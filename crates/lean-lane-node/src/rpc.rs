@@ -199,10 +199,33 @@ pub fn module(node: Arc<LaneNode>) -> RpcModule<Arc<LaneNode>> {
 
 pub async fn serve(node: Arc<LaneNode>, addr: SocketAddr) -> eyre::Result<(SocketAddr, ServerHandle)> {
     let config = ServerConfigBuilder::new().max_request_body_size(64 * 1024 * 1024).build();
-    let server = Server::builder().set_config(config).build(addr).await?;
-    let bound = server.local_addr()?;
-    let handle = server.start(module(node));
-    Ok((bound, handle))
+    // A restart must not die on a transient EADDRINUSE (a predecessor's
+    // lingering socket, a slow port release): retry for a while rather than
+    // throw away a completed recovery on one syscall. Bounded, so a genuinely
+    // occupied port (another node on it — the 2026-09-07 test-script bug
+    // that first surfaced this path) still fails loudly instead of hanging.
+    const BIND_ATTEMPTS: u32 = 240; // 240 x 500 ms = 120 s
+    let mut last = None;
+    for attempt in 1..=BIND_ATTEMPTS {
+        match Server::builder().set_config(config.clone()).build(addr).await {
+            Ok(server) => {
+                let bound = server.local_addr()?;
+                if attempt > 1 {
+                    eprintln!("rpc: bound {bound} after {attempt} attempts");
+                }
+                let handle = server.start(module(node));
+                return Ok((bound, handle));
+            }
+            Err(e) => {
+                if attempt % 20 == 1 {
+                    eprintln!("rpc: bind {addr} failed ({e}); retrying (attempt {attempt}/{BIND_ATTEMPTS})");
+                }
+                last = Some(e);
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        }
+    }
+    Err(eyre::eyre!("rpc: could not bind {addr} after {BIND_ATTEMPTS} attempts: {:#}", last.expect("no bind without an error")))
 }
 
 /// Client-side helper: frame + base64 a batch of canonical txs.
