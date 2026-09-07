@@ -7,12 +7,28 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-# Pinned to the same upstream reth tag the lane was measured against.
+# Pinned to the same upstream reth tag the lane was measured against (v2.3.0).
 alloy-consensus = { version = "~2.0.5", default-features = false }
+alloy-eips = { version = "~2.0.5", default-features = false }
+alloy-primitives = { version = "1.6.0", default-features = false, features = ["map-foldhash", "keccak-cache-global", "asm-keccak"] }
+alloy-rlp = { version = "0.3.15", default-features = false, features = ["core-net"] }
+eyre = "0.6"
 jsonrpsee = "0.26.0"
+rayon = "1.10"
+reth-chainspec = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0", default-features = false }
+reth-db-models = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0", default-features = false }
+reth-ethereum-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0", default-features = false }
+reth-evm-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0", default-features = false }
+reth-execution-types = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0", default-features = false }
 reth-primitives-traits = { version = "0.4.1", default-features = false }
+reth-storage-api = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0", default-features = false }
+reth-storage-errors = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0", default-features = false }
+reth-transaction-pool = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
+reth-trie-common = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0", default-features = false }
+revm-database = { version = "15.0.2", default-features = false }
 secp256k1 = { version = "0.30", default-features = false, features = ["global-context", "recovery"] }
 serde = { version = "1.0", default-features = false }
+serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
 tokio = { version = "1.44.2", default-features = false }
 
 [profile.release]
