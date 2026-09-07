@@ -1,0 +1,22 @@
+[package]
+name = "lean-native"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Lean fan-out native transfer type for the Arc payment lane: fixed-width codec, 1-signature->N-recipients, deterministic parallel execution (offline increment 1 — not wired into the engine)"
+publish = false
+
+[dependencies]
+alloy-primitives.workspace = true
+alloy-consensus = { workspace = true, features = ["serde"] }
+alloy-eips.workspace = true
+alloy-rlp.workspace = true
+reth-primitives-traits = { workspace = true, features = ["serde"] }
+reth-transaction-pool.workspace = true
+serde.workspace = true
+secp256k1 = { workspace = true, features = ["std", "recovery", "global-context"] }
+rayon.workspace = true
+
+[dev-dependencies]
+rand = "0.8"
+serde_json.workspace = true
