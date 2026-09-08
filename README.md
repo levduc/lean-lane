@@ -18,12 +18,15 @@ exact contract.
 
 ## Get it
 
-Single branch `main`. Until it has a hosted remote, clone it from the
-development machine over ssh (tailscale):
+Single branch `main`, tag `v0.1.0`:
 
 ```bash
-git clone papaduck@ginny-alienware:lean-lane
+git clone git@github.com:levduc/lean-lane.git
 ```
+
+The matching Arc consensus-layer changes are the `lean-lane-v0.1` branch of
+`levduc/arc-node` (tag `lean-lane-v0.1.0`); its
+`docs/lean-lane-integration.md` explains how the two fit together.
 
 ## Verify a machine in one command
 
