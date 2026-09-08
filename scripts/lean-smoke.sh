@@ -12,7 +12,7 @@
 #
 # Exit 0 = the lane works from a clean checkout on this machine.
 set -uo pipefail
-cd "$(cd "$(dirname "$0")/../.." && pwd)" || exit 1
+cd "$(cd "$(dirname "$0")/.." && pwd)" || exit 1
 MIXED=0
 if [ "${1:-}" = "--mixed" ]; then MIXED=1; shift; fi
 HEIGHTS=${1:-40}
@@ -53,7 +53,7 @@ done
 # ------------------------------------------------------------ fund file
 if [ ! -s "$FUND" ]; then
   say "generating 200-account fund file"
-  bash experiments/dual-el/gen-lean-fund.sh 200 "$FUND" >/dev/null 2>&1 \
+  bash scripts/gen-lean-fund.sh 200 "$FUND" >/dev/null 2>&1 \
     || { echo "FAIL: fund generation (is foundry/cast installed?)"; exit 1; }
 fi
 
