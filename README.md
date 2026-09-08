@@ -16,6 +16,15 @@ the framed bytes. The consensus layer treats the block bytes as opaque, checks
 structure, and anchors execution at decide — see `docs/integration.md` for the
 exact contract.
 
+## Get it
+
+Single branch `main`. Until it has a hosted remote, clone it from the
+development machine over ssh (tailscale):
+
+```bash
+git clone papaduck@ginny-alienware:lean-lane
+```
+
 ## Verify a machine in one command
 
 ```bash
