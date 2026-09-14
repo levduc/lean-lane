@@ -75,3 +75,34 @@ async fn lookup_by_commitment_survives_reopen() {
     let n = node(dir.path());
     assert_eq!(n.block_wire_bytes_by_commitment(c1).await.unwrap(), Some(w1));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn scan_finds_canonical_blocks_when_the_index_is_cold() {
+    let dir = tempfile::tempdir().unwrap();
+    let n = node(dir.path());
+    let (c1, w1) = advance(&n, 4, 0).await;
+    let (c2, w2) = advance(&n, 4, 1).await;
+    let (c3, w3) = advance(&n, 4, 2).await;
+    n.by_commitment.lock().await.clear();
+    assert_eq!(n.block_wire_bytes_by_commitment(c1).await.unwrap(), Some(w1));
+    assert_eq!(n.block_wire_bytes_by_commitment(c2).await.unwrap(), Some(w2));
+    assert_eq!(n.block_wire_bytes_by_commitment(c3).await.unwrap(), Some(w3));
+    let idx = n.by_commitment.lock().await;
+    assert!(idx.contains_key(&c1));
+    assert!(idx.contains_key(&c2));
+    assert!(idx.contains_key(&c3));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unknown_commitment_is_cached_as_a_miss() {
+    let dir = tempfile::tempdir().unwrap();
+    let n = node(dir.path());
+    advance(&n, 5, 0).await;
+    advance(&n, 5, 1).await;
+    let unknown = B256::repeat_byte(9);
+    assert_eq!(n.block_wire_bytes_by_commitment(unknown).await.unwrap(), None);
+    assert!(n.scan_misses.lock().await.contains(&unknown));
+    assert_eq!(n.block_wire_bytes_by_commitment(unknown).await.unwrap(), None);
+    advance(&n, 5, 2).await;
+    assert!(n.scan_misses.lock().await.is_empty());
+}

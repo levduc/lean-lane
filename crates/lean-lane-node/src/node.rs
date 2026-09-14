@@ -103,8 +103,14 @@ pub struct LaneNode {
     pub staged: Mutex<std::collections::VecDeque<(B256, StagedBlock)>>,
     /// commitment -> block number for canonical blocks known to this
     /// process (replayed at open, appended since). Misses fall back to a
-    /// bounded backward scan of the log (see `number_for_commitment`).
+    /// bounded backward scan of the log (see `locate_by_commitment`).
     pub by_commitment: Mutex<std::collections::HashMap<B256, u64>>,
+    /// Commitments a bounded backward scan has already failed to find
+    /// (bounded to 4096; cleared whenever a block is appended, since a new
+    /// block can turn an old miss into a hit). Turns a repeated
+    /// unknown-commitment lookup into one hash check instead of another
+    /// full scan.
+    pub scan_misses: Mutex<std::collections::HashSet<B256>>,
     /// IN-FLIGHT stagings: commitment -> (staged_parent, completion signal).
     /// arc_newBlock awaits a matching in-flight staging (bounded guard)
     /// instead of redoing the full execution — a <=35ms wait beats a ~230ms
@@ -241,6 +247,7 @@ impl LaneNode {
                 sync_target: AtomicU64::new(0),
                 staged: Mutex::new(Default::default()),
                 by_commitment: Mutex::new(by_commitment),
+                scan_misses: Mutex::new(Default::default()),
                 inflight: Mutex::new(Default::default()),
                 peer_clients,
             },
@@ -362,6 +369,7 @@ impl LaneNode {
         let t_append = Instant::now();
         self.log.lock().await.append(&block)?;
         self.by_commitment.lock().await.insert(block.commitment, block.number);
+        self.scan_misses.lock().await.clear();
         if let Some(s) = digest_state {
             s.write_snapshot(&self.cfg.datadir, commitment, block.number, block.timestamp_ms)?;
         }
@@ -553,6 +561,7 @@ impl LaneNode {
         let t_append = Instant::now();
         self.log.lock().await.append(&block)?;
         self.by_commitment.lock().await.insert(block.commitment, block.number);
+        self.scan_misses.lock().await.clear();
         if let Some(s) = digest_state {
             s.write_snapshot(&self.cfg.datadir, commitment, block.number, block.timestamp_ms)?;
         }
@@ -801,27 +810,36 @@ impl LaneNode {
             .map(|b| b.to_wire_bytes()))
     }
 
-    /// Resolve a commitment to a canonical block number: the in-process
-    /// index first, then a bounded backward scan of the log from the oldest
-    /// indexed number (older than that = not served; a peer with a fresher
-    /// snapshot will serve it).
-    async fn number_for_commitment(&self, c: B256) -> Result<Option<u64>, String> {
+    /// Resolve a commitment to canonical block bytes: the in-process index
+    /// first, then a bounded backward scan of the log from HEAD (older than
+    /// `SCAN_LIMIT` blocks back = not served; a peer with a fresher snapshot
+    /// will serve it). A scan that finds nothing is remembered in
+    /// `scan_misses` so a repeated unknown commitment costs one hash check
+    /// instead of another full scan.
+    async fn locate_by_commitment(&self, c: B256) -> Result<Option<Vec<u8>>, String> {
         if let Some(n) = self.by_commitment.lock().await.get(&c).copied() {
-            return Ok(Some(n));
+            return self.block_wire_bytes(n).await;
         }
-        const SCAN_LIMIT: u64 = 8192;
-        let oldest = self.by_commitment.lock().await.values().copied().min();
-        let Some(mut n) = oldest else { return Ok(None) };
-        let floor = n.saturating_sub(SCAN_LIMIT).max(1);
-        while n > floor {
-            n -= 1;
-            let b = self.log.lock().await.read_block(n).map_err(|e| e.to_string())?;
-            let Some(b) = b else { return Ok(None) };
+        if self.scan_misses.lock().await.contains(&c) {
+            return Ok(None);
+        }
+        const SCAN_LIMIT: u64 = 1024;
+        let head_n = self.head.lock().await.1;
+        let floor = head_n.saturating_sub(SCAN_LIMIT).max(1);
+        for n in (floor..=head_n).rev() {
+            let Some(b) = self.log.lock().await.read_block(n).map_err(|e| e.to_string())? else {
+                continue;
+            };
             self.by_commitment.lock().await.insert(b.commitment, n);
             if b.commitment == c {
-                return Ok(Some(n));
+                return Ok(Some(b.to_wire_bytes()));
             }
         }
+        let mut misses = self.scan_misses.lock().await;
+        if misses.len() >= 4096 {
+            misses.clear();
+        }
+        misses.insert(c);
         Ok(None)
     }
 
@@ -831,8 +849,8 @@ impl LaneNode {
         &self,
         c: B256,
     ) -> Result<Option<Vec<u8>>, String> {
-        if let Some(n) = self.number_for_commitment(c).await? {
-            return self.block_wire_bytes(n).await;
+        if let Some(wire) = self.locate_by_commitment(c).await? {
+            return Ok(Some(wire));
         }
         if let Some((_, e)) = self.staged.lock().await.iter().find(|(k, _)| *k == c) {
             return Ok(Some(e.wire.clone()));
