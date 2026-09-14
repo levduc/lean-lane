@@ -85,14 +85,22 @@ pub fn module(node: Arc<LaneNode>) -> RpcModule<Arc<LaneNode>> {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct NewBlockParams {
-        block_bytes: String,
+        block_bytes: Option<String>,
+        commitment: Option<B256>,
     }
     m.register_async_method("arc_newBlock", |params, node, _| async move {
         let p: NewBlockParams = params.parse()?;
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(&p.block_bytes)
-            .map_err(|e| err(e.to_string()))?;
-        match node.shim_new(&bytes).await.map_err(err)? {
+        let outcome = match (p.block_bytes, p.commitment) {
+            (Some(b64), _) => {
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(&b64)
+                    .map_err(|e| err(e.to_string()))?;
+                node.shim_new(&bytes).await.map_err(err)?
+            }
+            (None, Some(c)) => node.shim_new_by_commitment(c).await.map_err(err)?,
+            (None, None) => return Err(err("arc_newBlock: need blockBytes or commitment")),
+        };
+        match outcome {
             crate::node::NewBlockOutcome::Valid(commitment) => Ok::<_, ErrorObjectOwned>(
                 json!({ "status": "VALID", "commitment": format!("{commitment}") }),
             ),
@@ -111,8 +119,10 @@ pub fn module(node: Arc<LaneNode>) -> RpcModule<Arc<LaneNode>> {
     }
     m.register_async_method("arc_stageBlock", |params, node, _| async move {
         let p: NewBlockParams = params.parse()?;
+        let block_bytes =
+            p.block_bytes.ok_or_else(|| err("arc_stageBlock: need blockBytes"))?;
         let bytes = base64::engine::general_purpose::STANDARD
-            .decode(&p.block_bytes)
+            .decode(&block_bytes)
             .map_err(|e| err(e.to_string()))?;
         match node.stage_block(&bytes).await.map_err(err)? {
             crate::node::StageOutcome::Staged(commitment) => Ok::<_, ErrorObjectOwned>(

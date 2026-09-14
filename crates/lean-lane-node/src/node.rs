@@ -98,8 +98,10 @@ pub struct LaneNode {
     pub sync_notify: tokio::sync::Notify,
     /// Highest announced block number (backfill target when nothing is queued).
     pub sync_target: AtomicU64,
-    /// Vote-gap staged blocks keyed by commitment (bounded; all entries are
-    /// invalidated whenever the head advances).
+    /// Vote-gap staged blocks keyed by commitment (bounded to 32). Entries
+    /// behind the head are dropped whenever the head advances; entries at or
+    /// ahead of the new head are kept — a losing candidate at the settled
+    /// height stays servable by commitment to a peer that still asks for it.
     pub staged: Mutex<std::collections::VecDeque<(B256, StagedBlock)>>,
     /// commitment -> block number for canonical blocks known to this
     /// process (replayed at open, appended since). Misses fall back to a
@@ -389,8 +391,11 @@ impl LaneNode {
                 ring.push_back(r);
             }
         }
-        // head advanced: every staged entry was built against the old head
-        self.staged.lock().await.clear();
+        // head advanced: keep entries that are still AHEAD of the new head
+        // (losing candidates for this height are dropped when the height is
+        // passed; bytes for the current height stay servable by commitment)
+        let new_head_n = self.head.lock().await.1;
+        self.staged.lock().await.retain(|(_, e)| e.block.number >= new_head_n);
         let new_head = *self.head.lock().await;
         self.inflight.lock().await.retain(|_, (p, _)| *p == new_head.0);
         let s = &self.stats;
@@ -467,7 +472,7 @@ impl LaneNode {
 
     /// Shim: `arc_stageBlock` — fully validate + EXECUTE against the current
     /// head state into a memory-only staged entry (vote-gap deferred anchor).
-    /// Never appends, never queues (speculative). Bounded to 8 entries.
+    /// Never appends, never queues (speculative). Bounded to 32 entries.
     pub async fn stage_block(&self, bytes: &[u8]) -> Result<StageOutcome, String> {
         let block = LeanBlock::from_wire_bytes(bytes)?;
         let (head_c, head_n, _) = *self.head.lock().await;
@@ -516,7 +521,7 @@ impl LaneNode {
         {
             let mut q = self.staged.lock().await;
             q.retain(|(c, _)| *c != commitment);
-            if q.len() >= 8 {
+            if q.len() >= 32 {
                 q.pop_front();
             }
             q.push_back((commitment, entry));
@@ -579,7 +584,11 @@ impl LaneNode {
                 ring.push_back(r);
             }
         }
-        self.staged.lock().await.clear();
+        // head advanced: keep entries that are still AHEAD of the new head
+        // (losing candidates for this height are dropped when the height is
+        // passed; bytes for the current height stay servable by commitment)
+        let new_head_n = self.head.lock().await.1;
+        self.staged.lock().await.retain(|(_, e)| e.block.number >= new_head_n);
         let new_head = *self.head.lock().await;
         self.inflight.lock().await.retain(|_, (p, _)| *p == new_head.0);
         let s = &self.stats;
@@ -700,6 +709,40 @@ impl LaneNode {
             parent = c;
         }
         Ok(NewBlockOutcome::Valid(commitment))
+    }
+
+    /// Shim: `arc_newBlock{commitment}` — the CL only knows the commitment
+    /// (it is in the EVM header). Idempotent for canonical blocks; otherwise
+    /// apply from our staged/queued copy, else fetch the bytes from a peer by
+    /// commitment, else SYNCING.
+    pub async fn shim_new_by_commitment(&self, c: B256) -> Result<NewBlockOutcome, String> {
+        if self.locate_by_commitment(c).await?.is_some() {
+            return Ok(NewBlockOutcome::Valid(c));
+        }
+        if let Some(bytes) = self.block_wire_bytes_by_commitment(c).await? {
+            return self.shim_new(&bytes).await;
+        }
+        for cl in &self.peer_clients {
+            use jsonrpsee::core::client::ClientT;
+            let mut params = jsonrpsee::core::params::ObjectParams::new();
+            let _ = params.insert("commitment", format!("{c}"));
+            let r: Result<serde_json::Value, _> = cl.request("arc_getBlockBytes", params).await;
+            let Ok(v) = r else { continue };
+            let Some(b64) = v.get("blockBytes").and_then(|x| x.as_str()) else { continue };
+            let Ok(bytes) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
+            else {
+                continue;
+            };
+            match LeanBlock::from_wire_bytes(&bytes) {
+                Ok(b) if b.commitment == c => {
+                    self.stats.block_pulls.fetch_add(1, Ordering::Relaxed);
+                    return self.shim_new(&bytes).await;
+                }
+                _ => continue, // peer served the wrong block: ignore it
+            }
+        }
+        let head_n = self.head.lock().await.1;
+        Ok(NewBlockOutcome::Syncing { head: head_n })
     }
 
     /// Fire-and-forget gossip: after appending a block, ANNOUNCE it

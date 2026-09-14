@@ -106,3 +106,47 @@ async fn unknown_commitment_is_cached_as_a_miss() {
     advance(&n, 5, 2).await;
     assert!(n.scan_misses.lock().await.is_empty());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn new_block_by_commitment_promotes_a_staged_block() {
+    let dir = tempfile::tempdir().unwrap();
+    let n = node(dir.path());
+    seed_and_submit(&n, 4, 0, 2).await;
+    let (head_c, head_n, ts) = *n.head.lock().await;
+    let (c, wire) = n.shim_build(head_c, head_n + 1, ts + 1000, 1_000_000).await.unwrap();
+    assert_eq!(n.stage_block(&wire).await.unwrap(), StageOutcome::Staged(c));
+    assert_eq!(n.shim_new_by_commitment(c).await.unwrap(), NewBlockOutcome::Valid(c));
+    assert_eq!(n.head.lock().await.0, c);
+    // idempotent: already canonical
+    assert_eq!(n.shim_new_by_commitment(c).await.unwrap(), NewBlockOutcome::Valid(c));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn new_block_by_unknown_commitment_is_syncing() {
+    let dir = tempfile::tempdir().unwrap();
+    let n = node(dir.path());
+    let head_n = n.head.lock().await.1;
+    assert_eq!(
+        n.shim_new_by_commitment(B256::repeat_byte(7)).await.unwrap(),
+        NewBlockOutcome::Syncing { head: head_n }
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn staged_entry_survives_an_unrelated_head_move() {
+    // Stage block N+1 candidate A, then apply a different N+1 (B). A's
+    // bytes must still be served by commitment (it is a losing candidate,
+    // a peer may still ask for it), and promoting A must now answer
+    // SYNCING, not panic.
+    let dir = tempfile::tempdir().unwrap();
+    let n = node(dir.path());
+    seed_and_submit(&n, 5, 0, 2).await;
+    let (head_c, head_n, ts) = *n.head.lock().await;
+    let (ca, wa) = n.shim_build(head_c, head_n + 1, ts + 1000, 1_000_000).await.unwrap();
+    assert_eq!(n.stage_block(&wa).await.unwrap(), StageOutcome::Staged(ca));
+    let (cb, wb) = n.shim_build(head_c, head_n + 1, ts + 2000, 1_000_000).await.unwrap();
+    assert_ne!(ca, cb);
+    assert_eq!(n.shim_new(&wb).await.unwrap(), NewBlockOutcome::Valid(cb));
+    assert_eq!(n.block_wire_bytes_by_commitment(ca).await.unwrap(), Some(wa));
+    assert!(matches!(n.shim_new_by_commitment(ca).await, Err(_) | Ok(NewBlockOutcome::Syncing { .. })));
+}

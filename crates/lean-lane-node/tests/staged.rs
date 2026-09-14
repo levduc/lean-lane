@@ -130,10 +130,17 @@ async fn stale_staged_entry_never_promotes() {
         n.stage_block(&x.to_wire_bytes()).await.unwrap(),
         StageOutcome::Staged(x.commitment)
     );
-    // sibling Y lands first via the FULL path -> head advances -> staged map cleared
+    // sibling Y lands first via the FULL path -> head advances to 1. X's
+    // staged entry is at the SAME height (1 >= new head 1) so the new
+    // retention rule keeps it around -- a losing candidate stays servable
+    // by commitment to peers that might still ask for it; it just never
+    // gets to promote (checked below).
     let y = LeanBlock::new(genesis, 1, 222, vec![]);
     assert!(matches!(n.shim_new(&y.to_wire_bytes()).await.unwrap(), NewBlockOutcome::Valid(_)));
-    assert!(n.staged.lock().await.is_empty(), "head advance must invalidate staged entries");
+    assert!(
+        n.staged.lock().await.iter().any(|(c, _)| *c == x.commitment),
+        "a losing same-height candidate must stay staged after an unrelated head move"
+    );
     assert_eq!(n.stats.promoted.load(Ordering::Relaxed), 0);
     // feeding X now: height 1 is KNOWN with a different block -> the loud
     // conflicting error (v1.1 contract), never a stale promote
