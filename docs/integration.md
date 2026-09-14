@@ -42,9 +42,9 @@ a fleet must start with the same fund file or they will disagree at height 1.
 |---|---|---|
 | `arc_buildBlock` | `{parentCommitment, number, timestampMs, budgetGas}` | `{commitment, blockBytes}` — pulls best txs from the pool, executes against a staged copy, **does not append** |
 | `arc_stageBlock` | `{blockBytes}` | `{"status":"STAGED", commitment}` or `{"status":"SYNCING", number}` — validate + execute into a staged entry without appending, so a later `arc_newBlock` of the same bytes promotes instead of executing. Speculative; safe to fire-and-forget |
-| `arc_newBlock` | `{blockBytes}` | `{"status":"VALID", commitment}` (appended, or already known — idempotent by commitment) or `{"status":"SYNCING", number:<local head>}` (parent unknown: queued, the node backfills itself from `--peers` and applies when the gap closes) |
+| `arc_newBlock` | `{blockBytes}` **or** `{commitment}` | `{"status":"VALID", commitment}` (appended, or already known — idempotent by commitment) or `{"status":"SYNCING", number:<local head>}`. By commitment: promotes a staged copy, else applies a queued copy, else fetches the bytes from `--peers` by commitment and verifies them, else SYNCING |
 | `arc_getHead` | `{}` | `{commitment, number, timestampMs}` |
-| `arc_getBlockBytes` | `{number}` | `{blockBytes}` or `{blockBytes: null}` |
+| `arc_getBlockBytes` | `{number}` **or** `{commitment}` | `{blockBytes}` or `{blockBytes: null}` — canonical, staged or queued block |
 
 Malformed bytes, a wrong commitment, or a *conflicting* block at a known height
 are JSON-RPC **errors** (protocol violations); lag is never an error, it is
@@ -67,6 +67,7 @@ lane.
 | propose | `arc_buildBlock(head.commitment, head.number+1, evm_timestamp*1000, budget)` | timestamp is taken from the EVM payload so both lanes stay in lockstep; the bytes ride in the proposal beside the EVM payload |
 | validate (vote) | `arc_getHead`, `arc_getBlockBytes` when behind, then `arc_stageBlock` | **structural only**: recompute commitment; `timestamp_ms == evm_ts*1000`; `parent == head.commitment && number == head.number+1`. `number <= head` is a historic replay and is valid iff byte-equal to our canonical block; `number > head+1` means *we* are behind — pull from peer nodes first, then judge. No execution verdict at vote time |
 | decide (anchor) | `arc_newBlock(decided bytes)` | wait-and-poll up to 30 s (SYNCING-aware); the returned commitment must equal the certificate's lean commitment (it is recomputed locally, so a mismatch is a bug, not an attack) |
+| decide (v0.2) | arc_newBlock{commitment = EVM header prev_randao} | the node holds the bytes (staged at validation); the CL carries none |
 | sync serve | `arc_getBlockBytes(number)` | re-framed with the EVM payload; verified against the height's certificate before it is sent |
 | sync receive | same as validate, then `arc_newBlock` | |
 

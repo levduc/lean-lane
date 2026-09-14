@@ -24,6 +24,8 @@ Single branch `main`, tag `v0.1.0`:
 git clone git@github.com:levduc/lean-lane.git
 ```
 
+Branch `v0.2` carries the commitment-addressed verbs (`arc_newBlock{commitment}`, `arc_getBlockBytes{commitment}`) the Arc CL series `lean-lane-v0.2` uses.
+
 The matching Arc consensus-layer changes are the `lean-lane-v0.1` branch of
 `levduc/arc-node` (tag `lean-lane-v0.1.0`); its
 `docs/lean-lane-integration.md` explains how the two fit together.
