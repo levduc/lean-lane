@@ -101,6 +101,10 @@ pub struct LaneNode {
     /// Vote-gap staged blocks keyed by commitment (bounded; all entries are
     /// invalidated whenever the head advances).
     pub staged: Mutex<std::collections::VecDeque<(B256, StagedBlock)>>,
+    /// commitment -> block number for canonical blocks known to this
+    /// process (replayed at open, appended since). Misses fall back to a
+    /// bounded backward scan of the log (see `number_for_commitment`).
+    pub by_commitment: Mutex<std::collections::HashMap<B256, u64>>,
     /// IN-FLIGHT stagings: commitment -> (staged_parent, completion signal).
     /// arc_newBlock awaits a matching in-flight staging (bounded guard)
     /// instead of redoing the full execution — a <=35ms wait beats a ~230ms
@@ -164,11 +168,13 @@ impl LaneNode {
         let beneficiary = cfg.beneficiary;
         let mut replayed_blocks = 0u64;
         let mut replayed_txs = 0u64;
+        let mut by_commitment = std::collections::HashMap::new();
         log.replay(snap_number, |block| {
             let items = decode_block_txs(&block.txs);
             replayed_txs += items.len() as u64;
             apply_block(&mut state, &items, block.number, beneficiary);
             head = (block.commitment, block.number, block.timestamp_ms);
+            by_commitment.insert(block.commitment, block.number);
             replayed_blocks += 1;
         })?;
         let recovery = RecoveryReport {
@@ -234,6 +240,7 @@ impl LaneNode {
                 sync_notify: tokio::sync::Notify::new(),
                 sync_target: AtomicU64::new(0),
                 staged: Mutex::new(Default::default()),
+                by_commitment: Mutex::new(by_commitment),
                 inflight: Mutex::new(Default::default()),
                 peer_clients,
             },
@@ -354,6 +361,7 @@ impl LaneNode {
 
         let t_append = Instant::now();
         self.log.lock().await.append(&block)?;
+        self.by_commitment.lock().await.insert(block.commitment, block.number);
         if let Some(s) = digest_state {
             s.write_snapshot(&self.cfg.datadir, commitment, block.number, block.timestamp_ms)?;
         }
@@ -544,6 +552,7 @@ impl LaneNode {
 
         let t_append = Instant::now();
         self.log.lock().await.append(&block)?;
+        self.by_commitment.lock().await.insert(block.commitment, block.number);
         if let Some(s) = digest_state {
             s.write_snapshot(&self.cfg.datadir, commitment, block.number, block.timestamp_ms)?;
         }
@@ -790,6 +799,48 @@ impl LaneNode {
             .read_block(number)
             .map_err(|e| e.to_string())?
             .map(|b| b.to_wire_bytes()))
+    }
+
+    /// Resolve a commitment to a canonical block number: the in-process
+    /// index first, then a bounded backward scan of the log from the oldest
+    /// indexed number (older than that = not served; a peer with a fresher
+    /// snapshot will serve it).
+    async fn number_for_commitment(&self, c: B256) -> Result<Option<u64>, String> {
+        if let Some(n) = self.by_commitment.lock().await.get(&c).copied() {
+            return Ok(Some(n));
+        }
+        const SCAN_LIMIT: u64 = 8192;
+        let oldest = self.by_commitment.lock().await.values().copied().min();
+        let Some(mut n) = oldest else { return Ok(None) };
+        let floor = n.saturating_sub(SCAN_LIMIT).max(1);
+        while n > floor {
+            n -= 1;
+            let b = self.log.lock().await.read_block(n).map_err(|e| e.to_string())?;
+            let Some(b) = b else { return Ok(None) };
+            self.by_commitment.lock().await.insert(b.commitment, n);
+            if b.commitment == c {
+                return Ok(Some(n));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Shim: `arc_getBlockBytes{commitment}` — canonical, staged or queued
+    /// block with that commitment.
+    pub async fn block_wire_bytes_by_commitment(
+        &self,
+        c: B256,
+    ) -> Result<Option<Vec<u8>>, String> {
+        if let Some(n) = self.number_for_commitment(c).await? {
+            return self.block_wire_bytes(n).await;
+        }
+        if let Some((_, e)) = self.staged.lock().await.iter().find(|(k, _)| *k == c) {
+            return Ok(Some(e.wire.clone()));
+        }
+        if let Some(b) = self.sync_queue.lock().await.values().find(|b| b.commitment == c) {
+            return Ok(Some(b.to_wire_bytes()));
+        }
+        Ok(None)
     }
 
     pub async fn receipt(&self, hash: B256) -> Option<LeanReceipt> {

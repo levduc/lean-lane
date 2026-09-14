@@ -106,7 +106,8 @@ pub fn module(node: Arc<LaneNode>) -> RpcModule<Arc<LaneNode>> {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct GetBlockParams {
-        number: u64,
+        number: Option<u64>,
+        commitment: Option<B256>,
     }
     m.register_async_method("arc_stageBlock", |params, node, _| async move {
         let p: NewBlockParams = params.parse()?;
@@ -139,7 +140,11 @@ pub fn module(node: Arc<LaneNode>) -> RpcModule<Arc<LaneNode>> {
 
     m.register_async_method("arc_getBlockBytes", |params, node, _| async move {
         let p: GetBlockParams = params.parse()?;
-        let wire = node.block_wire_bytes(p.number).await.map_err(err)?;
+        let wire = match (p.commitment, p.number) {
+            (Some(c), _) => node.block_wire_bytes_by_commitment(c).await.map_err(err)?,
+            (None, Some(n)) => node.block_wire_bytes(n).await.map_err(err)?,
+            (None, None) => return Err(err("arc_getBlockBytes: need number or commitment")),
+        };
         Ok::<_, ErrorObjectOwned>(json!({
             "blockBytes": wire.map(|w| base64::engine::general_purpose::STANDARD.encode(w)),
         }))
