@@ -175,6 +175,31 @@ impl LeanBlock {
     }
 }
 
+/// What one `append` cost, split at the syscall that dominates it: the
+/// buffered `write_all` versus the `fsync`. The anchor timing line reports
+/// them as separate fields because only one of them is optional
+/// (`LEAN_FSYNC=0`) and only one of them is page-cache-pressure sensitive.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AppendTiming {
+    pub write_ns: u64,
+    pub fsync_ns: u64,
+}
+
+/// `LEAN_FSYNC=0` -> the append hot path does NOT fsync (read once).
+///
+/// Durability consequence: on a crash/power loss the last block(s) written
+/// since the kernel last flushed may be missing from the log. That is a
+/// LIVENESS cost only, never a safety one: the log is append-only and
+/// torn-tail-truncating, the commitment chain is recomputed from content on
+/// replay, peers backfill whatever the tail lost, and the CL certificate
+/// binds the block bytes — so a node that comes back short of its own tip
+/// re-fetches exactly the bytes the network already agreed on and cannot
+/// fork. Default (unset or anything but "0"): fsync per append, as before.
+pub fn fsync_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("LEAN_FSYNC").as_deref() != Ok("0"))
+}
+
 /// Append-only block log with fsync-per-append, torn-tail recovery, and an
 /// in-memory `number -> (offset, payload_len)` index for sync serving.
 pub struct BlockLog {
@@ -190,7 +215,7 @@ impl BlockLog {
         Ok(Self { file, bytes_written, index: Default::default() })
     }
 
-    pub fn append(&mut self, block: &LeanBlock) -> std::io::Result<()> {
+    pub fn append(&mut self, block: &LeanBlock) -> std::io::Result<AppendTiming> {
         let offset = self.bytes_written;
         let payload = block.payload();
         self.index.insert(block.number, (offset, payload.len() as u32));
@@ -199,10 +224,16 @@ impl BlockLog {
         rec.extend_from_slice(&len);
         rec.extend_from_slice(&payload);
         rec.extend_from_slice(&len);
+        let t_write = std::time::Instant::now();
         self.file.write_all(&rec)?;
-        self.file.sync_data()?;
+        let write_ns = t_write.elapsed().as_nanos() as u64;
+        let t_fsync = std::time::Instant::now();
+        if fsync_enabled() {
+            self.file.sync_data()?;
+        }
+        let fsync_ns = t_fsync.elapsed().as_nanos() as u64;
         self.bytes_written += rec.len() as u64;
-        Ok(())
+        Ok(AppendTiming { write_ns, fsync_ns })
     }
 
     /// Replay all intact records, invoking `f` for blocks with

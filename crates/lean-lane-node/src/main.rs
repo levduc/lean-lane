@@ -78,6 +78,12 @@ async fn run(args: &[String]) -> eyre::Result<()> {
     // accounts. Only applied to a FRESH datadir (recovered state wins).
     let fund_file: String = arg(args, "--fund-file", String::new());
     let fund_balance: u64 = arg(args, "--fund-balance", 1_000_000_000_000_000);
+    if !lean_lane_node::chain::fsync_enabled() {
+        println!(
+            "LEAN_FSYNC=0: the block-log append does NOT fsync (a crash may lose the log tail; \
+             peers backfill it and the CL certificate binds the bytes, so no fork)"
+        );
+    }
     let (node, rec) = LaneNode::open(cfg)?;
     let node = Arc::new(node);
     node.spawn_sync();
