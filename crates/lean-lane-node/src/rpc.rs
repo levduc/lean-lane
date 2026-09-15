@@ -151,7 +151,9 @@ pub fn module(node: Arc<LaneNode>) -> RpcModule<Arc<LaneNode>> {
     m.register_async_method("arc_getBlockBytes", |params, node, _| async move {
         let p: GetBlockParams = params.parse()?;
         let wire = match (p.commitment, p.number) {
-            (Some(c), _) => node.block_wire_bytes_by_commitment(c).await.map_err(err)?,
+            (Some(c), _) => {
+                node.block_wire_bytes_by_commitment_for(c, "get_bytes").await.map_err(err)?
+            }
             (None, Some(n)) => node.block_wire_bytes(n).await.map_err(err)?,
             (None, None) => return Err(err("arc_getBlockBytes: need number or commitment")),
         };

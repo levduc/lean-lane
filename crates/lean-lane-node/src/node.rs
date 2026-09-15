@@ -139,6 +139,9 @@ const PATH_NAMES: [&str; 7] =
 /// The named fields do not sum to `total_ms`; the residual is the JSON/base64
 /// envelope plus whatever the route paid outside the instrumented sections
 /// (for the peer route: the awaited `arc_getBlockBytes` round trip).
+///
+/// `n=0` means the height was never learned: a by-commitment call that
+/// resolved to nothing (`path=syncing`).
 #[derive(Default)]
 pub struct AnchorTimer {
     pub number: AtomicU64,
@@ -236,6 +239,15 @@ pub struct LaneNode {
     /// lookup of a commitment nobody has — exactly what the CL's value-sync
     /// serving path generates — paid another bounded backward log scan.
     pub scan_misses: Mutex<std::collections::HashSet<B256>>,
+    /// Lowest block number `by_commitment` is COMPLETE from (everything at or
+    /// above it that this node has appended is indexed: replay fills it at
+    /// open, every append adds to it). A backward log scan can therefore only
+    /// ever discover something BELOW this — above it, a miss is proof of
+    /// absence. In steady state (head more than SCAN_LIMIT past the snapshot
+    /// the process opened on) this makes the scan range empty, which is the
+    /// point: serving `arc_getBlockBytes{commitment}` for a commitment we do
+    /// not have used to read+hash up to 1024 blocks (1.24 MB each) per ask.
+    pub index_floor: AtomicU64,
     /// IN-FLIGHT stagings: commitment -> (staged_parent, completion signal).
     /// arc_newBlock awaits a matching in-flight staging (bounded guard)
     /// instead of redoing the full execution — a <=35ms wait beats a ~230ms
@@ -373,6 +385,9 @@ impl LaneNode {
                 staged: Mutex::new(Default::default()),
                 by_commitment: Mutex::new(by_commitment),
                 scan_misses: Mutex::new(Default::default()),
+                // replay indexed every block above the snapshot it started
+                // from; below that the index is cold and a scan can still pay
+                index_floor: AtomicU64::new(snap_number + 1),
                 inflight: Mutex::new(Default::default()),
                 peer_clients,
             },
@@ -935,6 +950,21 @@ impl LaneNode {
     /// apply from our staged/queued copy, else fetch the bytes from a peer by
     /// commitment, else SYNCING.
     pub async fn shim_new_by_commitment(&self, c: B256) -> Result<NewBlockOutcome, String> {
+        let t0 = Instant::now();
+        let tm = AnchorTimer::default();
+        let r = self.new_by_commitment_inner(c, &tm).await;
+        if matches!(r, Ok(NewBlockOutcome::Syncing { .. })) {
+            tm.set_path(PATH_SYNCING);
+        }
+        tm.emit(t0);
+        r
+    }
+
+    async fn new_by_commitment_inner(
+        &self,
+        c: B256,
+        tm: &AnchorTimer,
+    ) -> Result<NewBlockOutcome, String> {
         // Idempotency check against the in-process index ONLY. The block being
         // decided is by definition not canonical yet, so a miss here is the
         // normal case; running the bounded backward log scan for it cost one
@@ -942,11 +972,22 @@ impl LaneNode {
         // history, 331 ms at height 300) and collapsed cadence. A canonical
         // block older than the index still anchors correctly through the
         // bytes path below (known-height comparison in shim_new).
-        if self.by_commitment.lock().await.contains_key(&c) {
+        let t_index = Instant::now();
+        let known = self.by_commitment.lock().await.get(&c).copied();
+        add_ns(&tm.index_ns, t_index);
+        if let Some(n) = known {
+            // the index knows the height; report it rather than n=0
+            tm.number.store(n, Ordering::Relaxed);
+            tm.set_path(PATH_INDEX);
             return Ok(NewBlockOutcome::Valid(c));
         }
-        if let Some(bytes) = self.block_wire_bytes_by_commitment(c).await? {
-            return self.shim_new(&bytes).await;
+        if let Some((bytes, src)) = self.locate_wire(c, "new_block").await? {
+            tm.set_path(match src {
+                "staged" => PATH_STAGED,
+                "queued" => PATH_QUEUED,
+                _ => PATH_INDEX,
+            });
+            return self.shim_new_inner(&bytes, tm).await;
         }
         for cl in &self.peer_clients {
             use jsonrpsee::core::client::ClientT;
@@ -962,7 +1003,8 @@ impl LaneNode {
             match LeanBlock::from_wire_bytes(&bytes) {
                 Ok(b) if b.commitment == c => {
                     self.stats.block_pulls.fetch_add(1, Ordering::Relaxed);
-                    return self.shim_new(&bytes).await;
+                    tm.set_path(PATH_PEER);
+                    return self.shim_new_inner(&bytes, tm).await;
                 }
                 _ => continue, // peer served the wrong block: ignore it
             }
@@ -993,6 +1035,13 @@ impl LaneNode {
     /// case, zero further traffic); head+1 -> pull the block from peers (the
     /// announcer is among them and provably has it); further ahead -> arm the
     /// backfill (existing machinery).
+    ///
+    /// INVARIANT (tested: `announce_never_scans_the_log`): this path never
+    /// resolves a commitment, so it can never reach the backward log scan. An
+    /// announcement is decided on NUMBERS alone — a block above our head
+    /// cannot be in our log, and one at or below it is never pulled backwards
+    /// — so a peer announcing at 2 blk/s costs us one head read, whatever the
+    /// commitment is.
     pub async fn on_announce(&self, commitment: B256, number: u64) {
         self.stats.announces_rx.fetch_add(1, Ordering::Relaxed);
         let (head_c, head_n, _) = *self.head.lock().await;
@@ -1079,19 +1128,43 @@ impl LaneNode {
             .map(|b| b.to_wire_bytes()))
     }
 
-    /// Resolve a commitment to canonical block bytes: the in-process index
-    /// first, then a bounded backward scan of the log from HEAD (older than
-    /// `SCAN_LIMIT` blocks back = not served; a peer with a fresher snapshot
-    /// will serve it). A scan that finds nothing is remembered in
-    /// `scan_misses` so a repeated unknown commitment costs one hash check
-    /// instead of another full scan.
-    async fn locate_by_commitment(&self, c: B256) -> Result<Option<Vec<u8>>, String> {
+    /// Resolve a commitment to block bytes: staged, then the sync queue, then
+    /// the in-process index, then — only where the index is provably
+    /// incomplete — a bounded backward scan of the log. Returns the bytes and
+    /// WHERE they came from (the `hit=` field of `lean_locate`).
+    ///
+    /// The scan is the expensive branch: it reads and keccaks up to
+    /// `SCAN_LIMIT` blocks (1.24 MB each on the fleet), so it is now capped at
+    /// `index_floor - 1`. `by_commitment` is complete from `index_floor`
+    /// upward, so above that line a miss is proof of absence and scanning
+    /// cannot find anything the index did not already have — which is exactly
+    /// the case a peer's `arc_getBlockBytes{commitment}` for a block we have
+    /// not appended hits, on every ask, at a cost that grows with height.
+    /// Below `index_floor` (blocks older than the snapshot this process opened
+    /// on) the scan still runs, unchanged.
+    ///
+    /// A scan that finds nothing is remembered in `scan_misses` (exact
+    /// invalidation: only the appended commitment is removed) so a repeated
+    /// unknown commitment costs one hash check.
+    async fn locate_inner(
+        &self,
+        c: B256,
+        scanned: &mut u64,
+    ) -> Result<Option<(Vec<u8>, &'static str)>, String> {
+        // Staged and queued copies are exactly what the decide anchor asks for;
+        // check them before anything that can touch the log.
+        if let Some((_, e)) = self.staged.lock().await.iter().find(|(k, _)| *k == c) {
+            return Ok(Some((e.wire.clone(), "staged")));
+        }
+        if let Some(b) = self.sync_queue.lock().await.values().find(|b| b.commitment == c) {
+            return Ok(Some((b.to_wire_bytes(), "queued")));
+        }
         // Drop the index guard BEFORE reading the log: `block_wire_bytes`
         // awaits the log lock, and holding the commitment index across that
         // await serialises every other lookup behind one disk read.
         let hit = { self.by_commitment.lock().await.get(&c).copied() };
         if let Some(n) = hit {
-            return self.block_wire_bytes(n).await;
+            return Ok(self.block_wire_bytes(n).await?.map(|w| (w, "index")));
         }
         if self.scan_misses.lock().await.contains(&c) {
             return Ok(None);
@@ -1099,14 +1172,20 @@ impl LaneNode {
         const SCAN_LIMIT: u64 = 1024;
         let head_n = self.head.lock().await.1;
         let floor = head_n.saturating_sub(SCAN_LIMIT).max(1);
-        self.stats.log_scans.fetch_add(1, Ordering::Relaxed);
-        for n in (floor..=head_n).rev() {
-            let Some(b) = self.log.lock().await.read_block(n).map_err(|e| e.to_string())? else {
-                continue;
-            };
-            self.by_commitment.lock().await.insert(b.commitment, n);
-            if b.commitment == c {
-                return Ok(Some(b.to_wire_bytes()));
+        // never re-walk what the index already covers completely
+        let ceil = self.index_floor.load(Ordering::Relaxed).saturating_sub(1).min(head_n);
+        if ceil >= floor {
+            self.stats.log_scans.fetch_add(1, Ordering::Relaxed);
+            for n in (floor..=ceil).rev() {
+                *scanned += 1;
+                let Some(b) = self.log.lock().await.read_block(n).map_err(|e| e.to_string())?
+                else {
+                    continue;
+                };
+                self.by_commitment.lock().await.insert(b.commitment, n);
+                if b.commitment == c {
+                    return Ok(Some((b.to_wire_bytes(), "scan")));
+                }
             }
         }
         let mut misses = self.scan_misses.lock().await;
@@ -1117,21 +1196,51 @@ impl LaneNode {
         Ok(None)
     }
 
+    /// `locate_inner` + one `lean_locate` line per call under `LEAN_STATS=1`.
+    /// `caller` is the reason we are looking: `new_block` (the decide anchor),
+    /// `get_bytes` (a peer or the CL's value-sync serving path), `announce`,
+    /// `other` (tests/tools).
+    async fn locate_wire(
+        &self,
+        c: B256,
+        caller: &'static str,
+    ) -> Result<Option<(Vec<u8>, &'static str)>, String> {
+        let t0 = Instant::now();
+        let mut scanned = 0u64;
+        let r = self.locate_inner(c, &mut scanned).await;
+        if stats_enabled() {
+            let hit = match &r {
+                Ok(Some((_, h))) => *h,
+                Ok(None) => "miss",
+                Err(_) => "error",
+            };
+            println!(
+                "lean_locate caller={} hit={} scanned={} ms={:.2}",
+                caller,
+                hit,
+                scanned,
+                ms(t0.elapsed().as_nanos() as u64),
+            );
+        }
+        r
+    }
+
     /// Shim: `arc_getBlockBytes{commitment}` — canonical, staged or queued
     /// block with that commitment.
     pub async fn block_wire_bytes_by_commitment(
         &self,
         c: B256,
     ) -> Result<Option<Vec<u8>>, String> {
-        // Staged and queued copies are exactly what the decide anchor asks for;
-        // check them before anything that can touch the log.
-        if let Some((_, e)) = self.staged.lock().await.iter().find(|(k, _)| *k == c) {
-            return Ok(Some(e.wire.clone()));
-        }
-        if let Some(b) = self.sync_queue.lock().await.values().find(|b| b.commitment == c) {
-            return Ok(Some(b.to_wire_bytes()));
-        }
-        self.locate_by_commitment(c).await
+        self.block_wire_bytes_by_commitment_for(c, "other").await
+    }
+
+    /// As above, labelling the caller in the `lean_locate` line.
+    pub async fn block_wire_bytes_by_commitment_for(
+        &self,
+        c: B256,
+        caller: &'static str,
+    ) -> Result<Option<Vec<u8>>, String> {
+        Ok(self.locate_wire(c, caller).await?.map(|(w, _)| w))
     }
 
     pub async fn receipt(&self, hash: B256) -> Option<LeanReceipt> {

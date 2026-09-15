@@ -78,12 +78,20 @@ async fn lookup_by_commitment_survives_reopen() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn scan_finds_canonical_blocks_when_the_index_is_cold() {
+    use std::sync::atomic::Ordering;
     let dir = tempfile::tempdir().unwrap();
     let n = node(dir.path());
     let (c1, w1) = advance(&n, 4, 0).await;
     let (c2, w2) = advance(&n, 4, 1).await;
     let (c3, w3) = advance(&n, 4, 2).await;
     n.by_commitment.lock().await.clear();
+    // A cold index means the index is not COMPLETE down to these heights —
+    // that is what index_floor states, and what makes the scan worth running.
+    // (In production the only cold range is below the snapshot a process
+    // opened on; above index_floor a miss is proof of absence and the scan is
+    // skipped, which is the whole point of the floor.)
+    let head_n = n.head.lock().await.1;
+    n.index_floor.store(head_n + 1, Ordering::Relaxed);
     assert_eq!(n.block_wire_bytes_by_commitment(c1).await.unwrap(), Some(w1));
     assert_eq!(n.block_wire_bytes_by_commitment(c2).await.unwrap(), Some(w2));
     assert_eq!(n.block_wire_bytes_by_commitment(c3).await.unwrap(), Some(w3));
@@ -186,6 +194,49 @@ async fn staged_entry_survives_an_unrelated_head_move() {
     assert_eq!(n.shim_new(&wb).await.unwrap(), NewBlockOutcome::Valid(cb));
     assert_eq!(n.block_wire_bytes_by_commitment(ca).await.unwrap(), Some(wa));
     assert!(matches!(n.shim_new_by_commitment(ca).await, Err(_) | Ok(NewBlockOutcome::Syncing { .. })));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn announce_never_scans_the_log() {
+    // A peer announcing a commitment we have never seen must cost us one head
+    // read, not a backward log scan: the announce path decides on NUMBERS
+    // alone. (Fleet symptom this guards: lean-node CPU per block growing ~3x
+    // on peered validators while a lone-fast one stayed flat.)
+    use std::sync::atomic::Ordering;
+    let dir = tempfile::tempdir().unwrap();
+    let n = node(dir.path());
+    for nonce in 0..3 {
+        advance(&n, 8, nonce).await;
+    }
+    let head_n = n.head.lock().await.1;
+    // unknown commitment, ahead of us (the SYNCING-arming case) ...
+    n.on_announce(B256::repeat_byte(0xa1), head_n + 1).await;
+    // ... and one at a height we already have (the in-sync case)
+    n.on_announce(B256::repeat_byte(0xa2), head_n).await;
+    assert_eq!(
+        n.stats.log_scans.load(Ordering::Relaxed),
+        0,
+        "the announce path must never scan the log"
+    );
+    assert_eq!(n.stats.announces_rx.load(Ordering::Relaxed), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn serving_an_unknown_commitment_does_not_scan_above_the_index_floor() {
+    // arc_getBlockBytes{commitment} for something we do not have: the index is
+    // complete from index_floor up, so there is nothing to scan. This is the
+    // per-ask cost that used to read+hash up to 1024 blocks.
+    use std::sync::atomic::Ordering;
+    let dir = tempfile::tempdir().unwrap();
+    let n = node(dir.path());
+    for nonce in 0..3 {
+        advance(&n, 9, nonce).await;
+    }
+    assert_eq!(
+        n.block_wire_bytes_by_commitment_for(B256::repeat_byte(0xb7), "get_bytes").await.unwrap(),
+        None
+    );
+    assert_eq!(n.stats.log_scans.load(Ordering::Relaxed), 0, "nothing to scan above the floor");
 }
 
 #[tokio::test(flavor = "multi_thread")]
