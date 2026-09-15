@@ -264,3 +264,77 @@ async fn dead_inflight_staging_never_wedges_newblock() {
     assert_eq!(n.head.lock().await.1, 1);
     assert_eq!(n.stats.promoted.load(Ordering::Relaxed), 0, "must have used the full path");
 }
+
+/// A NO-OP tx (bankrupt sender) names recipients the direct path never writes.
+///
+/// `staged_entry` used to record `staged_state.get(a)` for every SYNTACTICALLY
+/// touched address — every sender, every output of every tx, the beneficiary —
+/// and `promote_staged` inserts all of them. `apply_block` writes only the
+/// senders, the outputs of APPLIED txs and the beneficiary, so a no-op's
+/// recipients got a default (0, 0) entry on the staged side and none at all on
+/// the direct side: identical balances, a different ACCOUNT COUNT, and
+/// `FlatState::digest` covers the count. Two validators executing the same
+/// bytes then report different digests and write different snapshots.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_noops_recipients_are_never_created_by_promote() {
+    let dd = tempfile::tempdir().unwrap(); // direct
+    let ds = tempfile::tempdir().unwrap(); // stage + promote
+    let d = open_node(dd.path()).await;
+    let s = open_node(ds.path()).await;
+    let domain = current_lane_domain();
+    // key 0 is funded on both nodes; key 99 is funded NOWHERE, so its tx is a
+    // no-op at execution and its two recipients are addresses neither node has
+    // ever seen.
+    seed_all(&[&d, &s], 1).await;
+    let (r1, r2, r3) = (
+        Address::with_last_byte(0x01),
+        Address::with_last_byte(0x02),
+        Address::with_last_byte(0x03),
+    );
+
+    let good = LeanSigned::new(LeanTx::sign(0, vec![Output { to: r1, amount: 5 }], &sk(0), &domain));
+    let bankrupt = LeanSigned::new(LeanTx::sign(
+        0,
+        vec![Output { to: r2, amount: 7 }, Output { to: r3, amount: 9 }],
+        &sk(99),
+        &domain,
+    ));
+    let (hc, hn, _) = *d.head.lock().await;
+    let block =
+        LeanBlock::new(hc, hn + 1, 10_001, vec![good.raw().to_vec(), bankrupt.raw().to_vec()]);
+    let wire = block.to_wire_bytes();
+
+    assert!(matches!(d.shim_new(&wire).await.unwrap(), NewBlockOutcome::Valid(_)));
+    assert_eq!(s.stage_block(&wire).await.unwrap(), StageOutcome::Staged(block.commitment));
+    assert!(matches!(s.shim_new(&wire).await.unwrap(), NewBlockOutcome::Valid(_)));
+    assert_eq!(s.stats.promoted.load(Ordering::Relaxed), 1, "the anchor must have promoted");
+
+    // the block really is "one applied, one no-op" — otherwise this gates nothing
+    let rd: Vec<_> = d.receipts.lock().await.iter().cloned().collect();
+    assert_eq!(rd.len(), 2);
+    assert!(rd[0].applied, "the funded tx must apply");
+    assert!(!rd[1].applied, "the bankrupt tx must be a no-op");
+
+    let (digest_d, len_d) = {
+        let g = d.state.lock().await;
+        (g.digest(), g.accounts.len())
+    };
+    let (digest_s, len_s) = {
+        let g = s.state.lock().await;
+        (g.digest(), g.accounts.len())
+    };
+    assert_eq!(len_d, len_s, "account COUNT diverged (promote created the no-op's recipients)");
+    assert_eq!(digest_d, digest_s, "state digest diverged");
+    for (name, n) in [("direct", &d), ("staged", &s)] {
+        let g = n.state.lock().await;
+        assert!(g.accounts.contains_key(&r1), "{name}: the applied output must exist");
+        assert!(!g.accounts.contains_key(&r2), "{name}: a no-op output must not be created");
+        assert!(!g.accounts.contains_key(&r3), "{name}: a no-op output must not be created");
+    }
+    let rs: Vec<_> = s.receipts.lock().await.iter().cloned().collect();
+    assert_eq!(rd, rs, "receipts diverged");
+    assert_eq!(
+        std::fs::read(dd.path().join("blocks.log")).unwrap(),
+        std::fs::read(ds.path().join("blocks.log")).unwrap(),
+    );
+}

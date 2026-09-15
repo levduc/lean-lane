@@ -860,8 +860,31 @@ impl LaneNode {
         touched.push(self.cfg.beneficiary);
         touched.sort_unstable();
         touched.dedup();
-        let post_touched: Vec<(Address, crate::state::Acct)> =
-            touched.iter().map(|a| (*a, staged_state.get(a))).collect();
+        // ONLY addresses the execution actually WROTE. `touched` is the
+        // syntactic set — every sender, every output of every tx, the
+        // beneficiary — and it is deliberately wider than the post-state:
+        // `apply_block` writes senders (always, even a no-op's), the outputs
+        // of APPLIED txs, and the beneficiary. The outputs of a NO-OP tx (a
+        // bankrupt or wrong-nonce sender) are never written.
+        //
+        // `staged_state.get()` would return `Acct::default()` for those and
+        // promote would INSERT it, creating a zero entry that the direct
+        // `commit_block` path never creates. `FlatState::digest` covers the
+        // account COUNT, so a node that staged+promoted and a node that
+        // executed the same bytes directly would report different digests and
+        // write different snapshots — the recovery/agreement checks split on
+        // an all-zero account nobody ever touched.
+        //
+        // Filtering on `contains_key` after execution reproduces exactly the
+        // direct path's write set: an address already in the map keeps the
+        // value it has (re-inserting it is a no-op), one that is not was not
+        // written. `changed` is derived from the same filtered list, so the
+        // pool is told about exactly the accounts whose (nonce, balance) can
+        // have moved.
+        let post_touched: Vec<(Address, crate::state::Acct)> = touched
+            .iter()
+            .filter_map(|a| staged_state.accounts.get(a).map(|acct| (*a, *acct)))
+            .collect();
         let changed = post_touched
             .iter()
             .map(|(a, acct)| reth_execution_types::ChangedAccount {
