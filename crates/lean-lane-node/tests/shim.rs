@@ -69,7 +69,8 @@ async fn build_is_pure_and_head_anchored() {
     // wrong number rejected (deviation from the doc, checked loudly)
     assert!(n.shim_build(head_c, head_n + 2, 1000, 150_000_000).await.is_err());
 
-    // valid build: deterministic, never mutates
+    // valid build: deterministic, never mutates the chain (it DOES leave a
+    // memory-only staged entry — see by_commitment.rs)
     let (c1, wire1) = n.shim_build(head_c, head_n + 1, 1000, 150_000_000).await.unwrap();
     let (c2, wire2) = n.shim_build(head_c, head_n + 1, 1000, 150_000_000).await.unwrap();
     assert_eq!(c1, c2, "same inputs + same pool snapshot => same block");
@@ -77,6 +78,11 @@ async fn build_is_pure_and_head_anchored() {
     assert_eq!(*n.head.lock().await, (head_c, head_n, 0), "build must not advance head");
     assert_eq!(n.state.lock().await.digest(), digest0, "build must not touch state");
     assert_eq!(n.pool.pool_size().pending, pool0, "build must not evict");
+    {
+        let q = n.staged.lock().await;
+        assert_eq!(q.len(), 1, "an identical rebuild replaces, never duplicates");
+        assert_eq!(q[0].0, c1);
+    }
 
     // commitment matches an independent recompute from the wire bytes
     let decoded = LeanBlock::from_wire_bytes(&wire1).unwrap();

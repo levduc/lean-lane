@@ -140,8 +140,11 @@ async fn appending_a_missed_commitment_drops_its_cached_miss() {
     advance(&n, 7, 0).await;
     seed_and_submit(&n, 7, 1, 2).await;
     let (head_c, head_n, ts) = *n.head.lock().await;
-    // built but NOT staged: unknown to the index, the staged map and the queue
     let (c, wire) = n.shim_build(head_c, head_n + 1, ts + 1000, 1_000_000).await.unwrap();
+    // `arc_buildBlock` self-stages its result; drop the staged copy, because
+    // this test needs a commitment that really is unknown to the index, the
+    // staged map AND the queue — that is what makes the lookup a cached miss.
+    n.staged.lock().await.clear();
     assert_eq!(n.block_wire_bytes_by_commitment(c).await.unwrap(), None);
     assert!(n.scan_misses.lock().await.contains(&c));
     assert_eq!(n.shim_new(&wire).await.unwrap(), NewBlockOutcome::Valid(c));
@@ -260,4 +263,128 @@ async fn anchoring_a_staged_block_never_scans_the_log() {
     let head_c = n.head.lock().await.0;
     assert_eq!(n.shim_new_by_commitment(head_c).await.unwrap(), NewBlockOutcome::Valid(head_c));
     assert_eq!(n.stats.log_scans.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_built_block_anchors_from_its_own_staged_copy() {
+    // THE proposer path (2026-09-15). `arc_buildBlock` used to execute on a
+    // throwaway copy, so at decide the proposer's own
+    // `arc_newBlock{commitment}` found nothing staged and pulled its own block
+    // back from a peer over HTTP (`path=peer`, 150-300 ms, on the consensus
+    // critical path). Build must now leave a staged entry, and the anchor must
+    // take the promote path with zero peer traffic and zero log scans.
+    use std::sync::atomic::Ordering;
+    let dir = tempfile::tempdir().unwrap();
+    let n = node(dir.path());
+    for nonce in 0..3u32 {
+        seed_and_submit(&n, 21, nonce, 2).await;
+        let (head_c, head_n, ts) = *n.head.lock().await;
+        let (c, _wire) = n.shim_build(head_c, head_n + 1, ts + 1000, 1_000_000).await.unwrap();
+        assert!(
+            n.staged.lock().await.iter().any(|(k, _)| *k == c),
+            "arc_buildBlock must stage its own result"
+        );
+        // the CL only ever hands back the commitment
+        assert_eq!(n.shim_new_by_commitment(c).await.unwrap(), NewBlockOutcome::Valid(c));
+        assert_eq!(n.head.lock().await.0, c);
+    }
+    assert_eq!(
+        n.stats.promoted.load(Ordering::Relaxed),
+        3,
+        "every self-built block must anchor through promote_staged (path=staged)"
+    );
+    assert_eq!(
+        n.stats.block_pulls.load(Ordering::Relaxed),
+        0,
+        "the proposer must never fetch its own block from a peer"
+    );
+    assert_eq!(n.stats.log_scans.load(Ordering::Relaxed), 0, "and never scan the log");
+    // staged map drained by the retention sweep, not leaking an entry a height
+    assert!(n.staged.lock().await.len() <= 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn staging_a_self_built_block_again_is_a_no_op() {
+    // A proposer's CL may also `arc_stageBlock` the bytes it just built. That
+    // must not re-execute: the entry already there is a post-state of the same
+    // parent over the same bytes.
+    let dir = tempfile::tempdir().unwrap();
+    let n = node(dir.path());
+    seed_and_submit(&n, 22, 0, 2).await;
+    let (head_c, head_n, ts) = *n.head.lock().await;
+    let (c, wire) = n.shim_build(head_c, head_n + 1, ts + 1000, 1_000_000).await.unwrap();
+    let staged_before: Vec<B256> =
+        n.staged.lock().await.iter().map(|(k, _)| *k).collect();
+    assert_eq!(staged_before, vec![c]);
+
+    assert_eq!(n.stage_block(&wire).await.unwrap(), StageOutcome::Staged(c));
+    // the no-op leaves exactly one entry for this commitment, still on this head
+    let q = n.staged.lock().await;
+    assert_eq!(q.len(), 1);
+    assert_eq!(q[0].0, c);
+    drop(q);
+
+    // build -> stage -> newBlock still works, and still promotes
+    use std::sync::atomic::Ordering;
+    assert_eq!(n.shim_new_by_commitment(c).await.unwrap(), NewBlockOutcome::Valid(c));
+    assert_eq!(n.head.lock().await.0, c);
+    assert_eq!(n.stats.promoted.load(Ordering::Relaxed), 1);
+    assert_eq!(n.stats.block_pulls.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn self_staged_build_matches_the_direct_path_byte_for_byte() {
+    // Differential: a chain anchored through the build-self-stage promote path
+    // must produce the same head, state digest, receipts and LOG BYTES as the
+    // same blocks fed through the full `arc_newBlock{bytes}` path.
+    use std::sync::atomic::Ordering;
+    let dp = tempfile::tempdir().unwrap(); // proposer (build -> by-commitment)
+    let dd = tempfile::tempdir().unwrap(); // follower (bytes)
+    let p = node(dp.path());
+    let d = node(dd.path());
+    for nonce in 0..6u32 {
+        seed_and_submit(&p, 23, nonce, 3).await;
+        seed_and_submit(&d, 23, nonce, 3).await;
+        let (head_c, head_n, ts) = *p.head.lock().await;
+        let (c, wire) = p.shim_build(head_c, head_n + 1, ts + 1000, 1_000_000).await.unwrap();
+        assert_eq!(p.shim_new_by_commitment(c).await.unwrap(), NewBlockOutcome::Valid(c));
+        assert_eq!(d.shim_new(&wire).await.unwrap(), NewBlockOutcome::Valid(c));
+        assert_eq!(*p.head.lock().await, *d.head.lock().await, "head diverged at {nonce}");
+        assert_eq!(
+            p.state.lock().await.digest(),
+            d.state.lock().await.digest(),
+            "state diverged at {nonce}"
+        );
+    }
+    assert_eq!(p.stats.promoted.load(Ordering::Relaxed), 6, "all six via promote_staged");
+    assert_eq!(d.stats.promoted.load(Ordering::Relaxed), 0, "the follower used the full path");
+    let rp: Vec<_> = p.receipts.lock().await.iter().cloned().collect();
+    let rd: Vec<_> = d.receipts.lock().await.iter().cloned().collect();
+    assert_eq!(rp, rd, "receipts diverged");
+    assert_eq!(
+        std::fs::read(dp.path().join("blocks.log")).unwrap(),
+        std::fs::read(dd.path().join("blocks.log")).unwrap(),
+        "log files must be byte-identical"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn self_staging_respects_the_32_entry_cap() {
+    // Retention/cap unchanged: repeated builds at the same height (each a
+    // distinct candidate) must never grow the staged map past 32.
+    let dir = tempfile::tempdir().unwrap();
+    let n = node(dir.path());
+    seed_and_submit(&n, 24, 0, 2).await;
+    let (head_c, head_n, _) = *n.head.lock().await;
+    for i in 0..40u64 {
+        // distinct timestamps => distinct commitments => distinct candidates
+        n.shim_build(head_c, head_n + 1, 1_000 + i, 1_000_000).await.unwrap();
+    }
+    assert_eq!(n.staged.lock().await.len(), 32, "staged map stays bounded at 32");
+    // and an identical rebuild replaces rather than duplicates
+    let before = n.staged.lock().await.len();
+    let (c, _) = n.shim_build(head_c, head_n + 1, 1_039, 1_000_000).await.unwrap();
+    let q = n.staged.lock().await;
+    assert_eq!(q.len(), before);
+    assert_eq!(q.iter().filter(|(k, _)| *k == c).count(), 1);
 }

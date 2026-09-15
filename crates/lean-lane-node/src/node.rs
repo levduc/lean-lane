@@ -584,10 +584,87 @@ impl LaneNode {
         Ok(Some(bn))
     }
 
+    /// Assemble the memory-only staged entry for `block` from a POST-execution
+    /// state copy. Shared by `stage_block` (someone else's bytes, arriving in
+    /// the vote gap) and `shim_build` (our own proposal), so the two produce
+    /// an identical entry — the proposer's own block must take exactly the
+    /// same promote path as every other validator's.
+    fn staged_entry(
+        &self,
+        block: LeanBlock,
+        wire: Vec<u8>,
+        staged_parent: B256,
+        items: &[(Address, LeanTx, B256)],
+        staged_state: &FlatState,
+        outcome: crate::exec::BlockOutcome,
+    ) -> StagedBlock {
+        let mut touched: Vec<Address> = items.iter().map(|(s, _, _)| *s).collect();
+        for (_, tx, _) in items {
+            touched.extend(tx.outputs.iter().map(|o| o.to));
+        }
+        touched.push(self.cfg.beneficiary);
+        touched.sort_unstable();
+        touched.dedup();
+        let post_touched: Vec<(Address, crate::state::Acct)> =
+            touched.iter().map(|a| (*a, staged_state.get(a))).collect();
+        let changed = post_touched
+            .iter()
+            .map(|(a, acct)| reth_execution_types::ChangedAccount {
+                address: *a,
+                nonce: acct.nonce,
+                balance: U256::from(acct.balance),
+            })
+            .collect();
+        let evict = items.iter().map(|(_, _, h)| *h).collect();
+        StagedBlock {
+            staged_parent,
+            wire,
+            post_touched,
+            changed,
+            receipts: outcome.receipts,
+            evict,
+            applied: outcome.applied,
+            noops: outcome.noops,
+            outputs: outcome.outputs,
+            block,
+        }
+    }
+
+    /// Publish a staged entry: replace any entry for the same commitment, keep
+    /// the map bounded at 32. The ONLY writer of `self.staged` outside
+    /// promotion's retention sweep.
+    async fn insert_staged(&self, commitment: B256, entry: StagedBlock, lock_ns: &AtomicU64) {
+        let mut q = timed_lock(&self.staged, lock_ns).await;
+        q.retain(|(c, _)| *c != commitment);
+        if q.len() >= 32 {
+            q.pop_front();
+        }
+        q.push_back((commitment, entry));
+    }
+
+    /// Is `commitment` already staged against `head_c`? Used to make a second
+    /// staging of the same bytes (our own `arc_buildBlock` result, then the
+    /// CL's `arc_stageBlock` for it) a cheap no-op instead of a re-execution.
+    async fn already_staged(&self, commitment: B256, head_c: B256, lock_ns: &AtomicU64) -> bool {
+        timed_lock(&self.staged, lock_ns)
+            .await
+            .iter()
+            .any(|(c, e)| *c == commitment && e.staged_parent == head_c)
+    }
+
     /// Shim: `arc_buildBlock` — build a candidate on the CURRENT head against a
     /// STAGED state copy. Never appends, never evicts, never mutates committed
     /// state. Contract: parent must be the head commitment; number must be
     /// head+1 (a consistent CL can send nothing else — checked loudly).
+    ///
+    /// SELF-STAGES its result (2026-09-15). The proposer used to execute its
+    /// own block on a throwaway copy and drop it: at decide its own
+    /// `arc_newBlock{commitment}` found nothing staged and nothing queued, so
+    /// it pulled ITS OWN block back over HTTP from a peer — on the consensus
+    /// critical path. Measured on the 4-validator fleet: `path=peer` on
+    /// 25-35% of heights (exactly the proposer's turn share), mean 150-300 ms
+    /// against 8-11 ms for `path=staged`. Staging the build result costs one
+    /// entry in a 32-slot map and turns that into the staged path.
     pub async fn shim_build(
         &self,
         parent: B256,
@@ -620,14 +697,28 @@ impl LaneNode {
             }
         }
         let block = LeanBlock::new(parent, number, timestamp_ms, raw);
+        let commitment = block.commitment;
+        let wire = block.to_wire_bytes();
         // staged execution: full state copy (I1 simplicity; CoW is a later
         // optimization) — proves the txs apply, commitment derives from content
         let mut staged = self.state.lock().await.clone();
-        apply_block(&mut staged, &items, number, self.cfg.beneficiary);
+        let outcome = apply_block(&mut staged, &items, number, self.cfg.beneficiary);
+        // Keep the result. Re-checking the head first: `head` was read before
+        // the state clone, so a block that landed in between would make
+        // `staged` a post-state of a DIFFERENT parent. `staged_parent` already
+        // stops such an entry from promoting, but an entry that can never
+        // promote is only a way to serve wrong bytes by commitment, so drop it.
+        let lock_ns = AtomicU64::new(0);
+        let still_head = timed_lock(&self.head, &lock_ns).await.0 == head_c;
+        if still_head && !self.already_staged(commitment, head_c, &lock_ns).await {
+            let entry =
+                self.staged_entry(block, wire.clone(), head_c, &items, &staged, outcome);
+            self.insert_staged(commitment, entry, &lock_ns).await;
+        }
         let build_ns = t_build.elapsed().as_nanos() as u64;
         self.stats.build_ns.fetch_add(build_ns, Ordering::Relaxed);
         self.stats.build_ns_last.store(build_ns, Ordering::Relaxed);
-        Ok((block.commitment, block.to_wire_bytes()))
+        Ok((commitment, wire))
     }
 
     /// Shim: `arc_stageBlock` — fully validate + EXECUTE against the current
@@ -645,6 +736,27 @@ impl LaneNode {
             return Ok(StageOutcome::Syncing { head: head_n });
         }
         let commitment_key = block.commitment;
+        // Already staged against this head — our own `arc_buildBlock` result,
+        // or a duplicate `arc_stageBlock`. A cheap no-op: the entry that is
+        // there is a post-state of the same parent over the same bytes, so
+        // re-executing would only pay ecrecover + a state clone to rebuild it.
+        // Cost of the no-op is the wire decode above (unavoidable: it is what
+        // computes the commitment we key on).
+        if self.already_staged(commitment_key, head_c, &lock_ns).await {
+            if stats_enabled() {
+                println!(
+                    concat!(
+                        "lean_stage n={} total_ms={:.2} decode_ms={:.2} ",
+                        "recover_ms=0.00 apply_ms=0.00 lock_ms={:.2} noop=1",
+                    ),
+                    number,
+                    ms(t0.elapsed().as_nanos() as u64),
+                    ms(decode_ns),
+                    ms(lock_ns.load(Ordering::Relaxed)),
+                );
+            }
+            return Ok(StageOutcome::Staged(commitment_key));
+        }
         let (done_tx, done_rx) = tokio::sync::watch::channel(false);
         timed_lock(&self.inflight, &lock_ns).await.insert(commitment_key, (head_c, done_rx));
         let t_recover = Instant::now();
@@ -654,46 +766,11 @@ impl LaneNode {
         let t_apply = Instant::now();
         let mut staged_state = timed_lock(&self.state, &lock_ns).await.clone();
         let outcome = apply_block(&mut staged_state, &items, block.number, self.cfg.beneficiary);
-        let mut touched: Vec<Address> = items.iter().map(|(s, _, _)| *s).collect();
-        for (_, tx, _) in &items {
-            touched.extend(tx.outputs.iter().map(|o| o.to));
-        }
-        touched.push(self.cfg.beneficiary);
-        touched.sort_unstable();
-        touched.dedup();
-        let post_touched: Vec<(Address, crate::state::Acct)> =
-            touched.iter().map(|a| (*a, staged_state.get(a))).collect();
-        let changed = post_touched
-            .iter()
-            .map(|(a, acct)| reth_execution_types::ChangedAccount {
-                address: *a,
-                nonce: acct.nonce,
-                balance: U256::from(acct.balance),
-            })
-            .collect();
-        let evict = items.iter().map(|(_, _, h)| *h).collect();
         let commitment = block.commitment;
-        let entry = StagedBlock {
-            staged_parent: head_c,
-            wire: bytes.to_vec(),
-            post_touched,
-            changed,
-            receipts: outcome.receipts,
-            evict,
-            applied: outcome.applied,
-            noops: outcome.noops,
-            outputs: outcome.outputs,
-            block,
-        };
+        let entry =
+            self.staged_entry(block, bytes.to_vec(), head_c, &items, &staged_state, outcome);
         let apply_ns = t_apply.elapsed().as_nanos() as u64;
-        {
-            let mut q = timed_lock(&self.staged, &lock_ns).await;
-            q.retain(|(c, _)| *c != commitment);
-            if q.len() >= 32 {
-                q.pop_front();
-            }
-            q.push_back((commitment, entry));
-        }
+        self.insert_staged(commitment, entry, &lock_ns).await;
         // signal AFTER the staged entry is visible, then deregister
         let _ = done_tx.send(true);
         timed_lock(&self.inflight, &lock_ns).await.remove(&commitment_key);
@@ -704,7 +781,7 @@ impl LaneNode {
             println!(
                 concat!(
                     "lean_stage n={} total_ms={:.2} decode_ms={:.2} ",
-                    "recover_ms={:.2} apply_ms={:.2} lock_ms={:.2}",
+                    "recover_ms={:.2} apply_ms={:.2} lock_ms={:.2} noop=0",
                 ),
                 number,
                 ms(stage_ns),
