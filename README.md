@@ -24,7 +24,7 @@ Single branch `main`, tag `v0.1.0`:
 git clone git@github.com:levduc/lean-lane.git
 ```
 
-Branch `v0.2` carries the commitment-addressed verbs (`arc_newBlock{commitment}`, `arc_getBlockBytes{commitment}`) the Arc CL series `lean-lane-v0.2` uses.
+Branch `v0.2` carries the commitment-addressed verbs (`arc_newBlock{commitment}`, `arc_getBlockBytes{commitment}`) the Arc CL series `lean-lane-v0.2` uses, plus the 2026-09-15 performance fixes (no log scan on the serving path, the proposer stages its own block, no re-pull of held blocks, the anchor waits for an in-flight stage, one commit gate per append). Optional diagnostics, all off by default: `LEAN_STATS=1` (stats every 10 s + per-call anchor/stage/locate lines), `LEAN_FSYNC=0`, `LEAN_ANNOUNCE_GRACE_MS`, `LEAN_STAGE_RACE_MS`.
 
 The matching Arc consensus-layer changes are the `lean-lane-v0.1` branch of
 `levduc/arc-node` (tag `lean-lane-v0.1.0`); its
