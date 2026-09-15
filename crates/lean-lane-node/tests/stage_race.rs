@@ -371,3 +371,130 @@ async fn a_stale_release_cannot_hand_a_second_committer_the_same_block() {
     assert_eq!(records_on_disk(dir.path()), 1, "the block is on disk exactly once");
     assert!(n.inflight.lock().await.is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// F3: the append is linkage-safe at the LAST MOMENT, not at the caller's
+// ---------------------------------------------------------------------------
+
+/// Build a block on an ARBITRARY parent. `wire_head_plus_one` reads the head,
+/// which cannot produce head+2 before head+1 exists — and the queue/drain
+/// race needs exactly that.
+async fn wire_child(
+    n: &LaneNode,
+    parent: B256,
+    number: u64,
+    timestamp_ms: u64,
+    key: u64,
+    txs_per_block: usize,
+) -> (B256, Vec<u8>) {
+    let mut txs = Vec::new();
+    for i in 0..txs_per_block {
+        txs.push(funded_tx(n, key + i as u64, 0, 4).await);
+    }
+    let b = LeanBlock::new(parent, number, timestamp_ms, txs);
+    (b.commitment, b.to_wire_bytes())
+}
+
+/// THE F3 GATE. The sync-queue drain commits with NO claim at all, so claim
+/// discipline — the only mutual exclusion the commit path had — does not cover
+/// it. It re-reads the head before committing a queued child, but that read
+/// and the head write inside `commit_block` are a whole commit apart, and a
+/// by-bytes feed of the same block arriving in that window takes the free
+/// claim and commits it concurrently: two identical records in `blocks.log`.
+/// The state converges either way (total-STF), which is what makes this
+/// invisible to every other check the node runs.
+///
+/// Staged deterministically: the committer of b1 is parked on `receipts` —
+/// the first lock `commit_block` takes AFTER the head write — so b1 is
+/// canonical and b2 is feedable by bytes while its drain has not started; then
+/// the `state` lock is taken, so the drain parks inside `commit_block(b2)`
+/// with the link check already passed, which is precisely the window.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_drain_racing_a_by_bytes_feed_appends_the_block_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let n = node(dir.path());
+    let (c1, w1) = wire_head_plus_one(&n, 500, 4).await;
+    let ts = n.head.lock().await.2;
+    let (c2, w2) = wire_child(&n, c1, 2, ts + 2_000, 600, 4).await;
+
+    // b2 first: it does not connect yet, so it is QUEUED behind b1 and the
+    // commit of b1 will drain it.
+    let q = n.shim_new(&w2).await.unwrap();
+    assert!(matches!(q, NewBlockOutcome::Syncing { .. }), "got {q:?}");
+    assert_eq!(n.sync_queue.lock().await.len(), 1);
+
+    // park the b1 commit immediately after its head write
+    let receipts_guard = n.receipts.lock().await;
+    let a = {
+        let (n, w1) = (n.clone(), w1.clone());
+        tokio::spawn(async move { n.shim_new(&w1).await })
+    };
+    let mut at_head = false;
+    for _ in 0..400 {
+        if n.head.lock().await.1 == 1 {
+            at_head = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // b1 canonical is what makes the drain race possible at all
+    assert!(at_head, "b1 never became the head");
+
+    // take `state` BEFORE releasing `receipts`, so the drain cannot get past
+    // `commit_block`'s apply
+    let state_guard = n.state.lock().await;
+    drop(receipts_guard);
+
+    // the drain removes b2 from the queue as its first act: that is the signal
+    // that it is committed to committing b2
+    let mut draining = false;
+    for _ in 0..400 {
+        if n.sync_queue.lock().await.is_empty() {
+            draining = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(draining, "the drain must have taken b2 out of the queue");
+
+    // ...and now the same block by bytes, claim free, head still saying 1
+    let b = {
+        let (n, w2) = (n.clone(), w2.clone());
+        tokio::spawn(async move { n.shim_new(&w2).await })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    drop(state_guard);
+
+    assert_eq!(a.await.unwrap().unwrap(), NewBlockOutcome::Valid(c1));
+    let rb = b.await.unwrap().unwrap();
+    let ok = matches!(rb, NewBlockOutcome::Valid(x) if x == c2)
+        || matches!(rb, NewBlockOutcome::Syncing { .. });
+    assert!(ok, "got {rb:?}");
+    assert_eq!(n.head.lock().await.1, 2);
+    assert_eq!(records_on_disk(dir.path()), 2, "b1 and b2, once each");
+    assert_eq!(log_len(&n).await, 2);
+    assert!(n.inflight.lock().await.is_empty());
+}
+
+/// The idempotent no-op above must stay narrow: same NUMBER is not enough,
+/// the commitment has to match. A different block at a height we already hold
+/// is still the loud fork error it always was.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_conflicting_block_at_a_known_height_is_still_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let n = node(dir.path());
+    let (genesis_c, _, genesis_ts) = *n.head.lock().await;
+    let (c1, w1) = wire_head_plus_one(&n, 700, 3).await;
+    assert_eq!(n.shim_new(&w1).await.unwrap(), NewBlockOutcome::Valid(c1));
+    // re-feeding the very same bytes is the idempotent VALID
+    assert_eq!(n.shim_new(&w1).await.unwrap(), NewBlockOutcome::Valid(c1));
+    assert_eq!(n.head.lock().await.0, c1);
+
+    // a FORK of height 1: same parent, same number, different body
+    let (c1b, w1b) = wire_child(&n, genesis_c, 1, genesis_ts + 1_000, 800, 3).await;
+    assert_ne!(c1b, c1);
+    let e = n.shim_new(&w1b).await.unwrap_err();
+    assert!(e.contains("conflicting"), "{e}");
+    assert_eq!(records_on_disk(dir.path()), 1, "the fork was not appended");
+    assert_eq!(n.head.lock().await.0, c1);
+}

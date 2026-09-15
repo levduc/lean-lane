@@ -281,6 +281,15 @@ impl AnchorTimer {
     }
 }
 
+/// What `link_to_head` decided about a block that is about to be appended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Link {
+    /// `number == head + 1` and `parent == head commitment`: append it.
+    Connects,
+    /// Already ours at its own number, with this commitment: append nothing.
+    AlreadyCanonical,
+}
+
 pub struct LaneNode {
     pub cfg: Config,
     pub pool: LanePool,
@@ -289,6 +298,28 @@ pub struct LaneNode {
     pub log: Mutex<BlockLog>,
     /// (head commitment, head number, head timestamp_ms)
     pub head: Mutex<(B256, u64, u64)>,
+    /// THE APPEND GATE. Held for the whole of a commit — from the linkage
+    /// decision, through the state apply and the log append, to the head
+    /// write — by `commit_block` and `promote_staged`, the only two functions
+    /// that append. It is what makes the head read that decides "does this
+    /// block connect?" and the head write that answers it for the next
+    /// committer ONE critical section.
+    ///
+    /// Claim discipline (`inflight`) narrows the double-append window but has
+    /// never closed it, because not every appender holds a claim: the
+    /// sync-queue drain commits with none, the staged promote hands its claim
+    /// back before promoting, and a claim waited out for 2 s can be stolen
+    /// from a holder that is merely slow rather than dead. Each of those ends
+    /// in two committers that both passed a parent-link check nobody re-took
+    /// at the moment of the append. The gate makes that check last-moment and
+    /// universal (`link_to_head`); the claim stays, as the thing that spares
+    /// the loser ~230 ms of execution it does not need.
+    ///
+    /// Costs nothing in steady state: commits are serial anyway (each builds
+    /// on the head the previous one wrote), so the gate is uncontended except
+    /// in exactly the racing case it exists to arbitrate. Staging, admission
+    /// and the serving path never take it.
+    commit_gate: Mutex<()>,
     pub receipts: Mutex<VecDeque<LeanReceipt>>,
     pub stats: Stats,
     /// Blocks that arrived ahead of our head, keyed by PARENT commitment
@@ -546,6 +577,7 @@ impl LaneNode {
                 state: Mutex::new(state),
                 log: Mutex::new(log),
                 head: Mutex::new(head),
+                commit_gate: Mutex::new(()),
                 receipts: Mutex::new(VecDeque::new()),
                 stats: Stats::default(),
                 sync_queue: Mutex::new(Default::default()),
@@ -635,8 +667,56 @@ impl LaneNode {
         (items, raw, hashes)
     }
 
-    /// Execute + append + commit bookkeeping for a block whose parent-link has
-    /// already been verified against head. The ONLY way the chain advances.
+    /// The last-moment linkage decision, taken under `commit_gate` and
+    /// therefore in the same critical section as the append and the head write
+    /// that follow it. Every caller of `commit_block`/`promote_staged` has
+    /// already checked the link — that check is what lets them execute at all
+    /// — but between that check and the append the head can move, and until
+    /// this existed nothing looked again.
+    ///
+    /// Three answers, and the middle one is the point: a block that is already
+    /// ours at its own number is a NO-OP, not an append. That is what makes a
+    /// second committer of the same bytes (a stolen claim, a drain racing an
+    /// anchor) harmless instead of a second record in `blocks.log` — the log
+    /// diverges byte-for-byte from every other validator's while the state
+    /// still converges, so nothing else in the node would ever notice.
+    async fn link_to_head(&self, block: &LeanBlock, tm: &AnchorTimer) -> eyre::Result<Link> {
+        let (head_c, head_n, _) = *timed_lock(&self.head, &tm.lock_ns).await;
+        if block.number == head_n + 1 && block.parent == head_c {
+            return Ok(Link::Connects);
+        }
+        if block.number > head_n {
+            eyre::bail!(
+                "block {} does not connect: parent {}, head {head_c} at {head_n}",
+                block.number,
+                block.parent,
+            );
+        }
+        // At or below the head. The only benign case is that this exact block
+        // is already canonical — someone else committed it while we executed.
+        let known = if block.number == head_n {
+            Some(head_c)
+        } else {
+            let mut log = timed_lock(&self.log, &tm.lock_ns).await;
+            log.read_block(block.number)?.map(|b| b.commitment)
+        };
+        match known {
+            Some(c) if c == block.commitment => Ok(Link::AlreadyCanonical),
+            Some(c) => eyre::bail!(
+                "conflicting block at known height {}: have {c}, got {}",
+                block.number,
+                block.commitment,
+            ),
+            None => eyre::bail!("height {} predates the log", block.number),
+        }
+    }
+
+    /// Execute + append + commit bookkeeping. Re-checks the parent link under
+    /// `commit_gate` immediately before touching state, so it is the ONLY way
+    /// the chain advances *and* the place the "does this connect?" question is
+    /// finally answered — no caller's earlier check is trusted. Idempotent:
+    /// re-committing a block that is already canonical appends nothing and is
+    /// still `Ok`, which is what the callers report as VALID.
     async fn commit_block(
         &self,
         block: LeanBlock,
@@ -645,6 +725,10 @@ impl LaneNode {
         tm: &AnchorTimer,
     ) -> eyre::Result<()> {
         tm.number.store(block.number, Ordering::Relaxed);
+        let _gate = timed_lock(&self.commit_gate, &tm.lock_ns).await;
+        if self.link_to_head(&block, tm).await? == Link::AlreadyCanonical {
+            return Ok(());
+        }
         let t_exec = Instant::now();
         let mut state = timed_lock(&self.state, &tm.lock_ns).await;
         let t_apply = Instant::now();
@@ -1066,6 +1150,15 @@ impl LaneNode {
         } = entry;
         let n_items = receipts.len();
         tm.number.store(block.number, Ordering::Relaxed);
+        // Same gate, same last-moment link check as `commit_block`: taking the
+        // staged entry out of `staged` makes this promote unique among
+        // promotes, but not among APPENDS — a by-bytes feed that arrives after
+        // the entry is taken finds nothing staged, takes the free claim, and
+        // commits the same block.
+        let _gate = timed_lock(&self.commit_gate, &tm.lock_ns).await;
+        if self.link_to_head(&block, tm).await? == Link::AlreadyCanonical {
+            return Ok(());
+        }
         let t_exec = Instant::now();
         let mut state = timed_lock(&self.state, &tm.lock_ns).await;
         let t_apply = Instant::now();
@@ -1358,7 +1451,12 @@ impl LaneNode {
             let evict = items.iter().map(|(_, _, h)| *h).collect();
             let c = nb.commitment;
             let num = nb.number;
-            // re-check the link (head may have moved past it via backfill)
+            // Cheap early-out: the head may have moved past this child via
+            // backfill while we committed its parent. This check is advisory
+            // only — the drain holds NO claim, so an anchor or a backfill for
+            // the same block can take the (free) claim in the window between
+            // here and the append. `commit_block` re-takes the check under
+            // `commit_gate` and answers that race with a no-op.
             let (hc, hn, _) = *timed_lock(&self.head, &tm.lock_ns).await;
             if nb.number != hn + 1 || nb.parent != hc {
                 break;
