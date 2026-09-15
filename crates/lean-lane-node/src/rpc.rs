@@ -38,14 +38,17 @@ struct StagePending(Arc<LaneNode>);
 
 impl StagePending {
     fn new(node: &Arc<LaneNode>) -> Self {
-        node.stage_pending.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        node.stage_pending
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Self(node.clone())
     }
 }
 
 impl Drop for StagePending {
     fn drop(&mut self) {
-        self.0.stage_pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        self.0
+            .stage_pending
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         // a waiter polling the grace window should re-check `inflight` now
         self.0.stage_notify.notify_waiters();
     }
@@ -64,8 +67,9 @@ pub fn module(node: Arc<LaneNode>) -> RpcModule<Arc<LaneNode>> {
 
     m.register_async_method("arc_sendRawTxBatch", |params, node, _| async move {
         let b64: String = params.one()?;
-        let blob =
-            base64::engine::general_purpose::STANDARD.decode(b64).map_err(|e| err(e.to_string()))?;
+        let blob = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .map_err(|e| err(e.to_string()))?;
         let mut at = 0usize;
         let mut accepted = 0u64;
         let mut rejected = 0u64;
@@ -137,9 +141,10 @@ pub fn module(node: Arc<LaneNode>) -> RpcModule<Arc<LaneNode>> {
                     .map_err(|e| err(e.to_string()))?;
                 node.shim_new_at(&bytes, t_entry).await.map_err(err)?
             }
-            (None, Some(c)) => {
-                node.shim_new_by_commitment_at(c, t_entry).await.map_err(err)?
-            }
+            (None, Some(c)) => node
+                .shim_new_by_commitment_at(c, t_entry)
+                .await
+                .map_err(err)?,
             (None, None) => return Err(err("arc_newBlock: need blockBytes or commitment")),
         };
         match outcome {
@@ -165,8 +170,9 @@ pub fn module(node: Arc<LaneNode>) -> RpcModule<Arc<LaneNode>> {
         // which the node knows a stage is coming but not yet which block.
         let _pending = StagePending::new(&node);
         let p: NewBlockParams = params.parse()?;
-        let block_bytes =
-            p.block_bytes.ok_or_else(|| err("arc_stageBlock: need blockBytes"))?;
+        let block_bytes = p
+            .block_bytes
+            .ok_or_else(|| err("arc_stageBlock: need blockBytes"))?;
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(&block_bytes)
             .map_err(|e| err(e.to_string()))?;
@@ -197,9 +203,10 @@ pub fn module(node: Arc<LaneNode>) -> RpcModule<Arc<LaneNode>> {
     m.register_async_method("arc_getBlockBytes", |params, node, _| async move {
         let p: GetBlockParams = params.parse()?;
         let wire = match (p.commitment, p.number) {
-            (Some(c), _) => {
-                node.block_wire_bytes_by_commitment_for(c, "get_bytes").await.map_err(err)?
-            }
+            (Some(c), _) => node
+                .block_wire_bytes_by_commitment_for(c, "get_bytes")
+                .await
+                .map_err(err)?,
             (None, Some(n)) => node.block_wire_bytes(n).await.map_err(err)?,
             (None, None) => return Err(err("arc_getBlockBytes: need number or commitment")),
         };
@@ -219,8 +226,7 @@ pub fn module(node: Arc<LaneNode>) -> RpcModule<Arc<LaneNode>> {
     // Spammers/wallets use this for nonce resync; the pool tracks pending on top.
     m.register_async_method("eth_getTransactionCount", |params, node, _| async move {
         let mut seq = params.sequence();
-        let addr: alloy_primitives::Address =
-            seq.next().map_err(|e| err(e.to_string()))?;
+        let addr: alloy_primitives::Address = seq.next().map_err(|e| err(e.to_string()))?;
         let _tag: Option<String> = seq.optional_next().unwrap_or(None);
         let nonce = node.state.lock().await.get(&addr).nonce;
         Ok::<_, ErrorObjectOwned>(format!("0x{nonce:x}"))
@@ -237,8 +243,10 @@ pub fn module(node: Arc<LaneNode>) -> RpcModule<Arc<LaneNode>> {
 
     m.register_async_method("eth_getTransactionReceipt", |params, node, _| async move {
         let hash: String = params.one()?;
-        let hash: B256 =
-            hash.trim_start_matches("0x").parse().map_err(|_| err("bad hash"))?;
+        let hash: B256 = hash
+            .trim_start_matches("0x")
+            .parse()
+            .map_err(|_| err("bad hash"))?;
         let r = node.receipt(hash).await;
         Ok::<_, ErrorObjectOwned>(r.map(|r| {
             json!({
@@ -260,8 +268,13 @@ pub fn module(node: Arc<LaneNode>) -> RpcModule<Arc<LaneNode>> {
     m
 }
 
-pub async fn serve(node: Arc<LaneNode>, addr: SocketAddr) -> eyre::Result<(SocketAddr, ServerHandle)> {
-    let config = ServerConfigBuilder::new().max_request_body_size(64 * 1024 * 1024).build();
+pub async fn serve(
+    node: Arc<LaneNode>,
+    addr: SocketAddr,
+) -> eyre::Result<(SocketAddr, ServerHandle)> {
+    let config = ServerConfigBuilder::new()
+        .max_request_body_size(64 * 1024 * 1024)
+        .build();
     // A restart must not die on a transient EADDRINUSE (a predecessor's
     // lingering socket, a slow port release): retry for a while rather than
     // throw away a completed recovery on one syscall. Bounded, so a genuinely
@@ -270,7 +283,11 @@ pub async fn serve(node: Arc<LaneNode>, addr: SocketAddr) -> eyre::Result<(Socke
     const BIND_ATTEMPTS: u32 = 240; // 240 x 500 ms = 120 s
     let mut last = None;
     for attempt in 1..=BIND_ATTEMPTS {
-        match Server::builder().set_config(config.clone()).build(addr).await {
+        match Server::builder()
+            .set_config(config.clone())
+            .build(addr)
+            .await
+        {
             Ok(server) => {
                 let bound = server.local_addr()?;
                 if attempt > 1 {
@@ -288,7 +305,10 @@ pub async fn serve(node: Arc<LaneNode>, addr: SocketAddr) -> eyre::Result<(Socke
             }
         }
     }
-    Err(eyre::eyre!("rpc: could not bind {addr} after {BIND_ATTEMPTS} attempts: {:#}", last.expect("no bind without an error")))
+    Err(eyre::eyre!(
+        "rpc: could not bind {addr} after {BIND_ATTEMPTS} attempts: {:#}",
+        last.expect("no bind without an error")
+    ))
 }
 
 /// Client-side helper: frame + base64 a batch of canonical txs.

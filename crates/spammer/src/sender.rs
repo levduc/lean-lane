@@ -50,8 +50,8 @@ use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{Duration, Instant};
 use tracing::{debug, warn};
 
-use crate::generator::TxGenerator;
 use crate::generator::SpamTx;
+use crate::generator::TxGenerator;
 use crate::latency::{compute_tx_hash, timestamp_now, TxSubmitted};
 use crate::rate_limiter::RateLimiter;
 use crate::ws::{is_connection_error, WsClient, WsClientBuilder};

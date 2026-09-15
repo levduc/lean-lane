@@ -130,10 +130,7 @@ impl StateRootProvider for LeanProvider {
     fn state_root_from_nodes(&self, _i: TrieInput) -> ProviderResult<B256> {
         Err(ProviderError::UnsupportedProvider)
     }
-    fn state_root_with_updates(
-        &self,
-        _s: HashedPostState,
-    ) -> ProviderResult<(B256, TrieUpdates)> {
+    fn state_root_with_updates(&self, _s: HashedPostState) -> ProviderResult<(B256, TrieUpdates)> {
         Err(ProviderError::UnsupportedProvider)
     }
     fn state_root_from_nodes_with_updates(
@@ -213,7 +210,10 @@ impl ChainSpecProvider for LeanProvider {
 
 impl BlockNumReader for LeanProvider {
     fn chain_info(&self) -> ProviderResult<ChainInfo> {
-        Ok(ChainInfo { best_hash: B256::ZERO, best_number: *self.head.read().unwrap() })
+        Ok(ChainInfo {
+            best_hash: B256::ZERO,
+            best_number: *self.head.read().unwrap(),
+        })
     }
     fn best_block_number(&self) -> ProviderResult<BlockNumber> {
         Ok(*self.head.read().unwrap())
@@ -260,10 +260,7 @@ impl StateProviderFactory for LeanProvider {
     fn pending(&self) -> ProviderResult<StateProviderBox> {
         Ok(Box::new(self.clone()))
     }
-    fn pending_state_by_hash(
-        &self,
-        _block_hash: B256,
-    ) -> ProviderResult<Option<StateProviderBox>> {
+    fn pending_state_by_hash(&self, _block_hash: B256) -> ProviderResult<Option<StateProviderBox>> {
         Ok(Some(Box::new(self.clone())))
     }
     fn maybe_pending(&self) -> ProviderResult<Option<StateProviderBox>> {

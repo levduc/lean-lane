@@ -13,13 +13,21 @@ fn sk(i: u64) -> SecretKey {
 }
 
 fn node(dir: &std::path::Path) -> LaneNode {
-    LaneNode::open(Config { datadir: dir.to_path_buf(), ..Default::default() }).unwrap().0
+    LaneNode::open(Config {
+        datadir: dir.to_path_buf(),
+        ..Default::default()
+    })
+    .unwrap()
+    .0
 }
 
 async fn seed_and_submit(n: &LaneNode, key: u64, nonce: u32, outputs: usize) {
     let domain = current_lane_domain();
     let outs = (0..outputs)
-        .map(|i| Output { to: Address::with_last_byte((i % 200) as u8), amount: 3 })
+        .map(|i| Output {
+            to: Address::with_last_byte((i % 200) as u8),
+            amount: 3,
+        })
         .collect();
     let tx = LeanTx::sign(nonce, outs, &sk(key), &domain);
     let signed = LeanSigned::new(tx);
@@ -27,7 +35,10 @@ async fn seed_and_submit(n: &LaneNode, key: u64, nonce: u32, outputs: usize) {
     if nonce == 0 {
         n.seed_account(
             sender,
-            Acct { nonce: 0, balance: 10 * (lean_fee(outputs) + outputs as u128 * 3 * AMOUNT_UNIT) },
+            Acct {
+                nonce: 0,
+                balance: 10 * (lean_fee(outputs) + outputs as u128 * 3 * AMOUNT_UNIT),
+            },
         )
         .await;
     }
@@ -38,7 +49,10 @@ async fn seed_and_submit(n: &LaneNode, key: u64, nonce: u32, outputs: usize) {
 async fn advance(n: &LaneNode, key: u64, nonce: u32) -> (B256, Vec<u8>) {
     seed_and_submit(n, key, nonce, 2).await;
     let (head_c, head_n, ts) = *n.head.lock().await;
-    let (c, wire) = n.shim_build(head_c, head_n + 1, ts + 1000, 1_000_000).await.unwrap();
+    let (c, wire) = n
+        .shim_build(head_c, head_n + 1, ts + 1000, 1_000_000)
+        .await
+        .unwrap();
     assert_eq!(n.shim_new(&wire).await.unwrap(), NewBlockOutcome::Valid(c));
     (c, wire)
 }
@@ -49,9 +63,20 @@ async fn canonical_blocks_are_found_by_commitment() {
     let n = node(dir.path());
     let (c1, w1) = advance(&n, 1, 0).await;
     let (c2, w2) = advance(&n, 1, 1).await;
-    assert_eq!(n.block_wire_bytes_by_commitment(c1).await.unwrap(), Some(w1));
-    assert_eq!(n.block_wire_bytes_by_commitment(c2).await.unwrap(), Some(w2));
-    assert_eq!(n.block_wire_bytes_by_commitment(B256::repeat_byte(9)).await.unwrap(), None);
+    assert_eq!(
+        n.block_wire_bytes_by_commitment(c1).await.unwrap(),
+        Some(w1)
+    );
+    assert_eq!(
+        n.block_wire_bytes_by_commitment(c2).await.unwrap(),
+        Some(w2)
+    );
+    assert_eq!(
+        n.block_wire_bytes_by_commitment(B256::repeat_byte(9))
+            .await
+            .unwrap(),
+        None
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -60,9 +85,15 @@ async fn staged_blocks_are_found_by_commitment() {
     let n = node(dir.path());
     seed_and_submit(&n, 2, 0, 2).await;
     let (head_c, head_n, ts) = *n.head.lock().await;
-    let (c, wire) = n.shim_build(head_c, head_n + 1, ts + 1000, 1_000_000).await.unwrap();
+    let (c, wire) = n
+        .shim_build(head_c, head_n + 1, ts + 1000, 1_000_000)
+        .await
+        .unwrap();
     assert_eq!(n.stage_block(&wire).await.unwrap(), StageOutcome::Staged(c));
-    assert_eq!(n.block_wire_bytes_by_commitment(c).await.unwrap(), Some(wire));
+    assert_eq!(
+        n.block_wire_bytes_by_commitment(c).await.unwrap(),
+        Some(wire)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -73,7 +104,10 @@ async fn lookup_by_commitment_survives_reopen() {
         advance(&n, 3, 0).await
     };
     let n = node(dir.path());
-    assert_eq!(n.block_wire_bytes_by_commitment(c1).await.unwrap(), Some(w1));
+    assert_eq!(
+        n.block_wire_bytes_by_commitment(c1).await.unwrap(),
+        Some(w1)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -92,9 +126,18 @@ async fn scan_finds_canonical_blocks_when_the_index_is_cold() {
     // skipped, which is the whole point of the floor.)
     let head_n = n.head.lock().await.1;
     n.index_floor.store(head_n + 1, Ordering::Relaxed);
-    assert_eq!(n.block_wire_bytes_by_commitment(c1).await.unwrap(), Some(w1));
-    assert_eq!(n.block_wire_bytes_by_commitment(c2).await.unwrap(), Some(w2));
-    assert_eq!(n.block_wire_bytes_by_commitment(c3).await.unwrap(), Some(w3));
+    assert_eq!(
+        n.block_wire_bytes_by_commitment(c1).await.unwrap(),
+        Some(w1)
+    );
+    assert_eq!(
+        n.block_wire_bytes_by_commitment(c2).await.unwrap(),
+        Some(w2)
+    );
+    assert_eq!(
+        n.block_wire_bytes_by_commitment(c3).await.unwrap(),
+        Some(w3)
+    );
     let idx = n.by_commitment.lock().await;
     assert!(idx.contains_key(&c1));
     assert!(idx.contains_key(&c2));
@@ -109,10 +152,16 @@ async fn unknown_commitment_is_cached_as_a_miss() {
     advance(&n, 5, 0).await;
     advance(&n, 5, 1).await;
     let unknown = B256::repeat_byte(9);
-    assert_eq!(n.block_wire_bytes_by_commitment(unknown).await.unwrap(), None);
+    assert_eq!(
+        n.block_wire_bytes_by_commitment(unknown).await.unwrap(),
+        None
+    );
     assert!(n.scan_misses.lock().await.contains(&unknown));
     let scans = n.stats.log_scans.load(Ordering::Relaxed);
-    assert_eq!(n.block_wire_bytes_by_commitment(unknown).await.unwrap(), None);
+    assert_eq!(
+        n.block_wire_bytes_by_commitment(unknown).await.unwrap(),
+        None
+    );
     assert_eq!(
         n.stats.log_scans.load(Ordering::Relaxed),
         scans,
@@ -127,8 +176,15 @@ async fn unknown_commitment_is_cached_as_a_miss() {
         "an unrelated append cannot turn a miss into a hit"
     );
     let scans = n.stats.log_scans.load(Ordering::Relaxed);
-    assert_eq!(n.block_wire_bytes_by_commitment(unknown).await.unwrap(), None);
-    assert_eq!(n.stats.log_scans.load(Ordering::Relaxed), scans, "still cached after an append");
+    assert_eq!(
+        n.block_wire_bytes_by_commitment(unknown).await.unwrap(),
+        None
+    );
+    assert_eq!(
+        n.stats.log_scans.load(Ordering::Relaxed),
+        scans,
+        "still cached after an append"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -140,7 +196,10 @@ async fn appending_a_missed_commitment_drops_its_cached_miss() {
     advance(&n, 7, 0).await;
     seed_and_submit(&n, 7, 1, 2).await;
     let (head_c, head_n, ts) = *n.head.lock().await;
-    let (c, wire) = n.shim_build(head_c, head_n + 1, ts + 1000, 1_000_000).await.unwrap();
+    let (c, wire) = n
+        .shim_build(head_c, head_n + 1, ts + 1000, 1_000_000)
+        .await
+        .unwrap();
     // `arc_buildBlock` self-stages its result; drop the staged copy, because
     // this test needs a commitment that really is unknown to the index, the
     // staged map AND the queue — that is what makes the lookup a cached miss.
@@ -152,7 +211,10 @@ async fn appending_a_missed_commitment_drops_its_cached_miss() {
         !n.scan_misses.lock().await.contains(&c),
         "appending the missed commitment must drop its cached miss"
     );
-    assert_eq!(n.block_wire_bytes_by_commitment(c).await.unwrap(), Some(wire));
+    assert_eq!(
+        n.block_wire_bytes_by_commitment(c).await.unwrap(),
+        Some(wire)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -161,12 +223,21 @@ async fn new_block_by_commitment_promotes_a_staged_block() {
     let n = node(dir.path());
     seed_and_submit(&n, 4, 0, 2).await;
     let (head_c, head_n, ts) = *n.head.lock().await;
-    let (c, wire) = n.shim_build(head_c, head_n + 1, ts + 1000, 1_000_000).await.unwrap();
+    let (c, wire) = n
+        .shim_build(head_c, head_n + 1, ts + 1000, 1_000_000)
+        .await
+        .unwrap();
     assert_eq!(n.stage_block(&wire).await.unwrap(), StageOutcome::Staged(c));
-    assert_eq!(n.shim_new_by_commitment(c).await.unwrap(), NewBlockOutcome::Valid(c));
+    assert_eq!(
+        n.shim_new_by_commitment(c).await.unwrap(),
+        NewBlockOutcome::Valid(c)
+    );
     assert_eq!(n.head.lock().await.0, c);
     // idempotent: already canonical
-    assert_eq!(n.shim_new_by_commitment(c).await.unwrap(), NewBlockOutcome::Valid(c));
+    assert_eq!(
+        n.shim_new_by_commitment(c).await.unwrap(),
+        NewBlockOutcome::Valid(c)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -175,7 +246,9 @@ async fn new_block_by_unknown_commitment_is_syncing() {
     let n = node(dir.path());
     let head_n = n.head.lock().await.1;
     assert_eq!(
-        n.shim_new_by_commitment(B256::repeat_byte(7)).await.unwrap(),
+        n.shim_new_by_commitment(B256::repeat_byte(7))
+            .await
+            .unwrap(),
         NewBlockOutcome::Syncing { head: head_n }
     );
 }
@@ -190,13 +263,25 @@ async fn staged_entry_survives_an_unrelated_head_move() {
     let n = node(dir.path());
     seed_and_submit(&n, 5, 0, 2).await;
     let (head_c, head_n, ts) = *n.head.lock().await;
-    let (ca, wa) = n.shim_build(head_c, head_n + 1, ts + 1000, 1_000_000).await.unwrap();
+    let (ca, wa) = n
+        .shim_build(head_c, head_n + 1, ts + 1000, 1_000_000)
+        .await
+        .unwrap();
     assert_eq!(n.stage_block(&wa).await.unwrap(), StageOutcome::Staged(ca));
-    let (cb, wb) = n.shim_build(head_c, head_n + 1, ts + 2000, 1_000_000).await.unwrap();
+    let (cb, wb) = n
+        .shim_build(head_c, head_n + 1, ts + 2000, 1_000_000)
+        .await
+        .unwrap();
     assert_ne!(ca, cb);
     assert_eq!(n.shim_new(&wb).await.unwrap(), NewBlockOutcome::Valid(cb));
-    assert_eq!(n.block_wire_bytes_by_commitment(ca).await.unwrap(), Some(wa));
-    assert!(matches!(n.shim_new_by_commitment(ca).await, Err(_) | Ok(NewBlockOutcome::Syncing { .. })));
+    assert_eq!(
+        n.block_wire_bytes_by_commitment(ca).await.unwrap(),
+        Some(wa)
+    );
+    assert!(matches!(
+        n.shim_new_by_commitment(ca).await,
+        Err(_) | Ok(NewBlockOutcome::Syncing { .. })
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -236,10 +321,16 @@ async fn serving_an_unknown_commitment_does_not_scan_above_the_index_floor() {
         advance(&n, 9, nonce).await;
     }
     assert_eq!(
-        n.block_wire_bytes_by_commitment_for(B256::repeat_byte(0xb7), "get_bytes").await.unwrap(),
+        n.block_wire_bytes_by_commitment_for(B256::repeat_byte(0xb7), "get_bytes")
+            .await
+            .unwrap(),
         None
     );
-    assert_eq!(n.stats.log_scans.load(Ordering::Relaxed), 0, "nothing to scan above the floor");
+    assert_eq!(
+        n.stats.log_scans.load(Ordering::Relaxed),
+        0,
+        "nothing to scan above the floor"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -254,14 +345,27 @@ async fn anchoring_a_staged_block_never_scans_the_log() {
     for nonce in 0..3 {
         seed_and_submit(&n, 6, nonce, 2).await;
         let (head_c, head_n, ts) = *n.head.lock().await;
-        let (c, wire) = n.shim_build(head_c, head_n + 1, ts + 1000, 1_000_000).await.unwrap();
+        let (c, wire) = n
+            .shim_build(head_c, head_n + 1, ts + 1000, 1_000_000)
+            .await
+            .unwrap();
         assert_eq!(n.stage_block(&wire).await.unwrap(), StageOutcome::Staged(c));
-        assert_eq!(n.shim_new_by_commitment(c).await.unwrap(), NewBlockOutcome::Valid(c));
+        assert_eq!(
+            n.shim_new_by_commitment(c).await.unwrap(),
+            NewBlockOutcome::Valid(c)
+        );
     }
-    assert_eq!(n.stats.log_scans.load(Ordering::Relaxed), 0, "anchor path must not scan the log");
+    assert_eq!(
+        n.stats.log_scans.load(Ordering::Relaxed),
+        0,
+        "anchor path must not scan the log"
+    );
     // and the idempotent re-anchor of a canonical block is index-only too
     let head_c = n.head.lock().await.0;
-    assert_eq!(n.shim_new_by_commitment(head_c).await.unwrap(), NewBlockOutcome::Valid(head_c));
+    assert_eq!(
+        n.shim_new_by_commitment(head_c).await.unwrap(),
+        NewBlockOutcome::Valid(head_c)
+    );
     assert_eq!(n.stats.log_scans.load(Ordering::Relaxed), 0);
 }
 
@@ -279,13 +383,19 @@ async fn a_built_block_anchors_from_its_own_staged_copy() {
     for nonce in 0..3u32 {
         seed_and_submit(&n, 21, nonce, 2).await;
         let (head_c, head_n, ts) = *n.head.lock().await;
-        let (c, _wire) = n.shim_build(head_c, head_n + 1, ts + 1000, 1_000_000).await.unwrap();
+        let (c, _wire) = n
+            .shim_build(head_c, head_n + 1, ts + 1000, 1_000_000)
+            .await
+            .unwrap();
         assert!(
             n.staged.lock().await.iter().any(|(k, _)| *k == c),
             "arc_buildBlock must stage its own result"
         );
         // the CL only ever hands back the commitment
-        assert_eq!(n.shim_new_by_commitment(c).await.unwrap(), NewBlockOutcome::Valid(c));
+        assert_eq!(
+            n.shim_new_by_commitment(c).await.unwrap(),
+            NewBlockOutcome::Valid(c)
+        );
         assert_eq!(n.head.lock().await.0, c);
     }
     assert_eq!(
@@ -298,7 +408,11 @@ async fn a_built_block_anchors_from_its_own_staged_copy() {
         0,
         "the proposer must never fetch its own block from a peer"
     );
-    assert_eq!(n.stats.log_scans.load(Ordering::Relaxed), 0, "and never scan the log");
+    assert_eq!(
+        n.stats.log_scans.load(Ordering::Relaxed),
+        0,
+        "and never scan the log"
+    );
     // staged map drained by the retention sweep, not leaking an entry a height
     assert!(n.staged.lock().await.len() <= 1);
 }
@@ -312,9 +426,11 @@ async fn staging_a_self_built_block_again_is_a_no_op() {
     let n = node(dir.path());
     seed_and_submit(&n, 22, 0, 2).await;
     let (head_c, head_n, ts) = *n.head.lock().await;
-    let (c, wire) = n.shim_build(head_c, head_n + 1, ts + 1000, 1_000_000).await.unwrap();
-    let staged_before: Vec<B256> =
-        n.staged.lock().await.iter().map(|(k, _)| *k).collect();
+    let (c, wire) = n
+        .shim_build(head_c, head_n + 1, ts + 1000, 1_000_000)
+        .await
+        .unwrap();
+    let staged_before: Vec<B256> = n.staged.lock().await.iter().map(|(k, _)| *k).collect();
     assert_eq!(staged_before, vec![c]);
 
     assert_eq!(n.stage_block(&wire).await.unwrap(), StageOutcome::Staged(c));
@@ -326,7 +442,10 @@ async fn staging_a_self_built_block_again_is_a_no_op() {
 
     // build -> stage -> newBlock still works, and still promotes
     use std::sync::atomic::Ordering;
-    assert_eq!(n.shim_new_by_commitment(c).await.unwrap(), NewBlockOutcome::Valid(c));
+    assert_eq!(
+        n.shim_new_by_commitment(c).await.unwrap(),
+        NewBlockOutcome::Valid(c)
+    );
     assert_eq!(n.head.lock().await.0, c);
     assert_eq!(n.stats.promoted.load(Ordering::Relaxed), 1);
     assert_eq!(n.stats.block_pulls.load(Ordering::Relaxed), 0);
@@ -346,18 +465,36 @@ async fn self_staged_build_matches_the_direct_path_byte_for_byte() {
         seed_and_submit(&p, 23, nonce, 3).await;
         seed_and_submit(&d, 23, nonce, 3).await;
         let (head_c, head_n, ts) = *p.head.lock().await;
-        let (c, wire) = p.shim_build(head_c, head_n + 1, ts + 1000, 1_000_000).await.unwrap();
-        assert_eq!(p.shim_new_by_commitment(c).await.unwrap(), NewBlockOutcome::Valid(c));
+        let (c, wire) = p
+            .shim_build(head_c, head_n + 1, ts + 1000, 1_000_000)
+            .await
+            .unwrap();
+        assert_eq!(
+            p.shim_new_by_commitment(c).await.unwrap(),
+            NewBlockOutcome::Valid(c)
+        );
         assert_eq!(d.shim_new(&wire).await.unwrap(), NewBlockOutcome::Valid(c));
-        assert_eq!(*p.head.lock().await, *d.head.lock().await, "head diverged at {nonce}");
+        assert_eq!(
+            *p.head.lock().await,
+            *d.head.lock().await,
+            "head diverged at {nonce}"
+        );
         assert_eq!(
             p.state.lock().await.digest(),
             d.state.lock().await.digest(),
             "state diverged at {nonce}"
         );
     }
-    assert_eq!(p.stats.promoted.load(Ordering::Relaxed), 6, "all six via promote_staged");
-    assert_eq!(d.stats.promoted.load(Ordering::Relaxed), 0, "the follower used the full path");
+    assert_eq!(
+        p.stats.promoted.load(Ordering::Relaxed),
+        6,
+        "all six via promote_staged"
+    );
+    assert_eq!(
+        d.stats.promoted.load(Ordering::Relaxed),
+        0,
+        "the follower used the full path"
+    );
     let rp: Vec<_> = p.receipts.lock().await.iter().cloned().collect();
     let rd: Vec<_> = d.receipts.lock().await.iter().cloned().collect();
     assert_eq!(rp, rd, "receipts diverged");
@@ -378,12 +515,21 @@ async fn self_staging_respects_the_32_entry_cap() {
     let (head_c, head_n, _) = *n.head.lock().await;
     for i in 0..40u64 {
         // distinct timestamps => distinct commitments => distinct candidates
-        n.shim_build(head_c, head_n + 1, 1_000 + i, 1_000_000).await.unwrap();
+        n.shim_build(head_c, head_n + 1, 1_000 + i, 1_000_000)
+            .await
+            .unwrap();
     }
-    assert_eq!(n.staged.lock().await.len(), 32, "staged map stays bounded at 32");
+    assert_eq!(
+        n.staged.lock().await.len(),
+        32,
+        "staged map stays bounded at 32"
+    );
     // and an identical rebuild replaces rather than duplicates
     let before = n.staged.lock().await.len();
-    let (c, _) = n.shim_build(head_c, head_n + 1, 1_039, 1_000_000).await.unwrap();
+    let (c, _) = n
+        .shim_build(head_c, head_n + 1, 1_039, 1_000_000)
+        .await
+        .unwrap();
     let q = n.staged.lock().await;
     assert_eq!(q.len(), before);
     assert_eq!(q.iter().filter(|(k, _)| *k == c).count(), 1);

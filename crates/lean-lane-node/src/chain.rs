@@ -87,7 +87,13 @@ impl LeanBlock {
         pre.extend_from_slice(&timestamp_ms.to_le_bytes());
         pre.extend_from_slice(txs_hash.as_slice());
         let commitment = keccak256(&pre);
-        Self { parent, number, timestamp_ms, txs, commitment }
+        Self {
+            parent,
+            number,
+            timestamp_ms,
+            txs,
+            commitment,
+        }
     }
 
     /// Canonical CONSENSUS wire form (the SSZ-carried bytes; commitment NOT
@@ -157,7 +163,12 @@ impl LeanBlock {
         pre.extend_from_slice(&number.to_le_bytes());
         pre.extend_from_slice(&timestamp_ms.to_le_bytes());
         pre.extend_from_slice(txs_hash.as_slice());
-        Ok(WireHeader { parent, number, timestamp_ms, commitment: keccak256(&pre) })
+        Ok(WireHeader {
+            parent,
+            number,
+            timestamp_ms,
+            commitment: keccak256(&pre),
+        })
     }
 
     /// Strict wire decode: malformed and trailing bytes rejected; the
@@ -200,7 +211,13 @@ impl LeanBlock {
             txs.push(bytes[at..at + len].to_vec());
             at += len;
         }
-        Ok(Self { parent, number, timestamp_ms, txs, commitment: h.commitment })
+        Ok(Self {
+            parent,
+            number,
+            timestamp_ms,
+            txs,
+            commitment: h.commitment,
+        })
     }
 
     fn payload(&self) -> Vec<u8> {
@@ -302,15 +319,24 @@ pub struct BlockLog {
 
 impl BlockLog {
     pub fn open(path: &Path) -> std::io::Result<Self> {
-        let file = std::fs::OpenOptions::new().create(true).read(true).append(true).open(path)?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(path)?;
         let bytes_written = file.metadata()?.len();
-        Ok(Self { file, bytes_written, index: Default::default() })
+        Ok(Self {
+            file,
+            bytes_written,
+            index: Default::default(),
+        })
     }
 
     pub fn append(&mut self, block: &LeanBlock) -> std::io::Result<AppendTiming> {
         let offset = self.bytes_written;
         let payload = block.payload();
-        self.index.insert(block.number, (offset, payload.len() as u32));
+        self.index
+            .insert(block.number, (offset, payload.len() as u32));
         let len = (payload.len() as u32).to_le_bytes();
         let mut rec = Vec::with_capacity(8 + payload.len());
         rec.extend_from_slice(&len);
@@ -382,7 +408,9 @@ impl BlockLog {
 
     /// Read one block back from the log by number (None if unknown).
     pub fn read_block(&mut self, number: u64) -> std::io::Result<Option<LeanBlock>> {
-        let Some(&(offset, len)) = self.index.get(&number) else { return Ok(None) };
+        let Some(&(offset, len)) = self.index.get(&number) else {
+            return Ok(None);
+        };
         self.file.seek(SeekFrom::Start(offset + 4))?;
         let mut payload = vec![0u8; len as usize];
         self.file.read_exact(&mut payload)?;

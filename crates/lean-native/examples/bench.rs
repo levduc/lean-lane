@@ -18,13 +18,26 @@ fn main() {
     let domain = lane_domain(1338);
     let beneficiary = Address::with_last_byte(0xbe);
     const TOTAL_OUTPUTS: usize = 100_000;
-    println!("lean-native bench — {} total outputs per config, {} rayon threads", TOTAL_OUTPUTS, rayon::current_num_threads());
+    println!(
+        "lean-native bench — {} total outputs per config, {} rayon threads",
+        TOTAL_OUTPUTS,
+        rayon::current_num_threads()
+    );
     println!("baseline: type-2 EIP-1559 transfer = 122 B/output, ecrecover per output");
     println!();
-    println!("{:>4} {:>7} {:>9} | {:>9} {:>9} {:>9} | {:>9} {:>9} {:>9} | {:>8}",
-        "N", "txs", "B/out",
-        "dec us/o", "recS us/o", "excS us/o",
-        "recP us/o", "excP us/o", "totP us/o", "pack x");
+    println!(
+        "{:>4} {:>7} {:>9} | {:>9} {:>9} {:>9} | {:>9} {:>9} {:>9} | {:>8}",
+        "N",
+        "txs",
+        "B/out",
+        "dec us/o",
+        "recS us/o",
+        "excS us/o",
+        "recP us/o",
+        "excP us/o",
+        "totP us/o",
+        "pack x"
+    );
     for n in [1usize, 10, 100] {
         let n_txs = TOTAL_OUTPUTS / n;
         // sign corpus (one tx per sender; hot+spread recipient mix)
@@ -58,7 +71,13 @@ fn main() {
         // pre-state: fund every sender
         let mut base = State::new();
         for r in &rec_s {
-            base.insert(r.sender, Account { nonce: 0, balance: u128::MAX / 2 });
+            base.insert(
+                r.sender,
+                Account {
+                    nonce: 0,
+                    balance: u128::MAX / 2,
+                },
+            );
         }
 
         // execute serial / parallel
@@ -76,13 +95,21 @@ fn main() {
         let per = |secs: f64| secs * 1e6 / TOTAL_OUTPUTS as f64;
         println!(
             "{:>4} {:>7} {:>9.1} | {:>9.3} {:>9.2} {:>9.3} | {:>9.2} {:>9.3} {:>9.2} | {:>8.2}",
-            n, n_txs, bytes_per_output,
-            per(dec), per(recs), per(exs),
-            per(recp), per(exp), per(dec + recp + exp),
+            n,
+            n_txs,
+            bytes_per_output,
+            per(dec),
+            per(recs),
+            per(exs),
+            per(recp),
+            per(exp),
+            per(dec + recp + exp),
             122.0 / bytes_per_output,
         );
     }
     println!();
-    println!("cols: dec=decode, recS/recP=ecrecover serial/parallel, excS/excP=execute serial/parallel,");
+    println!(
+        "cols: dec=decode, recS/recP=ecrecover serial/parallel, excS/excP=execute serial/parallel,"
+    );
     println!("      totP=decode+parallel recover+parallel execute, pack x = 122B / (B/out).");
 }

@@ -19,7 +19,10 @@ fn sk(i: u64) -> SecretKey {
 
 fn signed_fanout(key: u64, nonce: u32, n: usize) -> Vec<u8> {
     let outs = (0..n)
-        .map(|i| Output { to: Address::with_last_byte((i % 250) as u8), amount: 1 + i as u64 })
+        .map(|i| Output {
+            to: Address::with_last_byte((i % 250) as u8),
+            amount: 1 + i as u64,
+        })
         .collect();
     let env = ArcTxEnvelope::Lean(LeanSigned::new(LeanTx::sign(
         nonce,

@@ -93,8 +93,9 @@ impl FlatState {
         for e in std::fs::read_dir(dir)? {
             let e = e?;
             let name = e.file_name().to_string_lossy().into_owned();
-            if let Some(numstr) =
-                name.strip_prefix("snapshot-").and_then(|s| s.strip_suffix(".bin"))
+            if let Some(numstr) = name
+                .strip_prefix("snapshot-")
+                .and_then(|s| s.strip_suffix(".bin"))
             {
                 if let Ok(n) = numstr.parse::<u64>() {
                     if n <= ceiling && best.as_ref().is_none_or(|(b, _)| n > *b) {
@@ -103,7 +104,9 @@ impl FlatState {
                 }
             }
         }
-        let Some((_, path)) = best else { return Ok(None) };
+        let Some((_, path)) = best else {
+            return Ok(None);
+        };
         let mut bytes = Vec::new();
         std::fs::File::open(&path)?.read_to_end(&mut bytes)?;
         if bytes.len() < 56 {

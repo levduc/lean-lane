@@ -77,7 +77,13 @@ impl LeanSigned {
         let value = tx.outputs.iter().fold(U256::ZERO, |acc, o| {
             acc.saturating_add(U256::from(o.amount as u128 * AMOUNT_UNIT))
         });
-        Self { raw, tx, hash, value, empty_input: Bytes::new() }
+        Self {
+            raw,
+            tx,
+            hash,
+            value,
+            empty_input: Bytes::new(),
+        }
     }
 
     /// Signing-side constructor: encodes ONCE (the only encode in the tx's
@@ -210,8 +216,11 @@ impl alloy_rlp::Encodable for ArcTxEnvelope {
             Self::Eth(t) => t.encode(out),
             Self::Lean(_) => {
                 // Typed txs travel as an RLP string of the opaque 2718 bytes.
-                alloy_rlp::Header { list: false, payload_length: self.encode_2718_len() }
-                    .encode(out);
+                alloy_rlp::Header {
+                    list: false,
+                    payload_length: self.encode_2718_len(),
+                }
+                .encode(out);
                 self.encode_2718(out);
             }
         }
@@ -222,7 +231,12 @@ impl alloy_rlp::Encodable for ArcTxEnvelope {
             Self::Eth(t) => t.length(),
             Self::Lean(_) => {
                 let payload = self.encode_2718_len();
-                alloy_rlp::Header { list: false, payload_length: payload }.length() + payload
+                alloy_rlp::Header {
+                    list: false,
+                    payload_length: payload,
+                }
+                .length()
+                    + payload
             }
         }
     }
@@ -389,20 +403,20 @@ impl SignerRecoverable for ArcTxEnvelope {
     fn recover_signer(&self) -> Result<Address, RecoveryError> {
         match self {
             Self::Eth(t) => t.recover_signer(),
-            Self::Lean(t) => t
-                .tx
-                .recover_sender(&current_lane_domain())
-                .map_err(|_| RecoveryError::new()),
+            Self::Lean(t) => {
+                t.tx.recover_sender(&current_lane_domain())
+                    .map_err(|_| RecoveryError::new())
+            }
         }
     }
 
     fn recover_signer_unchecked(&self) -> Result<Address, RecoveryError> {
         match self {
             Self::Eth(t) => t.recover_signer_unchecked(),
-            Self::Lean(t) => t
-                .tx
-                .recover_sender(&current_lane_domain())
-                .map_err(|_| RecoveryError::new()),
+            Self::Lean(t) => {
+                t.tx.recover_sender(&current_lane_domain())
+                    .map_err(|_| RecoveryError::new())
+            }
         }
     }
 }
@@ -460,7 +474,10 @@ mod tests {
 
     fn lean(n: usize, key: u64) -> ArcTxEnvelope {
         let outs = (0..n)
-            .map(|i| Output { to: Address::with_last_byte((i % 250) as u8), amount: 1 + i as u64 })
+            .map(|i| Output {
+                to: Address::with_last_byte((i % 250) as u8),
+                amount: 1 + i as u64,
+            })
             .collect();
         ArcTxEnvelope::Lean(LeanSigned::new(LeanTx::sign(
             0,
@@ -496,7 +513,9 @@ mod tests {
     #[test]
     fn recovery_through_trait_matches_direct() {
         let tx = lean(4, 3);
-        let ArcTxEnvelope::Lean(ref inner) = tx else { unreachable!() };
+        let ArcTxEnvelope::Lean(ref inner) = tx else {
+            unreachable!()
+        };
         let direct = inner.tx().recover_sender(&current_lane_domain()).unwrap();
         assert_eq!(tx.recover_signer().unwrap(), direct);
     }

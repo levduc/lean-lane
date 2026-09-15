@@ -35,7 +35,6 @@ use tokio::time::{self, Duration};
 use tracing::{debug, info};
 use url::Url;
 
-
 use crate::accounts::AccountBuilder;
 use crate::generator::TxGenerator;
 use crate::latency::{LatencyTracker, TxSubmitted};
@@ -231,7 +230,8 @@ impl Spammer {
         };
 
         // Shared rate limiter for all senders
-        let mut limiter = RateLimiter::new(config.max_rate, config.max_num_txs, config.num_generators);
+        let mut limiter =
+            RateLimiter::new(config.max_rate, config.max_num_txs, config.num_generators);
         if let Some(gauge) = pool_gauge {
             limiter = limiter.with_pool_governor(gauge, config.pool_target);
         }
@@ -427,7 +427,7 @@ impl Spammer {
                 config.guzzler_fn_weights,
                 config.erc20_fn_weights,
                 config.tx_type_mix,
-            config.fanout_outputs.clone(),
+                config.fanout_outputs.clone(),
             )
             .with_query_nonces_on_init(true);
 
@@ -590,7 +590,8 @@ impl Spammer {
         let mut tx_generators = Vec::new();
         let mut tx_senders = Vec::new();
         for (i, mut tx_gen) in state.generators.into_iter().enumerate() {
-            let (tx_channel_sender, tx_channel_receiver) = mpsc::channel::<crate::generator::SpamTx>(10000);
+            let (tx_channel_sender, tx_channel_receiver) =
+                mpsc::channel::<crate::generator::SpamTx>(10000);
             tx_gen.reset_tx_sender(tx_channel_sender);
 
             let sender = TxSender::new_channel(

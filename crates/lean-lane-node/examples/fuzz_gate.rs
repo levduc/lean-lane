@@ -90,16 +90,22 @@ async fn main() -> eyre::Result<()> {
         .map(|i| {
             let n = 1 + (i % 12) as usize;
             let outs = (0..n)
-                .map(|j| Output { to: Address::with_last_byte((j * 3) as u8), amount: j as u64 })
+                .map(|j| Output {
+                    to: Address::with_last_byte((j * 3) as u8),
+                    amount: j as u64,
+                })
                 .collect();
-            LeanSigned::new(LeanTx::sign(i as u32, outs, &sk(i), &domain)).raw().to_vec()
+            LeanSigned::new(LeanTx::sign(i as u32, outs, &sk(i), &domain))
+                .raw()
+                .to_vec()
         })
         .collect();
     let g = lean_lane_node::chain::genesis_commitment(1338);
     let valid_blocks: Vec<Vec<u8>> = (0..32u64)
         .map(|i| {
-            let txs: Vec<Vec<u8>> =
-                (0..(i % 5)).map(|k| valid_txs[(i + k) as usize % valid_txs.len()].clone()).collect();
+            let txs: Vec<Vec<u8>> = (0..(i % 5))
+                .map(|k| valid_txs[(i + k) as usize % valid_txs.len()].clone())
+                .collect();
             LeanBlock::new(g, 1 + i, 1000 + i, txs).to_wire_bytes()
         })
         .collect();
@@ -133,7 +139,11 @@ async fn main() -> eyre::Result<()> {
         let len = rng.below(400);
         let buf = rng.bytes(len);
         if let Ok(b) = LeanBlock::from_wire_bytes(&buf) {
-            assert_eq!(b.to_wire_bytes(), buf, "T2: wire decode/encode not canonical");
+            assert_eq!(
+                b.to_wire_bytes(),
+                buf,
+                "T2: wire decode/encode not canonical"
+            );
             t2_ok += 1;
         }
         cases += 1;
@@ -143,7 +153,11 @@ async fn main() -> eyre::Result<()> {
         let base = &valid_blocks[k];
         let buf = mutate(&mut rng, base);
         if let Ok(b) = LeanBlock::from_wire_bytes(&buf) {
-            assert_eq!(b.to_wire_bytes(), buf, "T2m: wire decode/encode not canonical");
+            assert_eq!(
+                b.to_wire_bytes(),
+                buf,
+                "T2m: wire decode/encode not canonical"
+            );
             t2_ok += 1;
         }
         cases += 1;
@@ -153,7 +167,10 @@ async fn main() -> eyre::Result<()> {
     // ---- T3: full arc_newBlock path ----------------------------------------
     let dir = std::env::temp_dir().join(format!("fuzz-gate-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    let (node, _) = LaneNode::open(Config { datadir: dir.clone(), ..Default::default() })?;
+    let (node, _) = LaneNode::open(Config {
+        datadir: dir.clone(),
+        ..Default::default()
+    })?;
     // small committed prefix so known-height paths are reachable
     for i in 0..3u64 {
         let (hc, hn, _) = *node.head.lock().await;
@@ -162,11 +179,18 @@ async fn main() -> eyre::Result<()> {
         let sender = tx.recover_sender(&domain).unwrap();
         node.seed_account(
             sender,
-            Acct { nonce: tx.nonce as u64, balance: lean_fee(tx.outputs.len()) + 1_000 * AMOUNT_UNIT },
+            Acct {
+                nonce: tx.nonce as u64,
+                balance: lean_fee(tx.outputs.len()) + 1_000 * AMOUNT_UNIT,
+            },
         )
         .await;
         let blk = LeanBlock::new(hc, hn + 1, 10 + i, vec![txb]);
-        match node.shim_new(&blk.to_wire_bytes()).await.map_err(|e| eyre::eyre!(e))? {
+        match node
+            .shim_new(&blk.to_wire_bytes())
+            .await
+            .map_err(|e| eyre::eyre!(e))?
+        {
             NewBlockOutcome::Valid(_) => {}
             o => eyre::bail!("setup block not applied: {o:?}"),
         }
@@ -182,13 +206,22 @@ async fn main() -> eyre::Result<()> {
     let mut t3_err = 0u64;
     for i in 0..120_000u64 {
         let buf = if i % 2 == 0 {
-            { let len = rng.below(500); rng.bytes(len) }
+            {
+                let len = rng.below(500);
+                rng.bytes(len)
+            }
         } else {
-            { let k = rng.below(head_wire.len()); mutate(&mut rng, &head_wire[k]) }
+            {
+                let k = rng.below(head_wire.len());
+                mutate(&mut rng, &head_wire[k])
+            }
         };
         let head_before = *node.head.lock().await;
-        let digest_before =
-            if i % 500 == 0 { Some(node.state.lock().await.digest()) } else { None };
+        let digest_before = if i % 500 == 0 {
+            Some(node.state.lock().await.digest())
+        } else {
+            None
+        };
         match node.shim_new(&buf).await {
             Ok(NewBlockOutcome::Valid(_)) => {
                 let head_after = *node.head.lock().await;
@@ -199,13 +232,25 @@ async fn main() -> eyre::Result<()> {
                 t3_ok += 1;
             }
             Ok(NewBlockOutcome::Syncing { .. }) => {
-                assert_eq!(*node.head.lock().await, head_before, "T3: SYNCING must not move head");
+                assert_eq!(
+                    *node.head.lock().await,
+                    head_before,
+                    "T3: SYNCING must not move head"
+                );
                 t3_ok += 1;
             }
             Err(_) => {
-                assert_eq!(*node.head.lock().await, head_before, "T3: Err must not move head");
+                assert_eq!(
+                    *node.head.lock().await,
+                    head_before,
+                    "T3: Err must not move head"
+                );
                 if let Some(d) = digest_before {
-                    assert_eq!(node.state.lock().await.digest(), d, "T3: Err must not mutate state");
+                    assert_eq!(
+                        node.state.lock().await.digest(),
+                        d,
+                        "T3: Err must not mutate state"
+                    );
                 }
                 t3_err += 1;
             }
@@ -216,6 +261,9 @@ async fn main() -> eyre::Result<()> {
     let _ = std::fs::remove_dir_all(&dir);
 
     println!();
-    println!("FUZZ GATE PASS: {cases} total cases, 0 panics, canonical round-trips held ({:?})", t0.elapsed());
+    println!(
+        "FUZZ GATE PASS: {cases} total cases, 0 panics, canonical round-trips held ({:?})",
+        t0.elapsed()
+    );
     Ok(())
 }

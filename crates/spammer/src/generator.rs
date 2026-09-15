@@ -15,12 +15,12 @@
 // limitations under the License.
 
 use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope, TxLegacy};
+use alloy_eips::eip2718::Encodable2718;
 use alloy_primitives::{address, Address, Bytes, U256};
 use alloy_signer::Signer;
 use alloy_signer_local::LocalSigner;
 use alloy_sol_types::{sol, SolCall};
 use color_eyre::eyre::{self, Result};
-use alloy_eips::eip2718::Encodable2718;
 use k256::ecdsa::SigningKey;
 use rand::Rng;
 use serde_json::json;
@@ -39,13 +39,21 @@ use crate::erc20::TEST_TOKEN_ADDRESS;
 
 static CHAIN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1337);
 /// Set once at startup from --chain-id before any generator runs.
-pub fn set_chain_id(id: u64) { CHAIN_ID.store(id, std::sync::atomic::Ordering::Relaxed); }
-pub(crate) fn testnet_chain_id() -> u64 { CHAIN_ID.load(std::sync::atomic::Ordering::Relaxed) }
+pub fn set_chain_id(id: u64) {
+    CHAIN_ID.store(id, std::sync::atomic::Ordering::Relaxed);
+}
+pub(crate) fn testnet_chain_id() -> u64 {
+    CHAIN_ID.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// A generated, signed transaction ready for dispatch. Standard types travel as
 /// alloy envelopes; the lean fan-out (0x50) travels as its canonical raw bytes
 /// (its wire format is not representable as an alloy `TxEnvelope`).
 #[derive(Clone, Debug)]
+// One variant is a full `TxEnvelope` and the other a few bytes, but this
+// flows through a 10k-deep mpsc channel on the load generator's hot path:
+// boxing would trade the size difference for a heap allocation per tx.
+#[allow(clippy::large_enum_variant)]
 pub enum SpamTx {
     Envelope(TxEnvelope),
     Lean(Vec<u8>),
@@ -196,7 +204,12 @@ impl TxGenerator {
             fresh_recipients,
             recipient_pool,
             fresh_ctr: std::sync::atomic::AtomicU64::new(
-                (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) & 0xFFFF_FFFF) << 28,
+                (std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0)
+                    & 0xFFFF_FFFF)
+                    << 28,
             ),
             guzzler_fn_weights,
             erc20_fn_weights,
@@ -908,10 +921,15 @@ impl TxGenerator {
             // Fixed address window [base, base+size): sequential walk with wrap-around.
             // First pass CREATES the pool's accounts; every later pass is pure balance
             // UPDATES over existing accounts (steady-state payments on a large state).
-            let n = self.fresh_ctr.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % size;
+            let n = self
+                .fresh_ctr
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                % size;
             Address::left_padding_from(&(base + n).to_be_bytes())
         } else if self.fresh_recipients {
-            let n = self.fresh_ctr.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let n = self
+                .fresh_ctr
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Address::left_padding_from(&n.to_be_bytes())
         } else {
             // avoid zero address and Ethereum precompile addresses
@@ -923,11 +941,7 @@ impl TxGenerator {
     /// signature, `fanout_outputs` recipients of 1 gwei-unit each. Recipients
     /// reuse `transfer_recipient` (pool walk / fresh / synthetic), with a
     /// per-output salt so the default mode yields distinct addresses.
-    fn make_fanout_tx(
-        &self,
-        nonce: u64,
-        signer: &LocalSigner<SigningKey>,
-    ) -> Result<SpamTx> {
+    fn make_fanout_tx(&self, nonce: u64, signer: &LocalSigner<SigningKey>) -> Result<SpamTx> {
         let nonce32: u32 = nonce
             .try_into()
             .map_err(|_| eyre::eyre!("fanout: nonce {nonce} exceeds u32 (lean wire nonce)"))?;
@@ -1005,7 +1019,7 @@ impl TxGenerator {
 mod tests {
     use super::*;
     use crate::spammer::TEST_MNEMONIC;
-    use alloy_consensus::{transaction::SignerRecoverable, Transaction};
+    use alloy_consensus::transaction::SignerRecoverable;
     use std::{collections::HashMap, time::Duration};
     use tokio::sync::mpsc;
 
@@ -1215,33 +1229,55 @@ mod tests {
     }
 }
 
-
 /// Parse a `--fanout-outputs` spec: either a single N ("10") or a weighted mix
 /// "N:W,N:W,..." (weights = share of transactions). Returns the deterministic
 /// cycle pattern: weights reduced by their gcd, each N repeated its reduced
 /// weight, in spec order. Sampling `pattern[nonce % len]` then gives exact
 /// realized shares over every full cycle with zero randomness.
 pub fn parse_fanout_spec(spec: &str) -> std::result::Result<Vec<usize>, String> {
-    fn gcd(a: usize, b: usize) -> usize { if b == 0 { a } else { gcd(b, a % b) } }
+    fn gcd(a: usize, b: usize) -> usize {
+        if b == 0 {
+            a
+        } else {
+            gcd(b, a % b)
+        }
+    }
     let spec = spec.trim();
     if !spec.contains(':') {
-        let n: usize = spec.parse().map_err(|_| format!("not a number: {spec:?}"))?;
-        if n == 0 || n > 10_000 { return Err(format!("N must be 1..=10000, got {n}")); }
+        let n: usize = spec
+            .parse()
+            .map_err(|_| format!("not a number: {spec:?}"))?;
+        if n == 0 || n > 10_000 {
+            return Err(format!("N must be 1..=10000, got {n}"));
+        }
         return Ok(vec![n]);
     }
     let mut pairs: Vec<(usize, usize)> = Vec::new();
     for part in spec.split(',') {
-        let (n, w) = part.split_once(':').ok_or_else(|| format!("bad pair {part:?} (want N:W)"))?;
+        let (n, w) = part
+            .split_once(':')
+            .ok_or_else(|| format!("bad pair {part:?} (want N:W)"))?;
         let n: usize = n.trim().parse().map_err(|_| format!("bad N in {part:?}"))?;
-        let w: usize = w.trim().parse().map_err(|_| format!("bad weight in {part:?}"))?;
-        if n == 0 || n > 10_000 { return Err(format!("N must be 1..=10000, got {n}")); }
-        if w == 0 { return Err(format!("weight must be > 0 in {part:?}")); }
+        let w: usize = w
+            .trim()
+            .parse()
+            .map_err(|_| format!("bad weight in {part:?}"))?;
+        if n == 0 || n > 10_000 {
+            return Err(format!("N must be 1..=10000, got {n}"));
+        }
+        if w == 0 {
+            return Err(format!("weight must be > 0 in {part:?}"));
+        }
         pairs.push((n, w));
     }
     let g = pairs.iter().fold(0usize, |acc, (_, w)| gcd(acc, *w));
-    let pattern: Vec<usize> =
-        pairs.iter().flat_map(|(n, w)| std::iter::repeat(*n).take(w / g)).collect();
-    if pattern.len() > 100_000 { return Err(format!("pattern too long ({})", pattern.len())); }
+    let pattern: Vec<usize> = pairs
+        .iter()
+        .flat_map(|(n, w)| std::iter::repeat_n(*n, w / g))
+        .collect();
+    if pattern.len() > 100_000 {
+        return Err(format!("pattern too long ({})", pattern.len()));
+    }
     Ok(pattern)
 }
 
@@ -1266,8 +1302,10 @@ mod fanout_spec_tests {
     #[test]
     fn weighted_mix_expands_in_order() {
         assert_eq!(parse_fanout_spec("1:2,100:1").unwrap(), vec![1, 1, 100]);
-        assert_eq!(parse_fanout_spec("5:6,50:9").unwrap(),
-            vec![5, 5, 50, 50, 50]);
+        assert_eq!(
+            parse_fanout_spec("5:6,50:9").unwrap(),
+            vec![5, 5, 50, 50, 50]
+        );
     }
 
     #[test]

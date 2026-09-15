@@ -8,16 +8,16 @@
 
 use crate::chain::{genesis_commitment, AppendTiming, BlockLog, LeanBlock};
 use crate::exec::{apply_block, LeanReceipt};
+use crate::provider::LeanProvider;
 use crate::state::{Acct, FlatState};
-use alloy_eips::eip2718::Decodable2718;
 use alloy_consensus::Transaction as _;
+use alloy_eips::eip2718::Decodable2718;
 use alloy_primitives::{Address, B256, U256};
 use lean_native::envelope::{set_lane_chain_id, ArcTxEnvelope, LEAN_TX_TYPE};
 use lean_native::pool::ArcPooledTx;
 use lean_native::LeanTx;
 use reth_evm_ethereum::EthEvmConfig;
 use reth_primitives_traits::SignerRecoverable;
-use crate::provider::LeanProvider;
 use reth_transaction_pool::blobstore::InMemoryBlobStore;
 use reth_transaction_pool::validate::{EthTransactionValidator, EthTransactionValidatorBuilder};
 use reth_transaction_pool::{
@@ -64,7 +64,7 @@ impl Config {
     /// snapshots entirely rather than panicking on `% 0`, which is what both
     /// append paths used to do the first time they committed a block.
     pub fn snapshot_due(&self, number: u64) -> bool {
-        self.snapshot_every != 0 && number % self.snapshot_every == 0
+        self.snapshot_every != 0 && number.is_multiple_of(self.snapshot_every)
     }
 }
 
@@ -183,10 +183,7 @@ fn ms(ns: u64) -> f64 {
 /// line is to separate "this node was busy" from "this node was blocked
 /// behind stage/ingest/serving", so every lock on the anchor path is taken
 /// through here.
-async fn timed_lock<'a, T>(
-    m: &'a Mutex<T>,
-    acc: &AtomicU64,
-) -> tokio::sync::MutexGuard<'a, T> {
+async fn timed_lock<'a, T>(m: &'a Mutex<T>, acc: &AtomicU64) -> tokio::sync::MutexGuard<'a, T> {
     let t = Instant::now();
     let g = m.lock().await;
     add_ns(acc, t);
@@ -202,8 +199,9 @@ pub const PATH_QUEUED: u8 = 3;
 pub const PATH_PEER: u8 = 4;
 pub const PATH_SYNCING: u8 = 5;
 pub const PATH_BYTES: u8 = 6;
-const PATH_NAMES: [&str; 7] =
-    ["other", "index", "staged", "queued", "peer", "syncing", "bytes"];
+const PATH_NAMES: [&str; 7] = [
+    "other", "index", "staged", "queued", "peer", "syncing", "bytes",
+];
 
 /// Per-call decomposition of ONE `arc_newBlock` (the decide anchor). All
 /// atomics: the timer is passed by `&` through `shim_new` -> `promote_staged`
@@ -469,10 +467,18 @@ pub struct StagedBlock {
     changed: Vec<reth_execution_types::ChangedAccount>,
     receipts: Vec<LeanReceipt>,
     evict: Vec<B256>,
-    applied: usize,
     noops: usize,
     outputs: usize,
 }
+
+/// What a log replay reports: (head, blocks replayed, txs replayed, the
+/// commitment -> number index built on the way).
+type Replayed = (
+    (B256, u64, u64),
+    u64,
+    u64,
+    std::collections::HashMap<B256, u64>,
+);
 
 /// Replay `log` onto `state`, starting from the snapshot `snap` = (commitment,
 /// number, timestamp_ms) that `state` was loaded from. Each replayed tx pays
@@ -483,7 +489,7 @@ fn replay_onto(
     log: &mut BlockLog,
     snap: (B256, u64, u64),
     beneficiary: Address,
-) -> std::io::Result<((B256, u64, u64), u64, u64, std::collections::HashMap<B256, u64>)> {
+) -> std::io::Result<Replayed> {
     let (mut head, mut blocks, mut txs) = (snap, 0u64, 0u64);
     let mut by_commitment = std::collections::HashMap::new();
     log.replay(snap.1, |block| {
@@ -542,7 +548,10 @@ impl LaneNode {
             let fallback = FlatState::load_newest_snapshot_upto(&cfg.datadir, log_head)?;
             let (from, at) = match fallback {
                 Some((s, c, n, t)) => (s, (c, n, t)),
-                None => (FlatState::default(), (genesis_commitment(cfg.chain_id), 0, 0)),
+                None => (
+                    FlatState::default(),
+                    (genesis_commitment(cfg.chain_id), 0, 0),
+                ),
             };
             eprintln!(
                 concat!(
@@ -579,7 +588,10 @@ impl LaneNode {
         // Lane pool caps: the fleet launchers' deep-pool trio (counts 400k /
         // 512MB / big account slots) — default reth caps (~10k) reject bulk
         // ingress (measured: first bench run bounced 1,772 of 30k).
-        let big = SubPoolLimit { max_txs: 400_000, max_size: 512 * 1024 * 1024 };
+        let big = SubPoolLimit {
+            max_txs: 400_000,
+            max_size: 512 * 1024 * 1024,
+        };
         let pool_cfg = PoolConfig {
             pending_limit: big,
             basefee_limit: big,
@@ -680,9 +692,11 @@ impl LaneNode {
             self.stats.rejected.fetch_add(1, Ordering::Relaxed);
             return Err("only lean (0x50) transactions are accepted on the lane".into());
         }
-        let env = ArcTxEnvelope::decode_2718(&mut &bytes[..])
-            .map_err(|e| format!("decode: {e}"))?;
-        let signer = env.recover_signer().map_err(|e| format!("signature: {e}"))?;
+        let env =
+            ArcTxEnvelope::decode_2718(&mut &bytes[..]).map_err(|e| format!("decode: {e}"))?;
+        let signer = env
+            .recover_signer()
+            .map_err(|e| format!("signature: {e}"))?;
         let len = bytes.len();
         let pooled = ArcPooledTx::new(
             alloy_consensus::transaction::Recovered::new_unchecked(env, signer),
@@ -703,7 +717,9 @@ impl LaneNode {
                 self.stats.rejected.fetch_add(1, Ordering::Relaxed);
             }
         }
-        self.stats.admit_ns.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        self.stats
+            .admit_ns
+            .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
         res
     }
 
@@ -840,17 +856,27 @@ impl LaneNode {
         tm.append_ns.fetch_add(at.write_ns, Ordering::Relaxed);
         tm.fsync_ns.fetch_add(at.fsync_ns, Ordering::Relaxed);
         let t_index = Instant::now();
-        self.by_commitment.lock().await.insert(block.commitment, block.number);
+        self.by_commitment
+            .lock()
+            .await
+            .insert(block.commitment, block.number);
         // exact invalidation: only THIS commitment can have gone miss -> hit
         self.scan_misses.lock().await.remove(&block.commitment);
         add_ns(&tm.index_ns, t_index);
         if let Some(s) = digest_state {
             let t_snap = Instant::now();
-            s.write_snapshot(&self.cfg.datadir, commitment, block.number, block.timestamp_ms)?;
+            s.write_snapshot(
+                &self.cfg.datadir,
+                commitment,
+                block.number,
+                block.timestamp_ms,
+            )?;
             add_ns(&tm.append_ns, t_snap);
         }
         let append_ns = t_append.elapsed().as_nanos() as u64;
-        self.stats.append_ns_last.store(append_ns, Ordering::Relaxed);
+        self.stats
+            .append_ns_last
+            .store(append_ns, Ordering::Relaxed);
 
         *timed_lock(&self.head, &tm.lock_ns).await =
             (block.commitment, block.number, block.timestamp_ms);
@@ -869,15 +895,20 @@ impl LaneNode {
         // passed; bytes for the current height stay servable by commitment)
         let new_head = *timed_lock(&self.head, &tm.lock_ns).await;
         let new_head_n = new_head.1;
-        timed_lock(&self.staged, &tm.lock_ns).await.retain(|(_, e)| e.block.number >= new_head_n);
-        timed_lock(&self.inflight, &tm.lock_ns).await.retain(|_, (p, _, _)| *p == new_head.0);
+        timed_lock(&self.staged, &tm.lock_ns)
+            .await
+            .retain(|(_, e)| e.block.number >= new_head_n);
+        timed_lock(&self.inflight, &tm.lock_ns)
+            .await
+            .retain(|_, (p, _, _)| *p == new_head.0);
         let s = &self.stats;
         s.exec_ns.fetch_add(exec_ns, Ordering::Relaxed);
         s.append_ns.fetch_add(append_ns, Ordering::Relaxed);
         s.blocks.fetch_add(1, Ordering::Relaxed);
         s.txs.fetch_add(items.len() as u64, Ordering::Relaxed);
         s.noops.fetch_add(outcome.noops as u64, Ordering::Relaxed);
-        s.outputs.fetch_add(outcome.outputs as u64, Ordering::Relaxed);
+        s.outputs
+            .fetch_add(outcome.outputs as u64, Ordering::Relaxed);
         Ok(())
     }
 
@@ -896,7 +927,8 @@ impl LaneNode {
         self.stats.build_ns_last.store(build_ns, Ordering::Relaxed);
         let bn = block.number;
         let cm = block.commitment;
-        self.commit_block(block, items, hashes, &AnchorTimer::default()).await?;
+        self.commit_block(block, items, hashes, &AnchorTimer::default())
+            .await?;
         self.announce_to_peers(cm, bn);
         Ok(Some(bn))
     }
@@ -963,7 +995,6 @@ impl LaneNode {
             changed,
             receipts: outcome.receipts,
             evict,
-            applied: outcome.applied,
             noops: outcome.noops,
             outputs: outcome.outputs,
             block,
@@ -1018,7 +1049,9 @@ impl LaneNode {
             return Err(format!("stale parent: build on {parent}, head is {head_c}"));
         }
         if number != head_n + 1 {
-            return Err(format!("bad number {number}: head is {head_n} (want head+1)"));
+            return Err(format!(
+                "bad number {number}: head is {head_n} (want head+1)"
+            ));
         }
         // pick under the CALLER's budget (may differ from cfg)
         let mut gas = 0u64;
@@ -1032,7 +1065,11 @@ impl LaneNode {
             gas += g;
             let pooled: &ArcPooledTx = &tx.transaction;
             if let ArcTxEnvelope::Lean(lean) = pooled.0.transaction.inner() {
-                items.push((pooled.0.transaction.signer(), lean.tx().clone(), *lean.hash()));
+                items.push((
+                    pooled.0.transaction.signer(),
+                    lean.tx().clone(),
+                    *lean.hash(),
+                ));
                 raw.push(lean.raw().to_vec());
             }
         }
@@ -1062,7 +1099,8 @@ impl LaneNode {
         if let Some(mut staged) = on_head {
             let outcome = apply_block(&mut staged, &items, number, self.cfg.beneficiary);
             if !self.already_staged(commitment, head_c, &lock_ns).await {
-                let entry = self.staged_entry(block, wire.clone(), head_c, &items, &staged, outcome);
+                let entry =
+                    self.staged_entry(block, wire.clone(), head_c, &items, &staged, outcome);
                 self.insert_staged(commitment, entry, &lock_ns).await;
             }
         }
@@ -1251,15 +1289,32 @@ impl LaneNode {
             }
             (head_c, timed_lock(&self.state, lock_ns).await.clone())
         };
-        let outcome = apply_block(&mut staged_state, &items, block.number, self.cfg.beneficiary);
+        let outcome = apply_block(
+            &mut staged_state,
+            &items,
+            block.number,
+            self.cfg.beneficiary,
+        );
         let commitment = block.commitment;
-        let entry =
-            self.staged_entry(block, bytes.to_vec(), head_c, &items, &staged_state, outcome);
+        let entry = self.staged_entry(
+            block,
+            bytes.to_vec(),
+            head_c,
+            &items,
+            &staged_state,
+            outcome,
+        );
         let apply_ns = t_apply.elapsed().as_nanos() as u64;
         // visible BEFORE the caller signals completion: a waiter woken by that
         // signal must find the entry it was waiting for.
         self.insert_staged(commitment, entry, lock_ns).await;
-        Ok((StageOutcome::Staged(commitment), decode_ns, recover_ns, apply_ns, false))
+        Ok((
+            StageOutcome::Staged(commitment),
+            decode_ns,
+            recover_ns,
+            apply_ns,
+            false,
+        ))
     }
 
     /// Promote a staged block: append (fsync — the durability point), write
@@ -1272,7 +1327,6 @@ impl LaneNode {
             changed,
             receipts,
             evict,
-            applied: _,
             noops,
             outputs,
             ..
@@ -1312,17 +1366,27 @@ impl LaneNode {
         tm.append_ns.fetch_add(at.write_ns, Ordering::Relaxed);
         tm.fsync_ns.fetch_add(at.fsync_ns, Ordering::Relaxed);
         let t_index = Instant::now();
-        self.by_commitment.lock().await.insert(block.commitment, block.number);
+        self.by_commitment
+            .lock()
+            .await
+            .insert(block.commitment, block.number);
         // exact invalidation: only THIS commitment can have gone miss -> hit
         self.scan_misses.lock().await.remove(&block.commitment);
         add_ns(&tm.index_ns, t_index);
         if let Some(s) = digest_state {
             let t_snap = Instant::now();
-            s.write_snapshot(&self.cfg.datadir, commitment, block.number, block.timestamp_ms)?;
+            s.write_snapshot(
+                &self.cfg.datadir,
+                commitment,
+                block.number,
+                block.timestamp_ms,
+            )?;
             add_ns(&tm.append_ns, t_snap);
         }
         let append_ns = t_append.elapsed().as_nanos() as u64;
-        self.stats.append_ns_last.store(append_ns, Ordering::Relaxed);
+        self.stats
+            .append_ns_last
+            .store(append_ns, Ordering::Relaxed);
 
         *timed_lock(&self.head, &tm.lock_ns).await =
             (block.commitment, block.number, block.timestamp_ms);
@@ -1339,8 +1403,12 @@ impl LaneNode {
         // passed; bytes for the current height stay servable by commitment)
         let new_head = *timed_lock(&self.head, &tm.lock_ns).await;
         let new_head_n = new_head.1;
-        timed_lock(&self.staged, &tm.lock_ns).await.retain(|(_, e)| e.block.number >= new_head_n);
-        timed_lock(&self.inflight, &tm.lock_ns).await.retain(|_, (p, _, _)| *p == new_head.0);
+        timed_lock(&self.staged, &tm.lock_ns)
+            .await
+            .retain(|(_, e)| e.block.number >= new_head_n);
+        timed_lock(&self.inflight, &tm.lock_ns)
+            .await
+            .retain(|_, (p, _, _)| *p == new_head.0);
         let s = &self.stats;
         s.exec_ns.fetch_add(exec_ns, Ordering::Relaxed);
         s.append_ns.fetch_add(append_ns, Ordering::Relaxed);
@@ -1365,11 +1433,7 @@ impl LaneNode {
     /// the whole call and `pre_ms` isolates everything before dispatch (param
     /// parse, base64 decode of the body, tokio scheduling). The plain
     /// `shim_new` is the harness/test entry point: it starts the clock here.
-    pub async fn shim_new_at(
-        &self,
-        bytes: &[u8],
-        t0: Instant,
-    ) -> Result<NewBlockOutcome, String> {
+    pub async fn shim_new_at(&self, bytes: &[u8], t0: Instant) -> Result<NewBlockOutcome, String> {
         let tm = AnchorTimer::default();
         add_ns(&tm.pre_ns, t0);
         tm.set_path(PATH_BYTES);
@@ -1537,7 +1601,9 @@ impl LaneNode {
                     let _ = done_tx.send(true);
                     self.release_claim(commitment, id, &tm.lock_ns).await;
                 }
-                self.promote_staged(entry, tm).await.map_err(|e| e.to_string())?;
+                self.promote_staged(entry, tm)
+                    .await
+                    .map_err(|e| e.to_string())?;
             }
             None => {
                 let Some((my_id, done_tx)) = owner else {
@@ -1569,7 +1635,9 @@ impl LaneNode {
         // unlock the next).
         let mut parent = commitment;
         loop {
-            let next = timed_lock(&self.sync_queue, &tm.lock_ns).await.remove(&parent);
+            let next = timed_lock(&self.sync_queue, &tm.lock_ns)
+                .await
+                .remove(&parent);
             let Some(nb) = next else { break };
             let t_recover = Instant::now();
             let items = decode_block_txs(&nb.txs);
@@ -1587,7 +1655,9 @@ impl LaneNode {
             if nb.number != hn + 1 || nb.parent != hc {
                 break;
             }
-            self.commit_block(nb, items, evict, tm).await.map_err(|e| e.to_string())?;
+            self.commit_block(nb, items, evict, tm)
+                .await
+                .map_err(|e| e.to_string())?;
             let t_ann = Instant::now();
             self.announce_to_peers(c, num);
             add_ns(&tm.announce_ns, t_ann);
@@ -1765,7 +1835,9 @@ impl LaneNode {
             let _ = params.insert("commitment", format!("{c}"));
             let r: Result<serde_json::Value, _> = cl.request("arc_getBlockBytes", params).await;
             let Ok(v) = r else { continue };
-            let Some(b64) = v.get("blockBytes").and_then(|x| x.as_str()) else { continue };
+            let Some(b64) = v.get("blockBytes").and_then(|x| x.as_str()) else {
+                continue;
+            };
             let Ok(bytes) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
             else {
                 continue;
@@ -1799,7 +1871,9 @@ impl LaneNode {
                 let mut params = jsonrpsee::core::params::ObjectParams::new();
                 let _ = params.insert("commitment", format!("{commitment}"));
                 let _ = params.insert("number", number);
-                let _ = c.request::<serde_json::Value, _>("arc_announceBlock", params).await;
+                let _ = c
+                    .request::<serde_json::Value, _>("arc_announceBlock", params)
+                    .await;
             });
         }
     }
@@ -1860,7 +1934,9 @@ impl LaneNode {
             return;
         }
         if self.holds_announced(commitment, number, head_n).await {
-            self.stats.announce_skipped_staged.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .announce_skipped_staged
+                .fetch_add(1, Ordering::Relaxed);
             return;
         }
         if number == head_n + 1 {
@@ -1877,7 +1953,9 @@ impl LaneNode {
                     return;
                 }
                 if self.holds_announced(commitment, number, head_n).await {
-                    self.stats.announce_skipped_staged.fetch_add(1, Ordering::Relaxed);
+                    self.stats
+                        .announce_skipped_staged
+                        .fetch_add(1, Ordering::Relaxed);
                     return;
                 }
             }
@@ -1955,7 +2033,13 @@ impl LaneNode {
         // the return expression the guard lived across the copy, so every
         // peer/CL `arc_getBlockBytes` stalled the next height's append by a
         // memcpy it had no reason to wait for.
-        let block = { self.log.lock().await.read_block(number).map_err(|e| e.to_string())? };
+        let block = {
+            self.log
+                .lock()
+                .await
+                .read_block(number)
+                .map_err(|e| e.to_string())?
+        };
         Ok(block.map(|b| b.to_wire_bytes()))
     }
 
@@ -1987,7 +2071,13 @@ impl LaneNode {
         if let Some((_, e)) = self.staged.lock().await.iter().find(|(k, _)| *k == c) {
             return Ok(Some((e.wire.clone(), "staged")));
         }
-        if let Some(b) = self.sync_queue.lock().await.values().find(|b| b.commitment == c) {
+        if let Some(b) = self
+            .sync_queue
+            .lock()
+            .await
+            .values()
+            .find(|b| b.commitment == c)
+        {
             return Ok(Some((b.to_wire_bytes(), "queued")));
         }
         // Drop the index guard BEFORE reading the log: `block_wire_bytes`
@@ -2004,12 +2094,21 @@ impl LaneNode {
         let head_n = self.head.lock().await.1;
         let floor = head_n.saturating_sub(SCAN_LIMIT).max(1);
         // never re-walk what the index already covers completely
-        let ceil = self.index_floor.load(Ordering::Relaxed).saturating_sub(1).min(head_n);
+        let ceil = self
+            .index_floor
+            .load(Ordering::Relaxed)
+            .saturating_sub(1)
+            .min(head_n);
         if ceil >= floor {
             self.stats.log_scans.fetch_add(1, Ordering::Relaxed);
             for n in (floor..=ceil).rev() {
                 *scanned += 1;
-                let Some(b) = self.log.lock().await.read_block(n).map_err(|e| e.to_string())?
+                let Some(b) = self
+                    .log
+                    .lock()
+                    .await
+                    .read_block(n)
+                    .map_err(|e| e.to_string())?
                 else {
                     continue;
                 };
@@ -2058,10 +2157,7 @@ impl LaneNode {
 
     /// Shim: `arc_getBlockBytes{commitment}` — canonical, staged or queued
     /// block with that commitment.
-    pub async fn block_wire_bytes_by_commitment(
-        &self,
-        c: B256,
-    ) -> Result<Option<Vec<u8>>, String> {
+    pub async fn block_wire_bytes_by_commitment(&self, c: B256) -> Result<Option<Vec<u8>>, String> {
         self.block_wire_bytes_by_commitment_for(c, "other").await
     }
 
@@ -2075,7 +2171,13 @@ impl LaneNode {
     }
 
     pub async fn receipt(&self, hash: B256) -> Option<LeanReceipt> {
-        self.receipts.lock().await.iter().rev().find(|r| r.tx_hash == hash).cloned()
+        self.receipts
+            .lock()
+            .await
+            .iter()
+            .rev()
+            .find(|r| r.tx_hash == hash)
+            .cloned()
     }
 
     /// One-line periodic snapshot of everything that can grow without bound,
@@ -2187,8 +2289,12 @@ fn parallel_recovery_enabled() -> bool {
 pub fn decode_block_txs_serial(txs: &[Vec<u8>]) -> Vec<(Address, LeanTx, B256)> {
     let mut items = Vec::with_capacity(txs.len());
     for bytes in txs {
-        let Ok(env) = ArcTxEnvelope::decode_2718(&mut bytes.as_slice()) else { continue };
-        let Ok(signer) = env.recover_signer() else { continue };
+        let Ok(env) = ArcTxEnvelope::decode_2718(&mut bytes.as_slice()) else {
+            continue;
+        };
+        let Ok(signer) = env.recover_signer() else {
+            continue;
+        };
         if let ArcTxEnvelope::Lean(lean) = env {
             let hash = *lean.hash();
             items.push((signer, lean.tx().clone(), hash));

@@ -375,8 +375,11 @@ impl SpammerArgs {
             recipient_pool: self.recipient_pool.as_ref().map(|v| {
                 let (b, z) = v.split_once(':').expect("--recipient-pool needs base:size");
                 let parse = |x: &str| -> u64 {
-                    if let Some(h) = x.strip_prefix("0x") { u64::from_str_radix(h, 16).unwrap() }
-                    else { x.parse().unwrap() }
+                    if let Some(h) = x.strip_prefix("0x") {
+                        u64::from_str_radix(h, 16).unwrap()
+                    } else {
+                        x.parse().unwrap()
+                    }
                 };
                 (parse(b), parse(z))
             }),

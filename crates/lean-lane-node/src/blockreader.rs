@@ -12,10 +12,10 @@
 //! exists to remove.
 
 use crate::provider::LeanProvider;
+use alloy_consensus::transaction::TransactionMeta;
 use alloy_consensus::Header;
 use alloy_eips::{BlockHashOrNumber, BlockId, BlockNumberOrTag};
 use alloy_primitives::{Address, BlockHash, BlockNumber, TxHash, TxNumber};
-use alloy_consensus::transaction::TransactionMeta;
 use reth_db_models::StoredBlockBodyIndices;
 use reth_ethereum_primitives::{Block, Receipt, TransactionSigned};
 use reth_storage_api::{
@@ -125,10 +125,7 @@ impl ReceiptProvider for LeanProvider {
     fn receipt_by_hash(&self, _hash: TxHash) -> ProviderResult<Option<Receipt>> {
         Ok(None)
     }
-    fn receipts_by_block(
-        &self,
-        _block: BlockHashOrNumber,
-    ) -> ProviderResult<Option<Vec<Receipt>>> {
+    fn receipts_by_block(&self, _block: BlockHashOrNumber) -> ProviderResult<Option<Vec<Receipt>>> {
         Ok(None)
     }
     fn receipts_by_tx_range(
@@ -227,10 +224,7 @@ impl BlockReaderIdExt for LeanProvider {
     ) -> ProviderResult<Option<reth_primitives_traits::SealedHeader<Header>>> {
         Ok(None)
     }
-    fn header_by_number_or_tag(
-        &self,
-        _id: BlockNumberOrTag,
-    ) -> ProviderResult<Option<Header>> {
+    fn header_by_number_or_tag(&self, _id: BlockNumberOrTag) -> ProviderResult<Option<Header>> {
         Ok(None)
     }
     fn sealed_header_by_number_or_tag(

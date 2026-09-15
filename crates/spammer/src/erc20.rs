@@ -21,8 +21,8 @@ use color_eyre::eyre::Result;
 
 use crate::config::Erc20Function;
 use crate::generator::{
-    TxGenerator, GAS_ESTIMATE_MARGIN_DEN, GAS_ESTIMATE_MARGIN_NUM, MAX_FEE_PER_GAS,
-    MAX_PRIORITY_FEE_PER_GAS, testnet_chain_id,
+    testnet_chain_id, TxGenerator, GAS_ESTIMATE_MARGIN_DEN, GAS_ESTIMATE_MARGIN_NUM,
+    MAX_FEE_PER_GAS, MAX_PRIORITY_FEE_PER_GAS,
 };
 use crate::ws::WsClient;
 

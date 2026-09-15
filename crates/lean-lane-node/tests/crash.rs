@@ -33,14 +33,23 @@ async fn drive(node: &LaneNode, count: u64, per_block: u64) {
     for i in 0..count {
         let tx = LeanTx::sign(
             0,
-            vec![Output { to: Address::with_last_byte((i % 200) as u8), amount: 5 }],
+            vec![Output {
+                to: Address::with_last_byte((i % 200) as u8),
+                amount: 5,
+            }],
             &sk(i),
             &domain,
         );
         let signed = LeanSigned::new(tx);
         let sender = signed.tx().recover_sender(&domain).unwrap();
-        node.seed_account(sender, Acct { nonce: 0, balance: lean_fee(1) + 5 * AMOUNT_UNIT })
-            .await;
+        node.seed_account(
+            sender,
+            Acct {
+                nonce: 0,
+                balance: lean_fee(1) + 5 * AMOUNT_UNIT,
+            },
+        )
+        .await;
         node.submit_raw(signed.raw()).await.unwrap();
         if (i + 1) % per_block == 0 {
             node.produce_block(1_000 + i).await.unwrap().unwrap();
@@ -60,19 +69,30 @@ async fn recovery_from_snapshot_plus_tail_and_torn_writes() {
     // 1) clean recovery: snapshot@4 (+ zero tail)
     let node2 = make_node(dir.path(), 2).await;
     assert_eq!(node2.state.lock().await.digest(), digest);
-    assert_eq!(*node2.head.lock().await, head, "head must be re-derived from the log tail");
+    assert_eq!(
+        *node2.head.lock().await,
+        head,
+        "head must be re-derived from the log tail"
+    );
     drop(node2);
 
     // 2) torn tail: append a partial record (kill mid-append)
     let log_path = dir.path().join("blocks.log");
     let len_before = std::fs::metadata(&log_path).unwrap().len();
     {
-        let mut f = std::fs::OpenOptions::new().append(true).open(&log_path).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log_path)
+            .unwrap();
         f.write_all(&123u32.to_le_bytes()).unwrap(); // claims 123-byte payload...
         f.write_all(&[0xAB; 40]).unwrap(); // ...delivers 40 garbage bytes
     }
     let node3 = make_node(dir.path(), 2).await;
-    assert_eq!(node3.state.lock().await.digest(), digest, "torn tail must be ignored");
+    assert_eq!(
+        node3.state.lock().await.digest(),
+        digest,
+        "torn tail must be ignored"
+    );
     assert_eq!(
         std::fs::metadata(&log_path).unwrap().len(),
         len_before,
@@ -82,20 +102,31 @@ async fn recovery_from_snapshot_plus_tail_and_torn_writes() {
 
     // 3) garbage that parses as a length but fails the commitment check
     {
-        let mut f = std::fs::OpenOptions::new().append(true).open(&log_path).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log_path)
+            .unwrap();
         let garbage = vec![0u8; 96];
         f.write_all(&(96u32).to_le_bytes()).unwrap();
         f.write_all(&garbage).unwrap();
         f.write_all(&(96u32).to_le_bytes()).unwrap();
     }
     let node4 = make_node(dir.path(), 2).await;
-    assert_eq!(node4.state.lock().await.digest(), digest, "bad-commitment tail must be ignored");
+    assert_eq!(
+        node4.state.lock().await.digest(),
+        digest,
+        "bad-commitment tail must be ignored"
+    );
 
     // 4) and the lane keeps working after recovery: one more block applies
     drive(&node4, 3, 3).await;
     assert_ne!(node4.state.lock().await.digest(), digest);
     let head4 = *node4.head.lock().await;
-    assert_eq!(head4.1, head.1 + 1, "exactly one block appended after recovery");
+    assert_eq!(
+        head4.1,
+        head.1 + 1,
+        "exactly one block appended after recovery"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -106,11 +137,25 @@ async fn total_stf_noop_never_halts() {
     let dir = tempfile::tempdir().unwrap();
     let node = make_node(dir.path(), 1024).await;
     let domain = current_lane_domain();
-    let t1 = LeanTx::sign(0, vec![Output { to: Address::with_last_byte(1), amount: 5 }], &sk(500), &domain);
+    let t1 = LeanTx::sign(
+        0,
+        vec![Output {
+            to: Address::with_last_byte(1),
+            amount: 5,
+        }],
+        &sk(500),
+        &domain,
+    );
     let s1 = LeanSigned::new(t1);
     let sender = s1.tx().recover_sender(&domain).unwrap();
-    node.seed_account(sender, Acct { nonce: 0, balance: 2 * (lean_fee(1) + 5 * AMOUNT_UNIT) })
-        .await;
+    node.seed_account(
+        sender,
+        Acct {
+            nonce: 0,
+            balance: 2 * (lean_fee(1) + 5 * AMOUNT_UNIT),
+        },
+    )
+    .await;
     node.submit_raw(s1.raw()).await.unwrap();
     node.produce_block(1_000).await.unwrap().unwrap();
 
@@ -118,7 +163,15 @@ async fn total_stf_noop_never_halts() {
     // injecting directly into a block via the log-replay path semantics:
     // simplest equivalent: submit nonce-2 (gap) is rejected by pool; so build
     // a block by hand through apply_block with a stale item.
-    let stale = LeanTx::sign(0, vec![Output { to: Address::with_last_byte(2), amount: 5 }], &sk(500), &domain);
+    let stale = LeanTx::sign(
+        0,
+        vec![Output {
+            to: Address::with_last_byte(2),
+            amount: 5,
+        }],
+        &sk(500),
+        &domain,
+    );
     let stale_signed = LeanSigned::new(stale);
     let mut state = node.state.lock().await;
     let before = state.digest();
@@ -149,19 +202,29 @@ async fn a_snapshot_ahead_of_the_log_falls_back_instead_of_leaving_a_hole() {
     let dir = tempfile::tempdir().unwrap();
     let log_path = dir.path().join("blocks.log");
     let node = make_node(dir.path(), 2).await; // snapshot every 2 blocks
-    // Every sender is seeded BEFORE the first block: `seed_account` is a test
-    // hook, not a logged event, so an account created after a snapshot cannot
-    // be reproduced by replaying the log and the digests would not compare.
+                                               // Every sender is seeded BEFORE the first block: `seed_account` is a test
+                                               // hook, not a logged event, so an account created after a snapshot cannot
+                                               // be reproduced by replaying the log and the digests would not compare.
     let domain = current_lane_domain();
     let txs: Vec<_> = (0..12u64)
         .map(|i| {
-            let out = vec![Output { to: Address::with_last_byte((i % 200) as u8), amount: 5 }];
+            let out = vec![Output {
+                to: Address::with_last_byte((i % 200) as u8),
+                amount: 5,
+            }];
             LeanSigned::new(LeanTx::sign(0, out, &sk(900 + i), &domain))
         })
         .collect();
     for t in &txs {
         let sender = t.tx().recover_sender(&domain).unwrap();
-        node.seed_account(sender, Acct { nonce: 0, balance: lean_fee(1) + 5 * AMOUNT_UNIT }).await;
+        node.seed_account(
+            sender,
+            Acct {
+                nonce: 0,
+                balance: lean_fee(1) + 5 * AMOUNT_UNIT,
+            },
+        )
+        .await;
     }
     let mut produced = 0u64;
     for (i, t) in txs.iter().enumerate() {
@@ -188,7 +251,12 @@ async fn a_snapshot_ahead_of_the_log_falls_back_instead_of_leaving_a_hole() {
     assert!(dir.path().join("snapshot-4.bin").exists());
 
     // the crash: the snapshot survives, the log tail does not
-    std::fs::OpenOptions::new().write(true).open(&log_path).unwrap().set_len(len3).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&log_path)
+        .unwrap()
+        .set_len(len3)
+        .unwrap();
 
     let (n2, report) = LaneNode::open(Config {
         datadir: dir.path().to_path_buf(),
@@ -196,10 +264,24 @@ async fn a_snapshot_ahead_of_the_log_falls_back_instead_of_leaving_a_hole() {
         ..Default::default()
     })
     .unwrap();
-    assert_eq!(report.snapshot_number, 2, "recovered from the snapshot BELOW the log tail");
-    assert_eq!(*n2.head.lock().await, head3, "head is the last intact record");
-    assert_eq!(n2.state.lock().await.digest(), digest3, "state matches that head exactly");
-    assert!(dir.path().join("snapshot-4.bin").exists(), "the ahead snapshot is left alone");
+    assert_eq!(
+        report.snapshot_number, 2,
+        "recovered from the snapshot BELOW the log tail"
+    );
+    assert_eq!(
+        *n2.head.lock().await,
+        head3,
+        "head is the last intact record"
+    );
+    assert_eq!(
+        n2.state.lock().await.digest(),
+        digest3,
+        "state matches that head exactly"
+    );
+    assert!(
+        dir.path().join("snapshot-4.bin").exists(),
+        "the ahead snapshot is left alone"
+    );
 
     // no hole: height 4 is head+1 again, so it is ordinary lag the chain fills
     for t in txs.iter().skip(9) {
@@ -207,7 +289,10 @@ async fn a_snapshot_ahead_of_the_log_falls_back_instead_of_leaving_a_hole() {
     }
     n2.produce_block(3_000).await.unwrap().unwrap();
     assert_eq!(n2.head.lock().await.1, 4);
-    assert!(n2.log.lock().await.read_block(4).unwrap().is_some(), "4 is in the log now");
+    assert!(
+        n2.log.lock().await.read_block(4).unwrap().is_some(),
+        "4 is in the log now"
+    );
 }
 
 /// `--snapshot-every 0` is the natural way to say "never snapshot", and both
@@ -230,17 +315,38 @@ async fn snapshot_every_zero_never_snapshots_and_never_panics() {
         let domain = current_lane_domain();
         let signed = LeanSigned::new(LeanTx::sign(
             0,
-            vec![Output { to: Address::with_last_byte(9), amount: 5 }],
+            vec![Output {
+                to: Address::with_last_byte(9),
+                amount: 5,
+            }],
             &sk(999),
             &domain,
         ));
         let sender = signed.tx().recover_sender(&domain).unwrap();
-        node.seed_account(sender, Acct { nonce: 0, balance: lean_fee(1) + 5 * AMOUNT_UNIT }).await;
+        node.seed_account(
+            sender,
+            Acct {
+                nonce: 0,
+                balance: lean_fee(1) + 5 * AMOUNT_UNIT,
+            },
+        )
+        .await;
         node.submit_raw(signed.raw()).await.unwrap();
         let (hc, hn, ts) = *node.head.lock().await;
-        let (c, _) = node.shim_build(hc, hn + 1, ts + 1_000, 150_000_000).await.unwrap();
-        assert_eq!(node.shim_new_by_commitment(c).await.unwrap(), NewBlockOutcome::Valid(c));
-        assert_eq!(node.stats.promoted.load(std::sync::atomic::Ordering::Relaxed), 1);
+        let (c, _) = node
+            .shim_build(hc, hn + 1, ts + 1_000, 150_000_000)
+            .await
+            .unwrap();
+        assert_eq!(
+            node.shim_new_by_commitment(c).await.unwrap(),
+            NewBlockOutcome::Valid(c)
+        );
+        assert_eq!(
+            node.stats
+                .promoted
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
         head = *node.head.lock().await;
         assert_eq!(head.1, 5);
     }

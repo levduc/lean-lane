@@ -26,7 +26,11 @@ fn sk(i: u64) -> SecretKey {
 #[tokio::test(flavor = "multi_thread")]
 async fn syncing_roundtrip_queue_then_drain() {
     let dir = tempfile::tempdir().unwrap();
-    let (n, _) = LaneNode::open(Config { datadir: dir.path().into(), ..Default::default() }).unwrap();
+    let (n, _) = LaneNode::open(Config {
+        datadir: dir.path().into(),
+        ..Default::default()
+    })
+    .unwrap();
     let genesis = n.head.lock().await.0;
     let b1 = LeanBlock::new(genesis, 1, 100, vec![]);
     let b2 = LeanBlock::new(b1.commitment, 2, 200, vec![]);
@@ -45,25 +49,12 @@ async fn syncing_roundtrip_queue_then_drain() {
         NewBlockOutcome::Valid(b1.commitment)
     );
     let (hc, hn, _) = *n.head.lock().await;
-    assert_eq!((hc, hn), (b2.commitment, 2), "queued child must drain on parent arrival");
+    assert_eq!(
+        (hc, hn),
+        (b2.commitment, 2),
+        "queued child must drain on parent arrival"
+    );
     assert!(n.sync_queue.lock().await.is_empty());
-}
-
-async fn open_node(
-    dir: &std::path::Path,
-    peers: Vec<String>,
-) -> (Arc<LaneNode>, std::net::SocketAddr, jsonrpsee::server::ServerHandle) {
-    let (n, _) = LaneNode::open(Config {
-        datadir: dir.to_path_buf(),
-        snapshot_every: 16,
-        peers,
-        ..Default::default()
-    })
-    .unwrap();
-    let n = Arc::new(n);
-    n.spawn_sync();
-    let (addr, handle) = rpc::serve(n.clone(), ([127, 0, 0, 1], 0).into()).await.unwrap();
-    (n, addr, handle)
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -87,7 +78,9 @@ async fn three_node_kill_restart_converges_via_backfill() {
         .unwrap();
         let n = Arc::new(n);
         n.spawn_sync();
-        let (_addr, handle) = rpc::serve(n.clone(), ([127, 0, 0, 1], port).into()).await.unwrap();
+        let (_addr, handle) = rpc::serve(n.clone(), ([127, 0, 0, 1], port).into())
+            .await
+            .unwrap();
         (n, handle)
     };
     let (a, _ha) = boot(da.path().into(), base, vec![url(base + 1), url(base + 2)]).await;
@@ -101,13 +94,19 @@ async fn three_node_kill_restart_converges_via_backfill() {
     for i in 0..total {
         let tx = LeanTx::sign(
             0,
-            vec![Output { to: Address::with_last_byte((i % 200) as u8), amount: 5 }],
+            vec![Output {
+                to: Address::with_last_byte((i % 200) as u8),
+                amount: 5,
+            }],
             &sk(i),
             &domain,
         );
         let signed = LeanSigned::new(tx);
         let sender = signed.tx().recover_sender(&domain).unwrap();
-        let acct = Acct { nonce: 0, balance: lean_fee(1) + 5 * AMOUNT_UNIT };
+        let acct = Acct {
+            nonce: 0,
+            balance: lean_fee(1) + 5 * AMOUNT_UNIT,
+        };
         for n in [&a, &b, &c] {
             n.seed_account(sender, acct).await;
         }
@@ -115,7 +114,11 @@ async fn three_node_kill_restart_converges_via_backfill() {
     }
     for n in [&a, &b, &c] {
         let (cm, num, ts) = *n.head.lock().await;
-        n.state.lock().await.write_snapshot(&n.cfg.datadir, cm, num, ts).unwrap();
+        n.state
+            .lock()
+            .await
+            .write_snapshot(&n.cfg.datadir, cm, num, ts)
+            .unwrap();
     }
 
     // helper: A builds + commits one block (push-on-append fans it out)
@@ -125,7 +128,10 @@ async fn three_node_kill_restart_converges_via_backfill() {
         }
         let (hc, hn, _) = *a.head.lock().await;
         let (_c, wire) = a.shim_build(hc, hn + 1, ts, 150_000_000).await.unwrap();
-        assert!(matches!(a.shim_new(&wire).await.unwrap(), NewBlockOutcome::Valid(_)));
+        assert!(matches!(
+            a.shim_new(&wire).await.unwrap(),
+            NewBlockOutcome::Valid(_)
+        ));
     };
 
     // 10 blocks with everyone up: B and C follow via push alone
@@ -146,8 +152,14 @@ async fn three_node_kill_restart_converges_via_backfill() {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     };
-    assert!(wait_converge(b.clone(), a.clone(), 10).await, "B follows pushes");
-    assert!(wait_converge(c.clone(), a.clone(), 10).await, "C follows pushes");
+    assert!(
+        wait_converge(b.clone(), a.clone(), 10).await,
+        "B follows pushes"
+    );
+    assert!(
+        wait_converge(c.clone(), a.clone(), 10).await,
+        "C follows pushes"
+    );
 
     // KILL C (server down, node dropped)
     hc.stop().unwrap();
@@ -158,13 +170,20 @@ async fn three_node_kill_restart_converges_via_backfill() {
     for i in 10..60u64 {
         advance(a.clone(), Some(txs[i as usize].clone()), 1000 + i).await;
     }
-    assert!(wait_converge(b.clone(), a.clone(), 10).await, "B stays lockstep");
+    assert!(
+        wait_converge(b.clone(), a.clone(), 10).await,
+        "B stays lockstep"
+    );
 
     // RESTART C from its datadir. It is 50 behind; the next push (from A's
     // next append) delivers a non-connecting block -> SYNCING -> backfill
     // fetches the gap from peers. NO external feeding.
     let (c2, _hc2) = boot(dc.path().into(), base + 2, vec![url(base), url(base + 1)]).await;
-    assert_eq!(c2.head.lock().await.1, 10, "C restarts at its pre-kill head");
+    assert_eq!(
+        c2.head.lock().await.1,
+        10,
+        "C restarts at its pre-kill head"
+    );
     advance(a.clone(), None, 2000).await; // the trigger block (empty heartbeat)
 
     assert!(
@@ -201,7 +220,9 @@ async fn in_sync_peers_exchange_announcements_only() {
         .unwrap();
         let n = Arc::new(n);
         n.spawn_sync();
-        let (_a, h) = rpc::serve(n.clone(), ([127, 0, 0, 1], base + 1).into()).await.unwrap();
+        let (_a, h) = rpc::serve(n.clone(), ([127, 0, 0, 1], base + 1).into())
+            .await
+            .unwrap();
         (n, h)
     };
     let (a, _ha) = {
@@ -213,7 +234,9 @@ async fn in_sync_peers_exchange_announcements_only() {
         .unwrap();
         let n = Arc::new(n);
         n.spawn_sync();
-        let (_a, h) = rpc::serve(n.clone(), ([127, 0, 0, 1], base).into()).await.unwrap();
+        let (_a, h) = rpc::serve(n.clone(), ([127, 0, 0, 1], base).into())
+            .await
+            .unwrap();
         (n, h)
     };
 
@@ -221,19 +244,48 @@ async fn in_sync_peers_exchange_announcements_only() {
         let (hc, hn, _) = *a.head.lock().await;
         let (_c, wire) = a.shim_build(hc, hn + 1, height, 150_000_000).await.unwrap();
         // CL-anchor analog on B FIRST (in-sync case), then A appends+announces
-        assert!(matches!(b.shim_new(&wire).await.unwrap(), NewBlockOutcome::Valid(_)));
-        assert!(matches!(a.shim_new(&wire).await.unwrap(), NewBlockOutcome::Valid(_)));
+        assert!(matches!(
+            b.shim_new(&wire).await.unwrap(),
+            NewBlockOutcome::Valid(_)
+        ));
+        assert!(matches!(
+            a.shim_new(&wire).await.unwrap(),
+            NewBlockOutcome::Valid(_)
+        ));
     }
     // let the fire-and-forget announcements land
     let t0 = Instant::now();
-    while b.stats.announces_rx.load(std::sync::atomic::Ordering::Relaxed) < 100 {
-        assert!(t0.elapsed() < Duration::from_secs(10), "announcements must arrive");
+    while b
+        .stats
+        .announces_rx
+        .load(std::sync::atomic::Ordering::Relaxed)
+        < 100
+    {
+        assert!(
+            t0.elapsed() < Duration::from_secs(10),
+            "announcements must arrive"
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    let rx = b.stats.announces_rx.load(std::sync::atomic::Ordering::Relaxed);
-    let known = b.stats.announces_known.load(std::sync::atomic::Ordering::Relaxed);
-    let pulls = b.stats.block_pulls.load(std::sync::atomic::Ordering::Relaxed);
-    assert_eq!(pulls, 0, "in-sync peers must exchange ZERO block bytes (pulls={pulls})");
-    assert_eq!(rx, known, "every announcement must hit the known/ignore path");
+    let rx = b
+        .stats
+        .announces_rx
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let known = b
+        .stats
+        .announces_known
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let pulls = b
+        .stats
+        .block_pulls
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        pulls, 0,
+        "in-sync peers must exchange ZERO block bytes (pulls={pulls})"
+    );
+    assert_eq!(
+        rx, known,
+        "every announcement must hit the known/ignore path"
+    );
     assert_eq!(*a.head.lock().await, *b.head.lock().await);
 }

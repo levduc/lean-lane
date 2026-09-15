@@ -18,20 +18,31 @@ fn sk(i: u64) -> SecretKey {
 }
 
 async fn node(dir: &std::path::Path) -> LaneNode {
-    LaneNode::open(Config { datadir: dir.to_path_buf(), ..Default::default() }).unwrap().0
+    LaneNode::open(Config {
+        datadir: dir.to_path_buf(),
+        ..Default::default()
+    })
+    .unwrap()
+    .0
 }
 
 async fn seed_and_submit(n: &LaneNode, key: u64, outputs: usize) {
     let domain = current_lane_domain();
     let outs = (0..outputs)
-        .map(|i| Output { to: Address::with_last_byte((i % 200) as u8), amount: 3 })
+        .map(|i| Output {
+            to: Address::with_last_byte((i % 200) as u8),
+            amount: 3,
+        })
         .collect();
     let tx = LeanTx::sign(0, outs, &sk(key), &domain);
     let signed = LeanSigned::new(tx);
     let sender = signed.tx().recover_sender(&domain).unwrap();
     n.seed_account(
         sender,
-        Acct { nonce: 0, balance: lean_fee(outputs) + outputs as u128 * 3 * AMOUNT_UNIT },
+        Acct {
+            nonce: 0,
+            balance: lean_fee(outputs) + outputs as u128 * 3 * AMOUNT_UNIT,
+        },
     )
     .await;
     n.submit_raw(signed.raw()).await.unwrap();
@@ -65,22 +76,46 @@ async fn build_is_pure_and_head_anchored() {
     let pool0 = n.pool.pool_size().pending;
 
     // stale parent rejected
-    assert!(n.shim_build(B256::ZERO, head_n + 1, 1000, 150_000_000).await.is_err());
+    assert!(n
+        .shim_build(B256::ZERO, head_n + 1, 1000, 150_000_000)
+        .await
+        .is_err());
     // wrong number rejected (deviation from the doc, checked loudly)
-    assert!(n.shim_build(head_c, head_n + 2, 1000, 150_000_000).await.is_err());
+    assert!(n
+        .shim_build(head_c, head_n + 2, 1000, 150_000_000)
+        .await
+        .is_err());
 
     // valid build: deterministic, never mutates the chain (it DOES leave a
     // memory-only staged entry — see by_commitment.rs)
-    let (c1, wire1) = n.shim_build(head_c, head_n + 1, 1000, 150_000_000).await.unwrap();
-    let (c2, wire2) = n.shim_build(head_c, head_n + 1, 1000, 150_000_000).await.unwrap();
+    let (c1, wire1) = n
+        .shim_build(head_c, head_n + 1, 1000, 150_000_000)
+        .await
+        .unwrap();
+    let (c2, wire2) = n
+        .shim_build(head_c, head_n + 1, 1000, 150_000_000)
+        .await
+        .unwrap();
     assert_eq!(c1, c2, "same inputs + same pool snapshot => same block");
     assert_eq!(wire1, wire2);
-    assert_eq!(*n.head.lock().await, (head_c, head_n, 0), "build must not advance head");
-    assert_eq!(n.state.lock().await.digest(), digest0, "build must not touch state");
+    assert_eq!(
+        *n.head.lock().await,
+        (head_c, head_n, 0),
+        "build must not advance head"
+    );
+    assert_eq!(
+        n.state.lock().await.digest(),
+        digest0,
+        "build must not touch state"
+    );
     assert_eq!(n.pool.pool_size().pending, pool0, "build must not evict");
     {
         let q = n.staged.lock().await;
-        assert_eq!(q.len(), 1, "an identical rebuild replaces, never duplicates");
+        assert_eq!(
+            q.len(),
+            1,
+            "an identical rebuild replaces, never duplicates"
+        );
         assert_eq!(q[0].0, c1);
     }
 
@@ -133,12 +168,19 @@ async fn new_block_full_discipline() {
     assert!(n.shim_new(&w).await.is_err());
     // 7) empty heartbeat block: fine
     let hb = LeanBlock::new(c2, 3, 3000, vec![]);
-    assert_eq!(n.shim_new(&hb.to_wire_bytes()).await.unwrap(), NewBlockOutcome::Valid(hb.commitment));
+    assert_eq!(
+        n.shim_new(&hb.to_wire_bytes()).await.unwrap(),
+        NewBlockOutcome::Valid(hb.commitment)
+    );
     // 8) sync serving returns byte-identical wire form
     let served = n.block_wire_bytes(1).await.unwrap().unwrap();
     assert_eq!(served, w1);
     assert!(n.block_wire_bytes(99).await.unwrap().is_none());
-    assert_eq!(n.state.lock().await.digest(), digest, "errors must never mutate state");
+    assert_eq!(
+        n.state.lock().await.digest(),
+        digest,
+        "errors must never mutate state"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -153,7 +195,11 @@ async fn stats_line_carries_every_growth_field() {
     let line = n.stats_line().await;
     println!("{line}"); // visible with --nocapture: the line is read by humans
     assert!(line.starts_with("lean_stats "), "{line}");
-    assert_eq!(line.split_whitespace().count(), 16, "one key per field: {line}");
+    assert_eq!(
+        line.split_whitespace().count(),
+        16,
+        "one key per field: {line}"
+    );
     for key in [
         "head=",
         "accounts=",
@@ -177,11 +223,17 @@ async fn stats_line_carries_every_growth_field() {
     let pending = n.pool.pool_size().pending;
     assert_eq!(pending, 1, "the submitted tx must be pending");
     assert!(line.contains(&format!("pool={pending}")), "{line}");
-    assert!(!line.ends_with("rss_mb=0"), "RSS must be readable from /proc: {line}");
+    assert!(
+        !line.ends_with("rss_mb=0"),
+        "RSS must be readable from /proc: {line}"
+    );
 
     // after a block: the head moved and the last-append timer is populated
     let (head_c, head_n, _) = *n.head.lock().await;
-    let (c, wire) = n.shim_build(head_c, head_n + 1, 1_000, 150_000_000).await.unwrap();
+    let (c, wire) = n
+        .shim_build(head_c, head_n + 1, 1_000, 150_000_000)
+        .await
+        .unwrap();
     assert_eq!(n.shim_new(&wire).await.unwrap(), NewBlockOutcome::Valid(c));
     let line = n.stats_line().await;
     assert!(line.contains("head=1"), "{line}");
@@ -189,8 +241,14 @@ async fn stats_line_carries_every_growth_field() {
     // the timers are sub-millisecond on a 1-tx block, so check the counters
     // the line formats rather than the rounded text
     use std::sync::atomic::Ordering;
-    assert!(n.stats.build_ns_last.load(Ordering::Relaxed) > 0, "build must be timed");
-    assert!(n.stats.append_ns_last.load(Ordering::Relaxed) > 0, "append must be timed");
+    assert!(
+        n.stats.build_ns_last.load(Ordering::Relaxed) > 0,
+        "build must be timed"
+    );
+    assert!(
+        n.stats.append_ns_last.load(Ordering::Relaxed) > 0,
+        "append must be timed"
+    );
 }
 
 #[test]
@@ -221,7 +279,10 @@ fn anchor_line_carries_every_timing_field() {
         "decode_ms=",
         "pool_ms=",
     ] {
-        assert!(line.contains(key), "lean_anchor line is missing `{key}`: {line}");
+        assert!(
+            line.contains(key),
+            "lean_anchor line is missing `{key}`: {line}"
+        );
     }
 }
 
@@ -254,8 +315,14 @@ async fn the_receipt_ring_honours_its_configured_size() {
         for k in 4..8u64 {
             seed_and_submit(&n, 1_000 + k, 2).await;
             let (hc, hn, ts) = *n.head.lock().await;
-            let (c, _) = n.shim_build(hc, hn + 1, ts + 1_000, 150_000_000).await.unwrap();
-            assert_eq!(n.shim_new_by_commitment(c).await.unwrap(), NewBlockOutcome::Valid(c));
+            let (c, _) = n
+                .shim_build(hc, hn + 1, ts + 1_000, 150_000_000)
+                .await
+                .unwrap();
+            assert_eq!(
+                n.shim_new_by_commitment(c).await.unwrap(),
+                NewBlockOutcome::Valid(c)
+            );
         }
         assert_eq!(n.head.lock().await.1, 8);
         assert_eq!(n.receipts.lock().await.len(), want, "receipt_ring {cap}");

@@ -19,15 +19,25 @@ fn sk(i: u64) -> SecretKey {
 #[tokio::test(flavor = "multi_thread")]
 async fn funded_nonce0_tx_is_pending_and_packed() {
     let dir = tempfile::tempdir().unwrap();
-    let (n, _) = LaneNode::open(Config { datadir: dir.path().into(), ..Default::default() }).unwrap();
+    let (n, _) = LaneNode::open(Config {
+        datadir: dir.path().into(),
+        ..Default::default()
+    })
+    .unwrap();
     let domain = current_lane_domain();
 
     // fund-file analog: seed AFTER open (exactly what run-mode does)
     let tx = LeanTx::sign(
         0,
         vec![
-            Output { to: Address::with_last_byte(1), amount: 5 },
-            Output { to: Address::with_last_byte(2), amount: 7 },
+            Output {
+                to: Address::with_last_byte(1),
+                amount: 5,
+            },
+            Output {
+                to: Address::with_last_byte(2),
+                amount: 7,
+            },
         ],
         &sk(1),
         &domain,
@@ -35,7 +45,14 @@ async fn funded_nonce0_tx_is_pending_and_packed() {
     let signed = LeanSigned::new(tx);
     let sender = signed.tx().recover_sender(&domain).unwrap();
     // the repro's funding: 1e18 wei
-    n.seed_account(sender, Acct { nonce: 0, balance: 1_000_000_000_000_000_000 }).await;
+    n.seed_account(
+        sender,
+        Acct {
+            nonce: 0,
+            balance: 1_000_000_000_000_000_000,
+        },
+    )
+    .await;
     assert!(1_000_000_000_000_000_000u128 > lean_fee(2) + 12 * AMOUNT_UNIT);
 
     n.submit_raw(signed.raw()).await.expect("must be accepted");
@@ -64,17 +81,48 @@ async fn recovered_datadir_keeps_provider_and_state_in_lockstep() {
     let domain = current_lane_domain();
     let sender_key = 7u64;
     {
-        let (n, _) = LaneNode::open(Config { datadir: dir.path().into(), ..Default::default() }).unwrap();
-        let tx0 = LeanTx::sign(0, vec![Output { to: Address::with_last_byte(9), amount: 1 }], &sk(sender_key), &domain);
+        let (n, _) = LaneNode::open(Config {
+            datadir: dir.path().into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let tx0 = LeanTx::sign(
+            0,
+            vec![Output {
+                to: Address::with_last_byte(9),
+                amount: 1,
+            }],
+            &sk(sender_key),
+            &domain,
+        );
         let s0 = LeanSigned::new(tx0);
         let sender = s0.tx().recover_sender(&domain).unwrap();
-        n.seed_account(sender, Acct { nonce: 0, balance: 10 * (lean_fee(1) + AMOUNT_UNIT) }).await;
+        n.seed_account(
+            sender,
+            Acct {
+                nonce: 0,
+                balance: 10 * (lean_fee(1) + AMOUNT_UNIT),
+            },
+        )
+        .await;
         // persist genesis (run-mode does this after funding)
         let (cm, num, ts) = *n.head.lock().await;
-        n.state.lock().await.write_snapshot(&n.cfg.datadir, cm, num, ts).unwrap();
+        n.state
+            .lock()
+            .await
+            .write_snapshot(&n.cfg.datadir, cm, num, ts)
+            .unwrap();
         // three blocks from this sender, nonces 0,1,2
         for nonce in 0..3u32 {
-            let t = LeanTx::sign(nonce, vec![Output { to: Address::with_last_byte(9), amount: 1 }], &sk(sender_key), &domain);
+            let t = LeanTx::sign(
+                nonce,
+                vec![Output {
+                    to: Address::with_last_byte(9),
+                    amount: 1,
+                }],
+                &sk(sender_key),
+                &domain,
+            );
             let s = LeanSigned::new(t);
             n.submit_raw(s.raw()).await.unwrap();
             n.produce_block(1000 + nonce as u64).await.unwrap().unwrap();
@@ -82,21 +130,56 @@ async fn recovered_datadir_keeps_provider_and_state_in_lockstep() {
         assert_eq!(n.state.lock().await.get(&sender).nonce, 3);
     }
     // REOPEN (recovery = snapshot + replay)
-    let (n2, rec) = LaneNode::open(Config { datadir: dir.path().into(), ..Default::default() }).unwrap();
+    let (n2, rec) = LaneNode::open(Config {
+        datadir: dir.path().into(),
+        ..Default::default()
+    })
+    .unwrap();
     assert_eq!(rec.replayed_blocks, 3);
-    let probe = LeanTx::sign(3, vec![Output { to: Address::with_last_byte(9), amount: 1 }], &sk(sender_key), &domain);
+    let probe = LeanTx::sign(
+        3,
+        vec![Output {
+            to: Address::with_last_byte(9),
+            amount: 1,
+        }],
+        &sk(sender_key),
+        &domain,
+    );
     let sp = LeanSigned::new(probe);
     let sender = sp.tx().recover_sender(&domain).unwrap();
     // 1) RPC-visible nonce (what spammer -l reads) == 3
-    assert_eq!(n2.state.lock().await.get(&sender).nonce, 3, "state nonce after recovery");
+    assert_eq!(
+        n2.state.lock().await.get(&sender).nonce,
+        3,
+        "state nonce after recovery"
+    );
     // 2) admission at exactly that nonce must be PENDING
-    n2.submit_raw(sp.raw()).await.expect("nonce-3 must be accepted after recovery");
+    n2.submit_raw(sp.raw())
+        .await
+        .expect("nonce-3 must be accepted after recovery");
     let s = n2.pool.pool_size();
-    assert_eq!((s.pending, s.queued), (1, 0),
-        "recovered-view divergence: pending={} queued={} basefee={}", s.pending, s.queued, s.basefee);
+    assert_eq!(
+        (s.pending, s.queued),
+        (1, 0),
+        "recovered-view divergence: pending={} queued={} basefee={}",
+        s.pending,
+        s.queued,
+        s.basefee
+    );
     // 3) stale nonce-0 resubmit must be REJECTED (not queued)
-    let t0 = LeanTx::sign(0, vec![Output { to: Address::with_last_byte(9), amount: 1 }], &sk(sender_key), &domain);
-    assert!(n2.submit_raw(LeanSigned::new(t0).raw()).await.is_err(), "stale nonce must reject");
+    let t0 = LeanTx::sign(
+        0,
+        vec![Output {
+            to: Address::with_last_byte(9),
+            amount: 1,
+        }],
+        &sk(sender_key),
+        &domain,
+    );
+    assert!(
+        n2.submit_raw(LeanSigned::new(t0).raw()).await.is_err(),
+        "stale nonce must reject"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -114,16 +197,43 @@ async fn streamed_nonces_promote_across_blocks() {
     let domain = current_lane_domain();
     let sender_key = 42u64;
     let per_tx = lean_fee(1) + AMOUNT_UNIT;
-    let first = LeanTx::sign(0, vec![Output { to: Address::with_last_byte(3), amount: 1 }], &sk(sender_key), &domain);
+    let first = LeanTx::sign(
+        0,
+        vec![Output {
+            to: Address::with_last_byte(3),
+            amount: 1,
+        }],
+        &sk(sender_key),
+        &domain,
+    );
     let sender = LeanSigned::new(first).tx().recover_sender(&domain).unwrap();
-    n.seed_account(sender, Acct { nonce: 0, balance: 40 * per_tx }).await;
+    n.seed_account(
+        sender,
+        Acct {
+            nonce: 0,
+            balance: 40 * per_tx,
+        },
+    )
+    .await;
 
     for nonce in 0..30u32 {
-        let t = LeanTx::sign(nonce, vec![Output { to: Address::with_last_byte(3), amount: 1 }], &sk(sender_key), &domain);
+        let t = LeanTx::sign(
+            nonce,
+            vec![Output {
+                to: Address::with_last_byte(3),
+                amount: 1,
+            }],
+            &sk(sender_key),
+            &domain,
+        );
         n.submit_raw(LeanSigned::new(t).raw()).await.unwrap();
     }
     let s0 = n.pool.pool_size();
-    assert_eq!((s0.pending, s0.queued), (30, 0), "burst must be fully pending (consecutive nonces)");
+    assert_eq!(
+        (s0.pending, s0.queued),
+        (30, 0),
+        "burst must be fully pending (consecutive nonces)"
+    );
 
     // consume in ~10-tx blocks; after EVERY block the remainder must be pending
     let mut mined = 0usize;
@@ -131,7 +241,10 @@ async fn streamed_nonces_promote_across_blocks() {
     while mined < 30 {
         height += 1;
         let bn = n.produce_block(1000 + height).await.unwrap();
-        assert!(bn.is_some(), "block must not be empty while txs remain (mined={mined})");
+        assert!(
+            bn.is_some(),
+            "block must not be empty while txs remain (mined={mined})"
+        );
         let s = n.pool.pool_size();
         mined = 30 - (s.pending + s.queued);
         assert_eq!(

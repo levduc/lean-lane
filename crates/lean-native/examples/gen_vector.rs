@@ -17,8 +17,14 @@ fn main() {
     .unwrap();
     let domain = lane_domain(1338);
     let outputs = vec![
-        Output { to: Address::repeat_byte(0x11), amount: 5 },
-        Output { to: Address::repeat_byte(0x22), amount: 0x0102030405060708 },
+        Output {
+            to: Address::repeat_byte(0x11),
+            amount: 5,
+        },
+        Output {
+            to: Address::repeat_byte(0x22),
+            amount: 0x0102030405060708,
+        },
     ];
     let tx = LeanTx::sign(7, outputs, &sk, &domain);
     println!("chain_id: 1338");

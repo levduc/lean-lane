@@ -6,10 +6,10 @@
 //! block commitment (see `chain.rs`) is the source of truth for ordering, and
 //! state is a pure function of it.
 
+pub mod blockreader;
 pub mod chain;
 pub mod exec;
 pub mod node;
-pub mod blockreader;
 pub mod provider;
 pub mod rpc;
 pub mod state;

@@ -82,7 +82,9 @@ mod tests {
     fn size_is_72_plus_28n() {
         let signer = SigningKey::from_slice(&B256::repeat_byte(0x42).0).unwrap();
         for n in [1usize, 10, 100] {
-            let outputs: Vec<_> = (0..n).map(|i| (Address::repeat_byte(i as u8), 1u64)).collect();
+            let outputs: Vec<_> = (0..n)
+                .map(|i| (Address::repeat_byte(i as u8), 1u64))
+                .collect();
             let (bytes, _) = build_fanout_tx(0, &outputs, &signer, &lane_domain(1338));
             assert_eq!(bytes.len(), 72 + 28 * n);
         }

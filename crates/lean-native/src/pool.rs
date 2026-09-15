@@ -188,7 +188,9 @@ impl EthPoolTransaction for ArcPooledTx {
         _blob: &BlobTransactionSidecarVariant,
         _settings: &KzgSettings,
     ) -> Result<(), BlobTransactionValidationError> {
-        Err(BlobTransactionValidationError::NotBlobTransaction(self.ty()))
+        Err(BlobTransactionValidationError::NotBlobTransaction(
+            self.ty(),
+        ))
     }
 }
 
@@ -216,7 +218,10 @@ mod tests {
 
     fn lean_pooled(n: usize, key: u64, nonce: u32) -> ArcPooledTx {
         let outs = (0..n)
-            .map(|i| Output { to: Address::with_last_byte((i % 250) as u8), amount: 100 + i as u64 })
+            .map(|i| Output {
+                to: Address::with_last_byte((i % 250) as u8),
+                amount: 100 + i as u64,
+            })
             .collect();
         let env = ArcTxEnvelope::Lean(LeanSigned::new(LeanTx::sign(
             nonce,
@@ -249,8 +254,8 @@ mod tests {
     #[test]
     fn pool_cost_is_fee_plus_value() {
         let tx = lean_pooled(3, 7, 0);
-        let expected = U256::from(lean_fee(3)) +
-            U256::from((100u128 + 101 + 102) * crate::AMOUNT_UNIT);
+        let expected =
+            U256::from(lean_fee(3)) + U256::from((100u128 + 101 + 102) * crate::AMOUNT_UNIT);
         assert_eq!(*tx.cost(), expected);
     }
 }

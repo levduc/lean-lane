@@ -50,7 +50,9 @@ pub fn apply_block(
     let mut outputs = 0usize;
 
     for (i, (sender, tx, hash)) in items.iter().enumerate() {
-        let entry = debit_view.entry(*sender).or_insert_with(|| state.get(sender));
+        let entry = debit_view
+            .entry(*sender)
+            .or_insert_with(|| state.get(sender));
         let fee = lean_fee(tx.outputs.len());
         let mut total = fee;
         let mut ok = tx.nonce as u64 == entry.nonce;
@@ -86,7 +88,11 @@ pub fn apply_block(
             let wei = o.amount as u128 * AMOUNT_UNIT;
             *credits.entry(o.to).or_default() += wei;
             if o.amount != 0 {
-                logs.push(TransferLog { from: *sender, to: o.to, amount: wei });
+                logs.push(TransferLog {
+                    from: *sender,
+                    to: o.to,
+                    amount: wei,
+                });
             }
         }
         outputs += tx.outputs.len();
@@ -110,5 +116,11 @@ pub fn apply_block(
     }
     state.credit(beneficiary, fees);
 
-    BlockOutcome { receipts, applied, noops: items.len() - applied, outputs, fees_to_beneficiary: fees }
+    BlockOutcome {
+        receipts,
+        applied,
+        noops: items.len() - applied,
+        outputs,
+        fees_to_beneficiary: fees,
+    }
 }

@@ -32,20 +32,33 @@ fn sk(i: u64) -> SecretKey {
 }
 
 fn open(dir: &std::path::Path, peers: Vec<String>) -> Arc<LaneNode> {
-    let (n, _) =
-        LaneNode::open(Config { datadir: dir.to_path_buf(), peers, ..Default::default() }).unwrap();
+    let (n, _) = LaneNode::open(Config {
+        datadir: dir.to_path_buf(),
+        peers,
+        ..Default::default()
+    })
+    .unwrap();
     Arc::new(n)
 }
 
 async fn seed_and_submit(n: &LaneNode, key: u64, nonce: u32) {
     let domain = current_lane_domain();
-    let outs = vec![Output { to: Address::with_last_byte(7), amount: 3 }];
+    let outs = vec![Output {
+        to: Address::with_last_byte(7),
+        amount: 3,
+    }];
     let tx = LeanTx::sign(nonce, outs, &sk(key), &domain);
     let signed = LeanSigned::new(tx);
     let sender = signed.tx().recover_sender(&domain).unwrap();
     if nonce == 0 {
-        n.seed_account(sender, Acct { nonce: 0, balance: 10 * (lean_fee(1) + 3 * AMOUNT_UNIT) })
-            .await;
+        n.seed_account(
+            sender,
+            Acct {
+                nonce: 0,
+                balance: 10 * (lean_fee(1) + 3 * AMOUNT_UNIT),
+            },
+        )
+        .await;
     }
     n.submit_raw(signed.raw()).await.unwrap();
 }
@@ -54,7 +67,10 @@ async fn seed_and_submit(n: &LaneNode, key: u64, nonce: u32) {
 async fn advance(n: &LaneNode, key: u64, nonce: u32) -> (B256, Vec<u8>) {
     seed_and_submit(n, key, nonce).await;
     let (head_c, head_n, ts) = *n.head.lock().await;
-    let (c, wire) = n.shim_build(head_c, head_n + 1, ts + 1000, 1_000_000).await.unwrap();
+    let (c, wire) = n
+        .shim_build(head_c, head_n + 1, ts + 1000, 1_000_000)
+        .await
+        .unwrap();
     assert_eq!(n.shim_new(&wire).await.unwrap(), NewBlockOutcome::Valid(c));
     (c, wire)
 }
@@ -63,7 +79,9 @@ async fn advance(n: &LaneNode, key: u64, nonce: u32) -> (B256, Vec<u8>) {
 /// receives. This is how "no HTTP request is made" is asserted: a pull would
 /// have to open a connection to the peer, whatever it then does with it.
 async fn counting_peer() -> (String, Arc<AtomicU64>) {
-    let l = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let l = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
     let addr = l.local_addr().unwrap();
     let hits = Arc::new(AtomicU64::new(0));
     let h = hits.clone();
@@ -106,24 +124,44 @@ async fn announcing_a_block_we_have_staged_pulls_nothing() {
     let (head_c, head_n, ts) = *n.head.lock().await;
     // `arc_buildBlock` self-stages; `arc_stageBlock` on someone else's bytes
     // leaves exactly the same entry (tested in by_commitment.rs).
-    let (c, wire) = n.shim_build(head_c, head_n + 1, ts + 1000, 1_000_000).await.unwrap();
-    assert!(n.staged.lock().await.iter().any(|(k, _)| *k == c), "precondition: staged");
+    let (c, wire) = n
+        .shim_build(head_c, head_n + 1, ts + 1000, 1_000_000)
+        .await
+        .unwrap();
+    assert!(
+        n.staged.lock().await.iter().any(|(k, _)| *k == c),
+        "precondition: staged"
+    );
 
     let t0 = Instant::now();
     n.on_announce(c, head_n + 1).await;
-    assert!(t0.elapsed() < Duration::from_millis(200), "a held block must not wait out the grace");
+    assert!(
+        t0.elapsed() < Duration::from_millis(200),
+        "a held block must not wait out the grace"
+    );
 
     assert_eq!(n.stats.announce_skipped_staged.load(Ordering::Relaxed), 1);
     assert_eq!(n.stats.backfill_pulls.load(Ordering::Relaxed), 0);
     assert_eq!(n.stats.block_pulls.load(Ordering::Relaxed), 0);
-    assert_eq!(n.head.lock().await.1, head_n, "head must not move on an announcement");
+    assert_eq!(
+        n.head.lock().await.1,
+        head_n,
+        "head must not move on an announcement"
+    );
     // give any backfill the announcement could have armed time to act
     tokio::time::sleep(Duration::from_millis(600)).await;
-    assert_eq!(hits.load(Ordering::Relaxed), 0, "no HTTP request may be made");
+    assert_eq!(
+        hits.load(Ordering::Relaxed),
+        0,
+        "no HTTP request may be made"
+    );
     assert_eq!(n.stats.backfill_pulls.load(Ordering::Relaxed), 0);
 
     // and the anchor still lands, from the staged copy
-    assert_eq!(n.shim_new_by_commitment(c).await.unwrap(), NewBlockOutcome::Valid(c));
+    assert_eq!(
+        n.shim_new_by_commitment(c).await.unwrap(),
+        NewBlockOutcome::Valid(c)
+    );
     assert_eq!(n.head.lock().await.1, head_n + 1);
     assert_eq!(n.stats.promoted.load(Ordering::Relaxed), 1);
     let _ = wire;
@@ -140,7 +178,10 @@ async fn announcing_a_different_candidate_at_a_staged_height_pulls_nothing() {
     n.spawn_sync();
     seed_and_submit(&n, 32, 0).await;
     let (head_c, head_n, ts) = *n.head.lock().await;
-    let (c, _) = n.shim_build(head_c, head_n + 1, ts + 1000, 1_000_000).await.unwrap();
+    let (c, _) = n
+        .shim_build(head_c, head_n + 1, ts + 1000, 1_000_000)
+        .await
+        .unwrap();
 
     let other = B256::repeat_byte(0xc7);
     assert_ne!(other, c);
@@ -148,9 +189,17 @@ async fn announcing_a_different_candidate_at_a_staged_height_pulls_nothing() {
 
     assert_eq!(n.stats.announce_skipped_staged.load(Ordering::Relaxed), 1);
     tokio::time::sleep(Duration::from_millis(600)).await;
-    assert_eq!(hits.load(Ordering::Relaxed), 0, "no HTTP request may be made");
+    assert_eq!(
+        hits.load(Ordering::Relaxed),
+        0,
+        "no HTTP request may be made"
+    );
     assert_eq!(n.stats.backfill_pulls.load(Ordering::Relaxed), 0);
-    assert_eq!(n.stats.log_scans.load(Ordering::Relaxed), 0, "and still no log scan");
+    assert_eq!(
+        n.stats.log_scans.load(Ordering::Relaxed),
+        0,
+        "and still no log scan"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -161,7 +210,9 @@ async fn announcing_head_plus_two_with_nothing_staged_still_pulls() {
     let da = tempfile::tempdir().unwrap();
     let db = tempfile::tempdir().unwrap();
     let a = open(da.path(), vec![]);
-    let (a_addr, _ha) = rpc::serve(a.clone(), ([127, 0, 0, 1], 0).into()).await.unwrap();
+    let (a_addr, _ha) = rpc::serve(a.clone(), ([127, 0, 0, 1], 0).into())
+        .await
+        .unwrap();
     let (_c1, _) = advance(&a, 41, 0).await;
     let (c2, _) = advance(&a, 41, 1).await;
 
@@ -189,14 +240,19 @@ async fn announcing_head_plus_one_with_a_parked_cl_pulls_after_the_grace() {
     let da = tempfile::tempdir().unwrap();
     let db = tempfile::tempdir().unwrap();
     let a = open(da.path(), vec![]);
-    let (a_addr, _ha) = rpc::serve(a.clone(), ([127, 0, 0, 1], 0).into()).await.unwrap();
+    let (a_addr, _ha) = rpc::serve(a.clone(), ([127, 0, 0, 1], 0).into())
+        .await
+        .unwrap();
     let (c1, _) = advance(&a, 42, 0).await;
 
     let b = open(db.path(), vec![format!("http://{a_addr}")]);
     b.spawn_sync();
     b.on_announce(c1, 1).await;
 
-    assert!(wait_head(&b, 1, 15).await, "a parked-CL node must still heal via the backfill");
+    assert!(
+        wait_head(&b, 1, 15).await,
+        "a parked-CL node must still heal via the backfill"
+    );
     assert_eq!(b.head.lock().await.0, c1);
     assert!(b.stats.backfill_pulls.load(Ordering::Relaxed) >= 1);
 }
@@ -211,7 +267,10 @@ async fn concurrent_feeds_of_the_same_block_append_it_once() {
     let n = open(dir.path(), vec![]);
     seed_and_submit(&n, 43, 0).await;
     let (head_c, head_n, ts) = *n.head.lock().await;
-    let (c, wire) = n.shim_build(head_c, head_n + 1, ts + 1000, 1_000_000).await.unwrap();
+    let (c, wire) = n
+        .shim_build(head_c, head_n + 1, ts + 1000, 1_000_000)
+        .await
+        .unwrap();
     // drop the self-staged entry so BOTH feeds take the by-bytes commit path
     n.staged.lock().await.clear();
 
@@ -224,8 +283,15 @@ async fn concurrent_feeds_of_the_same_block_append_it_once() {
     assert_eq!(r1.unwrap().unwrap(), NewBlockOutcome::Valid(c));
     assert_eq!(r2.unwrap().unwrap(), NewBlockOutcome::Valid(c));
     assert_eq!(*n.head.lock().await, (c, 1, ts + 1000));
-    assert_eq!(n.stats.blocks.load(Ordering::Relaxed), 1, "exactly one commit");
-    assert!(n.block_wire_bytes(2).await.unwrap().is_none(), "nothing appended above the head");
+    assert_eq!(
+        n.stats.blocks.load(Ordering::Relaxed),
+        1,
+        "exactly one commit"
+    );
+    assert!(
+        n.block_wire_bytes(2).await.unwrap().is_none(),
+        "nothing appended above the head"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -238,7 +304,10 @@ async fn the_anchor_waits_out_an_in_flight_commit_of_the_same_block() {
     let n = open(dir.path(), vec![]);
     seed_and_submit(&n, 44, 0).await;
     let (head_c, head_n, ts) = *n.head.lock().await;
-    let (c, wire) = n.shim_build(head_c, head_n + 1, ts + 1000, 1_000_000).await.unwrap();
+    let (c, wire) = n
+        .shim_build(head_c, head_n + 1, ts + 1000, 1_000_000)
+        .await
+        .unwrap();
     n.staged.lock().await.clear();
 
     // Park the commit INSIDE `commit_block`, after it has claimed the
@@ -250,20 +319,42 @@ async fn the_anchor_waits_out_an_in_flight_commit_of_the_same_block() {
     let commit = tokio::spawn(async move { feeder.shim_new(&bytes).await });
     let t0 = Instant::now();
     while !n.inflight.lock().await.contains_key(&c) {
-        assert!(t0.elapsed() < Duration::from_secs(5), "the commit must claim the commitment");
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "the commit must claim the commitment"
+        );
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 
     let anchor = n.clone();
     let by_c = tokio::spawn(async move { anchor.shim_new_by_commitment(c).await });
     tokio::time::sleep(Duration::from_millis(100)).await;
-    assert!(!by_c.is_finished(), "the anchor must WAIT on the in-flight commit, not answer early");
+    assert!(
+        !by_c.is_finished(),
+        "the anchor must WAIT on the in-flight commit, not answer early"
+    );
     drop(state_guard);
 
     assert_eq!(commit.await.unwrap().unwrap(), NewBlockOutcome::Valid(c));
-    assert_eq!(by_c.await.unwrap().unwrap(), NewBlockOutcome::Valid(c), "idempotent VALID");
+    assert_eq!(
+        by_c.await.unwrap().unwrap(),
+        NewBlockOutcome::Valid(c),
+        "idempotent VALID"
+    );
     assert_eq!(n.head.lock().await.0, c);
-    assert_eq!(n.stats.blocks.load(Ordering::Relaxed), 1, "exactly one commit");
-    assert_eq!(n.stats.block_pulls.load(Ordering::Relaxed), 0, "and no peer fetch");
-    assert_eq!(n.stats.log_scans.load(Ordering::Relaxed), 0, "and no log scan");
+    assert_eq!(
+        n.stats.blocks.load(Ordering::Relaxed),
+        1,
+        "exactly one commit"
+    );
+    assert_eq!(
+        n.stats.block_pulls.load(Ordering::Relaxed),
+        0,
+        "and no peer fetch"
+    );
+    assert_eq!(
+        n.stats.log_scans.load(Ordering::Relaxed),
+        0,
+        "and no log scan"
+    );
 }

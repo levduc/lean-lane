@@ -33,20 +33,33 @@ fn sk(i: u64) -> SecretKey {
 }
 
 fn node(dir: &std::path::Path) -> Arc<LaneNode> {
-    Arc::new(LaneNode::open(Config { datadir: dir.to_path_buf(), ..Default::default() }).unwrap().0)
+    Arc::new(
+        LaneNode::open(Config {
+            datadir: dir.to_path_buf(),
+            ..Default::default()
+        })
+        .unwrap()
+        .0,
+    )
 }
 
 /// A signed fan-out tx plus the funding its sender needs.
 async fn funded_tx(n: &LaneNode, key: u64, nonce: u32, outputs: usize) -> Vec<u8> {
     let domain = current_lane_domain();
     let outs = (0..outputs)
-        .map(|i| Output { to: Address::with_last_byte((i % 200) as u8), amount: 3 })
+        .map(|i| Output {
+            to: Address::with_last_byte((i % 200) as u8),
+            amount: 3,
+        })
         .collect();
     let signed = LeanSigned::new(LeanTx::sign(nonce, outs, &sk(key), &domain));
     let sender = signed.tx().recover_sender(&domain).unwrap();
     n.seed_account(
         sender,
-        Acct { nonce: 0, balance: 100 * (lean_fee(outputs) + outputs as u128 * 3 * AMOUNT_UNIT) },
+        Acct {
+            nonce: 0,
+            balance: 100 * (lean_fee(outputs) + outputs as u128 * 3 * AMOUNT_UNIT),
+        },
     )
     .await;
     signed.raw().to_vec()
@@ -107,10 +120,16 @@ async fn commitment_of_wire_rejects_malformed_bytes() {
     let n = node(dir.path());
     let (_, wire) = wire_head_plus_one(&n, 7, 3).await;
     assert!(LeanBlock::commitment_of_wire(&wire[..20]).is_err(), "short");
-    assert!(LeanBlock::commitment_of_wire(&wire[..wire.len() - 5]).is_err(), "truncated body");
+    assert!(
+        LeanBlock::commitment_of_wire(&wire[..wire.len() - 5]).is_err(),
+        "truncated body"
+    );
     let mut trailing = wire.clone();
     trailing.push(0);
-    assert!(LeanBlock::commitment_of_wire(&trailing).is_err(), "trailing");
+    assert!(
+        LeanBlock::commitment_of_wire(&trailing).is_err(),
+        "trailing"
+    );
     // and a bad body must never leave a claim behind
     assert!(n.stage_block(&trailing).await.is_err());
     assert!(n.inflight.lock().await.is_empty());
@@ -182,12 +201,26 @@ async fn anchor_waits_for_a_stage_that_has_not_registered_yet() {
 
     let t = std::time::Instant::now();
     let r = n.shim_new_by_commitment(c).await.unwrap();
-    assert_eq!(r, NewBlockOutcome::Valid(c), "anchor must not SYNC past its own stage");
-    assert!(t.elapsed() >= Duration::from_millis(20), "it really did wait");
+    assert_eq!(
+        r,
+        NewBlockOutcome::Valid(c),
+        "anchor must not SYNC past its own stage"
+    );
+    assert!(
+        t.elapsed() >= Duration::from_millis(20),
+        "it really did wait"
+    );
     assert!(matches!(staging.await.unwrap().unwrap(), StageOutcome::Staged(x) if x == c));
 
-    assert!(n.stats.stage_race_waits.load(Ordering::Relaxed) >= 1, "the wait is counted");
-    assert_eq!(n.stats.block_pulls.load(Ordering::Relaxed), 0, "no peer fetch");
+    assert!(
+        n.stats.stage_race_waits.load(Ordering::Relaxed) >= 1,
+        "the wait is counted"
+    );
+    assert_eq!(
+        n.stats.block_pulls.load(Ordering::Relaxed),
+        0,
+        "no peer fetch"
+    );
     assert_eq!(n.head.lock().await.1, 1);
     assert_eq!(log_len(&n).await, 1, "appended exactly once");
     assert!(n.inflight.lock().await.is_empty());
@@ -202,9 +235,16 @@ async fn no_stage_pending_means_no_wait() {
     let dir = tempfile::tempdir().unwrap();
     let n = node(dir.path());
     let t = std::time::Instant::now();
-    let r = n.shim_new_by_commitment(B256::repeat_byte(0xab)).await.unwrap();
+    let r = n
+        .shim_new_by_commitment(B256::repeat_byte(0xab))
+        .await
+        .unwrap();
     assert!(matches!(r, NewBlockOutcome::Syncing { head: 0 }));
-    assert!(t.elapsed() < Duration::from_millis(30), "took {:?}", t.elapsed());
+    assert!(
+        t.elapsed() < Duration::from_millis(30),
+        "took {:?}",
+        t.elapsed()
+    );
     assert_eq!(n.stats.stage_race_waits.load(Ordering::Relaxed), 0);
 }
 
@@ -242,9 +282,19 @@ async fn anchor_for_a_failing_stage_returns_without_hanging() {
         .await
         .expect("anchor hung on a failed stage")
         .unwrap();
-    assert!(matches!(r, NewBlockOutcome::Syncing { head: 0 }), "got {r:?}");
-    assert!(t.elapsed() < Duration::from_secs(2), "took {:?}", t.elapsed());
-    assert!(matches!(staging.await.unwrap().unwrap(), StageOutcome::Syncing { head: 0 }));
+    assert!(
+        matches!(r, NewBlockOutcome::Syncing { head: 0 }),
+        "got {r:?}"
+    );
+    assert!(
+        t.elapsed() < Duration::from_secs(2),
+        "took {:?}",
+        t.elapsed()
+    );
+    assert!(matches!(
+        staging.await.unwrap().unwrap(),
+        StageOutcome::Syncing { head: 0 }
+    ));
     // the failed stage released its claim (a leak would park the NEXT anchor
     // for the full 2 s guard)
     assert!(n.inflight.lock().await.is_empty());
@@ -269,7 +319,11 @@ async fn a_failed_stage_leaves_no_claim() {
     let t = std::time::Instant::now();
     let r = n.shim_new_by_commitment(orphan.commitment).await.unwrap();
     assert!(matches!(r, NewBlockOutcome::Syncing { head: 0 }));
-    assert!(t.elapsed() < Duration::from_millis(30), "took {:?}", t.elapsed());
+    assert!(
+        t.elapsed() < Duration::from_millis(30),
+        "took {:?}",
+        t.elapsed()
+    );
 }
 
 /// A duplicate stage of a block already staged stays the cheap no-op it was,
@@ -283,7 +337,10 @@ async fn duplicate_stage_is_still_a_noop() {
     assert_eq!(n.stage_block(&wire).await.unwrap(), StageOutcome::Staged(c));
     assert_eq!(n.staged.lock().await.len(), 1);
     assert!(n.inflight.lock().await.is_empty());
-    assert_eq!(n.shim_new_by_commitment(c).await.unwrap(), NewBlockOutcome::Valid(c));
+    assert_eq!(
+        n.shim_new_by_commitment(c).await.unwrap(),
+        NewBlockOutcome::Valid(c)
+    );
     assert_eq!(log_len(&n).await, 1);
 }
 
@@ -350,7 +407,10 @@ async fn a_stale_release_cannot_hand_a_second_committer_the_same_block() {
         !n.release_claim(c, u64::MAX, &lock_ns).await,
         "a claim we do not own must not be released"
     );
-    assert!(n.inflight.lock().await.contains_key(&c), "the committer still holds its claim");
+    assert!(
+        n.inflight.lock().await.contains_key(&c),
+        "the committer still holds its claim"
+    );
 
     // a third feed of the same bytes, while the commit is still in flight
     let third = {
@@ -368,7 +428,11 @@ async fn a_stale_release_cannot_hand_a_second_committer_the_same_block() {
         || matches!(r3, NewBlockOutcome::Syncing { .. });
     assert!(ok, "got {r3:?}");
     assert_eq!(n.head.lock().await.1, 1);
-    assert_eq!(records_on_disk(dir.path()), 1, "the block is on disk exactly once");
+    assert_eq!(
+        records_on_disk(dir.path()),
+        1,
+        "the block is on disk exactly once"
+    );
     assert!(n.inflight.lock().await.is_empty());
 }
 
@@ -564,7 +628,10 @@ async fn a_commit_between_the_head_read_and_the_state_clone_stages_nothing() {
     assert_eq!(committer.await.unwrap().unwrap(), Some(1));
     // the head moved under the stage: it must refuse, not stage a post-state
     // of a parent it never re-checked
-    assert_eq!(staging.await.unwrap().unwrap(), StageOutcome::Syncing { head: 1 });
+    assert_eq!(
+        staging.await.unwrap().unwrap(),
+        StageOutcome::Syncing { head: 1 }
+    );
     assert!(
         !n.staged.lock().await.iter().any(|(c, _)| *c == cb),
         "staged an entry whose post-state is not its parent's",

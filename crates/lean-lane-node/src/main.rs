@@ -37,7 +37,10 @@ fn arg<T: std::str::FromStr>(args: &[String], name: &str, default: T) -> T {
 }
 
 fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
 }
 
 fn sk(i: u64) -> SecretKey {
@@ -105,20 +108,34 @@ async fn run(args: &[String]) -> eyre::Result<()> {
             if line.is_empty() {
                 continue;
             }
-            let a: Address = line.parse().map_err(|e| eyre::eyre!("fund-file '{line}': {e}"))?;
-            node.seed_account(a, Acct { nonce: 0, balance: fund_balance as u128 }).await;
+            let a: Address = line
+                .parse()
+                .map_err(|e| eyre::eyre!("fund-file '{line}': {e}"))?;
+            node.seed_account(
+                a,
+                Acct {
+                    nonce: 0,
+                    balance: fund_balance as u128,
+                },
+            )
+            .await;
             n += 1;
         }
         // Persist the seeded genesis (recovery gotcha: unsnapshotted seeds
         // silently diverge on restart).
         let (c, num, t) = *node.head.lock().await;
-        node.state.lock().await.write_snapshot(&node.cfg.datadir, c, num, t)?;
+        node.state
+            .lock()
+            .await
+            .write_snapshot(&node.cfg.datadir, c, num, t)?;
         println!("funded {n} accounts @ {fund_balance} gwei-units from {fund_file}");
     }
     let shim = args.iter().any(|a| a == "--shim")
-        || std::env::var("ARC_LEAN_SHIM").map_or(false, |v| v == "1");
+        || std::env::var("ARC_LEAN_SHIM").is_ok_and(|v| v == "1");
     let bind: String = arg(args, "--bind", "127.0.0.1".to_string());
-    let bind_ip: std::net::IpAddr = bind.parse().map_err(|e| eyre::eyre!("--bind {bind}: {e}"))?;
+    let bind_ip: std::net::IpAddr = bind
+        .parse()
+        .map_err(|e| eyre::eyre!("--bind {bind}: {e}"))?;
     let (addr, _handle) = rpc::serve(node.clone(), (bind_ip, port).into()).await?;
     println!("rpc: http://{addr}  (eth_sendRawTransaction / arc_sendRawTxBatch / txpool_status / arc_getHead / arc_buildBlock / arc_newBlock / arc_getBlockBytes)");
     if shim {
@@ -171,8 +188,20 @@ async fn bench(args: &[String]) -> eyre::Result<()> {
         let signed = LeanSigned::new(tx);
         let sender = signed.tx().recover_sender(&domain).unwrap();
         let need: u128 = lean_fee(n)
-            + signed.tx().outputs.iter().map(|o| o.amount as u128 * AMOUNT_UNIT).sum::<u128>();
-        node.seed_account(sender, Acct { nonce: 0, balance: need }).await;
+            + signed
+                .tx()
+                .outputs
+                .iter()
+                .map(|o| o.amount as u128 * AMOUNT_UNIT)
+                .sum::<u128>();
+        node.seed_account(
+            sender,
+            Acct {
+                nonce: 0,
+                balance: need,
+            },
+        )
+        .await;
         raws.push(signed.raw().to_vec());
     }
     println!("  signed+seeded in {:?}", t0.elapsed());
@@ -180,7 +209,10 @@ async fn bench(args: &[String]) -> eyre::Result<()> {
         // Persist the seeded genesis so recovery has the same starting state
         // a real lane would get from its genesis file.
         let (c, n, t) = *node.head.lock().await;
-        node.state.lock().await.write_snapshot(&node.cfg.datadir, c, n, t)?;
+        node.state
+            .lock()
+            .await
+            .write_snapshot(&node.cfg.datadir, c, n, t)?;
     }
 
     // -- rpc + driver ---------------------------------------------------------
@@ -211,7 +243,9 @@ async fn bench(args: &[String]) -> eyre::Result<()> {
     let t_submit = Instant::now();
     for chunk in raws.chunks(2000) {
         let b64 = rpc::encode_batch(chunk);
-        let r: serde_json::Value = client.request("arc_sendRawTxBatch", rpc_params![b64]).await?;
+        let r: serde_json::Value = client
+            .request("arc_sendRawTxBatch", rpc_params![b64])
+            .await?;
         if r["rejected"].as_u64().unwrap_or(0) > 0 {
             eprintln!("batch rejects: {r}");
         }
@@ -247,29 +281,53 @@ async fn bench(args: &[String]) -> eyre::Result<()> {
     println!("=== lean-lane-node bench ===");
     println!("txs {txs} ({} noops)  blocks {blocks}  outputs {outputs}  budget {}M gas  cadence {block_ms}ms",
         s.noops.load(Ordering::Relaxed), node.cfg.budget_gas / 1_000_000);
-    println!("SUSTAINED: {:.0} outputs/s  ({:.0} tx/s) over {:.1}s active window (first->last block)",
-        outputs as f64 / active_s, txs as f64 / active_s, active_s);
-    println!("submit: {} txs in {:?} through arc_sendRawTxBatch ({:.1}k tx/s offered)",
-        admitted, submit_elapsed, admitted as f64 / submit_elapsed.as_secs_f64() / 1000.0);
+    println!(
+        "SUSTAINED: {:.0} outputs/s  ({:.0} tx/s) over {:.1}s active window (first->last block)",
+        outputs as f64 / active_s,
+        txs as f64 / active_s,
+        active_s
+    );
+    println!(
+        "submit: {} txs in {:?} through arc_sendRawTxBatch ({:.1}k tx/s offered)",
+        admitted,
+        submit_elapsed,
+        admitted as f64 / submit_elapsed.as_secs_f64() / 1000.0
+    );
     println!("per-output µs: admission {:.2} (per tx {:.2})  build {:.3}  execute {:.3}  append+fsync {:.3}",
         s.admit_ns.load(Ordering::Relaxed) as f64 / 1000.0 / outputs as f64,
         s.admit_ns.load(Ordering::Relaxed) as f64 / 1000.0 / admitted as f64,
         per_out(s.build_ns.load(Ordering::Relaxed)),
         per_out(s.exec_ns.load(Ordering::Relaxed)),
         per_out(s.append_ns.load(Ordering::Relaxed)));
-    println!("log: {} bytes total = {:.1} B/output  ({:.1} B/tx)",
-        log_bytes, log_bytes as f64 / outputs as f64, log_bytes as f64 / txs as f64);
+    println!(
+        "log: {} bytes total = {:.1} B/output  ({:.1} B/tx)",
+        log_bytes,
+        log_bytes as f64 / outputs as f64,
+        log_bytes as f64 / txs as f64
+    );
 
     // -- recovery -------------------------------------------------------------
     let digest_live = node.state.lock().await.digest();
-    let cfg2 = Config { datadir: dir.clone(), ..Default::default() };
+    let cfg2 = Config {
+        datadir: dir.clone(),
+        ..Default::default()
+    };
     let t_rec = Instant::now();
     let (node2, rec) = LaneNode::open(cfg2)?;
     let rec_elapsed = t_rec.elapsed();
     let digest_rec = node2.state.lock().await.digest();
-    println!("recovery: snapshot@{} + {} blocks / {} txs replayed in {:?}  state {}",
-        rec.snapshot_number, rec.replayed_blocks, rec.replayed_txs, rec_elapsed,
-        if digest_rec == digest_live { "MATCHES" } else { "MISMATCH!!" });
+    println!(
+        "recovery: snapshot@{} + {} blocks / {} txs replayed in {:?}  state {}",
+        rec.snapshot_number,
+        rec.replayed_blocks,
+        rec.replayed_txs,
+        rec_elapsed,
+        if digest_rec == digest_live {
+            "MATCHES"
+        } else {
+            "MISMATCH!!"
+        }
+    );
     if digest_rec != digest_live {
         eyre::bail!("recovery digest mismatch");
     }

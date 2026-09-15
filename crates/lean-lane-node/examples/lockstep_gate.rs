@@ -27,8 +27,10 @@ fn sk(i: u64) -> SecretKey {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> eyre::Result<()> {
-    let blocks: u64 =
-        std::env::args().nth(1).and_then(|a| a.parse().ok()).unwrap_or(10_000);
+    let blocks: u64 = std::env::args()
+        .nth(1)
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(10_000);
     let dir_a = std::env::temp_dir().join(format!("lockstep-a-{}", std::process::id()));
     let dir_b = std::env::temp_dir().join(format!("lockstep-b-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir_a);
@@ -73,12 +75,29 @@ async fn main() -> eyre::Result<()> {
                     })
                     .collect();
                 let need: u128 = lean_fee(n)
-                    + outs.iter().map(|o| o.amount as u128 * AMOUNT_UNIT).sum::<u128>();
+                    + outs
+                        .iter()
+                        .map(|o| o.amount as u128 * AMOUNT_UNIT)
+                        .sum::<u128>();
                 let tx = LeanTx::sign(0, outs, &sk(key), &domain);
                 let signed = LeanSigned::new(tx);
                 let sender = signed.tx().recover_sender(&domain).unwrap();
-                a.seed_account(sender, Acct { nonce: 0, balance: need }).await;
-                b.seed_account(sender, Acct { nonce: 0, balance: need }).await;
+                a.seed_account(
+                    sender,
+                    Acct {
+                        nonce: 0,
+                        balance: need,
+                    },
+                )
+                .await;
+                b.seed_account(
+                    sender,
+                    Acct {
+                        nonce: 0,
+                        balance: need,
+                    },
+                )
+                .await;
                 txs.push(signed.raw().to_vec());
                 key += 1;
                 total_txs += 1;
@@ -88,9 +107,15 @@ async fn main() -> eyre::Result<()> {
     }
     for n in [&a, &b] {
         let (c, num, ts) = *n.head.lock().await;
-        n.state.lock().await.write_snapshot(&n.cfg.datadir, c, num, ts)?;
+        n.state
+            .lock()
+            .await
+            .write_snapshot(&n.cfg.datadir, c, num, ts)?;
     }
-    println!("  genesis ready: {total_txs} txs, {key} senders ({:?})", t0.elapsed());
+    println!(
+        "  genesis ready: {total_txs} txs, {key} senders ({:?})",
+        t0.elapsed()
+    );
 
     let mut prev_wire: Option<Vec<u8>> = None;
     for height in 1..=blocks {
@@ -103,10 +128,14 @@ async fn main() -> eyre::Result<()> {
             .await
             .map_err(|e| eyre::eyre!(e))?;
         let NewBlockOutcome::Valid(ca2) = a.shim_new(&wire).await.map_err(|e| eyre::eyre!(e))?
-        else { eyre::bail!("A SYNCING on own block") };
+        else {
+            eyre::bail!("A SYNCING on own block")
+        };
         assert_eq!(ca, ca2, "A's own newBlock must agree with its build");
         let NewBlockOutcome::Valid(cb) = b.shim_new(&wire).await.map_err(|e| eyre::eyre!(e))?
-        else { eyre::bail!("B SYNCING on in-order feed at height {height}") };
+        else {
+            eyre::bail!("B SYNCING on in-order feed at height {height}")
+        };
         assert_eq!(ca, cb, "lockstep broke at height {height}");
 
         // in-stream idempotency: occasionally re-feed the previous block to B
@@ -130,14 +159,23 @@ async fn main() -> eyre::Result<()> {
             })?;
             b = nb;
             assert_eq!(*b.head.lock().await, head_before, "B head after restart");
-            assert_eq!(b.state.lock().await.digest(), digest_before, "B state after restart");
+            assert_eq!(
+                b.state.lock().await.digest(),
+                digest_before,
+                "B state after restart"
+            );
             println!(
                 "  [restart @ {height}] B recovered: snapshot@{} + {} blocks in {:?}",
-                rec.snapshot_number, rec.replayed_blocks, t_rec.elapsed()
+                rec.snapshot_number,
+                rec.replayed_blocks,
+                t_rec.elapsed()
             );
         }
         if height % 1000 == 0 {
-            println!("  {height}/{blocks} heights, {total_txs} txs, {:?}", t0.elapsed());
+            println!(
+                "  {height}/{blocks} heights, {total_txs} txs, {:?}",
+                t0.elapsed()
+            );
         }
     }
 

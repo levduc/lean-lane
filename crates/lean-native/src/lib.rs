@@ -205,11 +205,19 @@ impl LeanTx {
         let mut sig = [0u8; SIG_LEN];
         sig.copy_from_slice(&bytes[at..at + SIG_LEN]);
         *buf = &bytes[need..];
-        Ok(LeanTx { nonce, outputs, sig })
+        Ok(LeanTx {
+            nonce,
+            outputs,
+            sig,
+        })
     }
 
     pub fn sign(nonce: u32, outputs: Vec<Output>, sk: &SecretKey, domain: &B256) -> Self {
-        let mut tx = LeanTx { nonce, outputs, sig: [0u8; SIG_LEN] };
+        let mut tx = LeanTx {
+            nonce,
+            outputs,
+            sig: [0u8; SIG_LEN],
+        };
         let msg = Message::from_digest(tx.signing_hash(domain).0);
         let sig = SECP256K1.sign_ecdsa_recoverable(&msg, sk);
         let (rec, data) = sig.serialize_compact();
@@ -280,13 +288,23 @@ pub struct RecoveredTx {
 
 pub fn recover_all_serial(txs: &[LeanTx], domain: &B256) -> Result<Vec<RecoveredTx>, TxError> {
     txs.iter()
-        .map(|tx| Ok(RecoveredTx { sender: tx.recover_sender(domain)?, tx: tx.clone() }))
+        .map(|tx| {
+            Ok(RecoveredTx {
+                sender: tx.recover_sender(domain)?,
+                tx: tx.clone(),
+            })
+        })
         .collect()
 }
 
 pub fn recover_all_parallel(txs: &[LeanTx], domain: &B256) -> Result<Vec<RecoveredTx>, TxError> {
     txs.par_iter()
-        .map(|tx| Ok(RecoveredTx { sender: tx.recover_sender(domain)?, tx: tx.clone() }))
+        .map(|tx| {
+            Ok(RecoveredTx {
+                sender: tx.recover_sender(domain)?,
+                tx: tx.clone(),
+            })
+        })
         .collect()
 }
 
@@ -296,7 +314,10 @@ fn validate_and_debit(
     spendable: &mut Account,
 ) -> Result<(u128, Vec<TransferLog>), TxError> {
     if tx.nonce != spendable.nonce {
-        return Err(TxError::NonceMismatch { expected: spendable.nonce, got: tx.nonce });
+        return Err(TxError::NonceMismatch {
+            expected: spendable.nonce,
+            got: tx.nonce,
+        });
     }
     let fee = lean_fee(tx.outputs.len());
     let mut total: u128 = fee;
@@ -314,7 +335,11 @@ fn validate_and_debit(
         .outputs
         .iter()
         .filter(|o| o.amount != 0)
-        .map(|o| TransferLog { from: sender, to: o.to, amount: o.amount as u128 * AMOUNT_UNIT })
+        .map(|o| TransferLog {
+            from: sender,
+            to: o.to,
+            amount: o.amount as u128 * AMOUNT_UNIT,
+        })
         .collect();
     Ok((total, logs))
 }
@@ -336,13 +361,16 @@ pub fn execute_block_serial(
         let entry = debit_view
             .entry(rtx.sender)
             .or_insert_with(|| state.get(&rtx.sender).copied().unwrap_or_default());
-        let (_, logs) =
-            validate_and_debit(rtx.sender, &rtx.tx, entry).map_err(|e| (i, e))?;
+        let (_, logs) = validate_and_debit(rtx.sender, &rtx.tx, entry).map_err(|e| (i, e))?;
         for o in &rtx.tx.outputs {
             *credits.entry(o.to).or_default() += o.amount as u128 * AMOUNT_UNIT;
         }
         fees += lean_fee(rtx.tx.outputs.len());
-        receipts.push(Receipt { sender: rtx.sender, n_outputs: rtx.tx.outputs.len(), logs });
+        receipts.push(Receipt {
+            sender: rtx.sender,
+            n_outputs: rtx.tx.outputs.len(),
+            logs,
+        });
     }
     // Commit debits, then credits, then the deferred beneficiary fee.
     for (addr, acct) in debit_view {
@@ -352,7 +380,10 @@ pub fn execute_block_serial(
         state.entry(addr).or_default().balance += amount;
     }
     state.entry(beneficiary).or_default().balance += fees;
-    Ok(BlockResult { receipts, fees_to_beneficiary: fees })
+    Ok(BlockResult {
+        receipts,
+        fees_to_beneficiary: fees,
+    })
 }
 
 /// Deterministic parallel implementation: partition by sender (nonce/balance
@@ -400,10 +431,20 @@ pub fn execute_block_parallel(
                     fees += lean_fee(rtx.tx.outputs.len());
                     receipts.push((
                         i,
-                        Receipt { sender: *sender, n_outputs: rtx.tx.outputs.len(), logs },
+                        Receipt {
+                            sender: *sender,
+                            n_outputs: rtx.tx.outputs.len(),
+                            logs,
+                        },
                     ));
                 }
-                outs.push(PartOut { sender: *sender, post: acct, credits, receipts, fees });
+                outs.push(PartOut {
+                    sender: *sender,
+                    post: acct,
+                    credits,
+                    receipts,
+                    fees,
+                });
             }
             Ok(outs)
         })
@@ -420,7 +461,7 @@ pub fn execute_block_parallel(
             Err(e) => {
                 // Whole-block failure must report the FIRST invalid tx index,
                 // matching the serial reference regardless of thread timing.
-                if first_err.map_or(true, |(fi, _)| e.0 < fi) {
+                if first_err.is_none_or(|(fi, _)| e.0 < fi) {
                     first_err = Some(e);
                 }
             }
@@ -440,8 +481,14 @@ pub fn execute_block_parallel(
         }
     }
     state.entry(beneficiary).or_default().balance += fees_total;
-    let receipts = receipts_slots.into_iter().map(|r| r.expect("all txs accounted")).collect();
-    Ok(BlockResult { receipts, fees_to_beneficiary: fees_total })
+    let receipts = receipts_slots
+        .into_iter()
+        .map(|r| r.expect("all txs accounted"))
+        .collect();
+    Ok(BlockResult {
+        receipts,
+        fees_to_beneficiary: fees_total,
+    })
 }
 
 #[cfg(test)]
@@ -456,7 +503,15 @@ mod tests {
     }
 
     fn addr_of(i: u64, domain: &B256) -> Address {
-        let tx = LeanTx::sign(0, vec![Output { to: Address::ZERO, amount: 1 }], &sk(i), domain);
+        let tx = LeanTx::sign(
+            0,
+            vec![Output {
+                to: Address::ZERO,
+                amount: 1,
+            }],
+            &sk(i),
+            domain,
+        );
         tx.recover_sender(domain).unwrap()
     }
 
@@ -473,7 +528,10 @@ mod tests {
         let d = dom();
         for n in [1usize, 2, 10, 100, MAX_OUTPUTS] {
             let outputs: Vec<Output> = (0..n)
-                .map(|i| Output { to: Address::with_last_byte((i % 250) as u8), amount: i as u64 })
+                .map(|i| Output {
+                    to: Address::with_last_byte((i % 250) as u8),
+                    amount: i as u64,
+                })
                 .collect();
             let tx = LeanTx::sign(7, outputs, &sk(1), &d);
             let bytes = tx.encode();
@@ -481,14 +539,25 @@ mod tests {
             assert_eq!(bytes[0], LEAN_TX_TYPE);
             let back = LeanTx::decode(&bytes).unwrap();
             assert_eq!(back, tx);
-            assert_eq!(back.recover_sender(&d).unwrap(), tx.recover_sender(&d).unwrap());
+            assert_eq!(
+                back.recover_sender(&d).unwrap(),
+                tx.recover_sender(&d).unwrap()
+            );
         }
     }
 
     #[test]
     fn decode_rejects_malformed() {
         let d = dom();
-        let tx = LeanTx::sign(0, vec![Output { to: Address::ZERO, amount: 5 }], &sk(1), &d);
+        let tx = LeanTx::sign(
+            0,
+            vec![Output {
+                to: Address::ZERO,
+                amount: 5,
+            }],
+            &sk(1),
+            &d,
+        );
         let good = tx.encode();
         // too short at every truncation point
         for cut in 0..good.len() {
@@ -501,12 +570,18 @@ mod tests {
         // wrong type byte
         let mut bad = good.clone();
         bad[0] = 0x51;
-        assert!(matches!(LeanTx::decode(&bad), Err(DecodeError::BadType(0x51))));
+        assert!(matches!(
+            LeanTx::decode(&bad),
+            Err(DecodeError::BadType(0x51))
+        ));
         // zero outputs
         let mut z = good.clone();
         z[5] = 0;
         z[6] = 0;
-        assert!(matches!(LeanTx::decode(&z), Err(DecodeError::BadOutputCount(0)) | Err(DecodeError::TrailingBytes)));
+        assert!(matches!(
+            LeanTx::decode(&z),
+            Err(DecodeError::BadOutputCount(0)) | Err(DecodeError::TrailingBytes)
+        ));
         // tampered output amount breaks signature recovery to the same sender
         let mut t = good.clone();
         let amt_off = HEADER_LEN + 20;
@@ -523,8 +598,19 @@ mod tests {
     fn domain_separates_lanes() {
         let d1 = lane_domain(1338);
         let d2 = lane_domain(1337);
-        let tx = LeanTx::sign(0, vec![Output { to: Address::ZERO, amount: 5 }], &sk(3), &d1);
-        assert_ne!(tx.recover_sender(&d1).unwrap(), tx.recover_sender(&d2).unwrap());
+        let tx = LeanTx::sign(
+            0,
+            vec![Output {
+                to: Address::ZERO,
+                amount: 5,
+            }],
+            &sk(3),
+            &d1,
+        );
+        assert_ne!(
+            tx.recover_sender(&d1).unwrap(),
+            tx.recover_sender(&d2).unwrap()
+        );
     }
 
     #[test]
@@ -540,18 +626,28 @@ mod tests {
         let tx = LeanTx::sign(
             0,
             vec![
-                Output { to: r1, amount: 400_000 },
+                Output {
+                    to: r1,
+                    amount: 400_000,
+                },
                 Output { to: r2, amount: 0 },
-                Output { to: r1, amount: 600_000 },
+                Output {
+                    to: r1,
+                    amount: 600_000,
+                },
             ],
             &sk(1),
             &d,
         );
         let rec = recover_all_serial(&[tx], &d).unwrap();
         let out = execute_block_serial(&mut state, &rec, ben).unwrap();
-        assert_eq!(out.receipts[0].logs.len(), 2, "zero-value output must not log");
+        assert_eq!(
+            out.receipts[0].logs.len(),
+            2,
+            "zero-value output must not log"
+        );
         assert_eq!(state[&r1].balance, 1_000_000 * AMOUNT_UNIT);
-        assert!(state.get(&r2).map_or(true, |a| a.balance == 0));
+        assert!(state.get(&r2).is_none_or(|a| a.balance == 0));
         assert_eq!(state[&sender].balance, 0);
         assert_eq!(state[&ben].balance, lean_fee(3));
         assert_eq!(state[&sender].nonce, 1);
@@ -566,8 +662,14 @@ mod tests {
         let tx = LeanTx::sign(
             0,
             vec![
-                Output { to: Address::with_last_byte(1), amount: 50 },
-                Output { to: Address::with_last_byte(2), amount: 50 },
+                Output {
+                    to: Address::with_last_byte(1),
+                    amount: 50,
+                },
+                Output {
+                    to: Address::with_last_byte(2),
+                    amount: 50,
+                },
             ],
             &sk(2),
             &d,
@@ -587,11 +689,31 @@ mod tests {
         let mut state = State::new();
         fund(&mut state, a, 1_000 * AMOUNT_UNIT + lean_fee(1));
         fund(&mut state, b, lean_fee(1)); // b can pay its fee but not forward a's credit
-        let t1 = LeanTx::sign(0, vec![Output { to: b, amount: 1_000 }], &sk(3), &d);
-        let t2 = LeanTx::sign(0, vec![Output { to: Address::with_last_byte(9), amount: 500 }], &sk(4), &d);
+        let t1 = LeanTx::sign(
+            0,
+            vec![Output {
+                to: b,
+                amount: 1_000,
+            }],
+            &sk(3),
+            &d,
+        );
+        let t2 = LeanTx::sign(
+            0,
+            vec![Output {
+                to: Address::with_last_byte(9),
+                amount: 500,
+            }],
+            &sk(4),
+            &d,
+        );
         let rec = recover_all_serial(&[t1, t2], &d).unwrap();
         let err = execute_block_serial(&mut state.clone(), &rec, Address::ZERO).unwrap_err();
-        assert_eq!(err, (1, TxError::InsufficientFunds), "same-block credit must not fund t2");
+        assert_eq!(
+            err,
+            (1, TxError::InsufficientFunds),
+            "same-block credit must not fund t2"
+        );
         let errp = execute_block_parallel(&mut state, &rec, Address::ZERO).unwrap_err();
         assert_eq!(err, errp);
     }
@@ -609,8 +731,10 @@ mod tests {
             .collect();
         let rec_s = recover_all_serial(&txs, &d).unwrap();
         let rec_p = recover_all_parallel(&txs, &d).unwrap();
-        assert_eq!(rec_s.iter().map(|r| r.sender).collect::<Vec<_>>(),
-                   rec_p.iter().map(|r| r.sender).collect::<Vec<_>>());
+        assert_eq!(
+            rec_s.iter().map(|r| r.sender).collect::<Vec<_>>(),
+            rec_p.iter().map(|r| r.sender).collect::<Vec<_>>()
+        );
         let mut s1 = state.clone();
         let mut s2 = state;
         let o1 = execute_block_serial(&mut s1, &rec_s, ben);
@@ -633,11 +757,18 @@ mod tests {
         for k in 0..40u64 {
             balances.push((k, 10 * lean_fee(3) + 100_000 * AMOUNT_UNIT));
             // two txs per sender, in nonce order, mixed fan-out incl. hot recipient + self dups
-            work.push((k, 0u32, vec![
-                Output { to: hot, amount: 7 },
-                Output { to: Address::with_last_byte((k % 200) as u8), amount: 11 },
-                Output { to: hot, amount: 3 },
-            ]));
+            work.push((
+                k,
+                0u32,
+                vec![
+                    Output { to: hot, amount: 7 },
+                    Output {
+                        to: Address::with_last_byte((k % 200) as u8),
+                        amount: 11,
+                    },
+                    Output { to: hot, amount: 3 },
+                ],
+            ));
             work.push((k, 1u32, vec![Output { to: hot, amount: 1 }]));
         }
         differential(work, balances);
@@ -650,10 +781,27 @@ mod tests {
         // sender 6: self-transfer; sender 7: nonce gap -> whole block invalid, same index both impls
         differential(
             vec![
-                (6, 0, vec![Output { to: a3, amount: 500 }]),  // 500 gwei
-                (7, 5, vec![Output { to: Address::with_last_byte(1), amount: 1 }]),
+                (
+                    6,
+                    0,
+                    vec![Output {
+                        to: a3,
+                        amount: 500,
+                    }],
+                ), // 500 gwei
+                (
+                    7,
+                    5,
+                    vec![Output {
+                        to: Address::with_last_byte(1),
+                        amount: 1,
+                    }],
+                ),
             ],
-            vec![(6, lean_fee(1) + 1_000 * AMOUNT_UNIT), (7, lean_fee(1) + 1_000 * AMOUNT_UNIT)],
+            vec![
+                (6, lean_fee(1) + 1_000 * AMOUNT_UNIT),
+                (7, lean_fee(1) + 1_000 * AMOUNT_UNIT),
+            ],
         );
     }
 

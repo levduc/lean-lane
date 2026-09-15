@@ -37,24 +37,46 @@ impl Rng {
 }
 
 async fn open_node(dir: &std::path::Path) -> LaneNode {
-    LaneNode::open(Config { datadir: dir.to_path_buf(), snapshot_every: 7, ..Default::default() })
-        .unwrap()
-        .0
+    LaneNode::open(Config {
+        datadir: dir.to_path_buf(),
+        snapshot_every: 7,
+        ..Default::default()
+    })
+    .unwrap()
+    .0
 }
 
 async fn seed_all(nodes: &[&LaneNode], keys: u64) {
     let domain = current_lane_domain();
     for k in 0..keys {
-        let probe = LeanTx::sign(0, vec![Output { to: Address::ZERO, amount: 1 }], &sk(k), &domain);
+        let probe = LeanTx::sign(
+            0,
+            vec![Output {
+                to: Address::ZERO,
+                amount: 1,
+            }],
+            &sk(k),
+            &domain,
+        );
         let sender = LeanSigned::new(probe).tx().recover_sender(&domain).unwrap();
         for n in nodes {
-            n.seed_account(sender, Acct { nonce: 0, balance: 200 * (lean_fee(100) + 100 * AMOUNT_UNIT) })
-                .await;
+            n.seed_account(
+                sender,
+                Acct {
+                    nonce: 0,
+                    balance: 200 * (lean_fee(100) + 100 * AMOUNT_UNIT),
+                },
+            )
+            .await;
         }
     }
     for n in nodes {
         let (c, num, ts) = *n.head.lock().await;
-        n.state.lock().await.write_snapshot(&n.cfg.datadir, c, num, ts).unwrap();
+        n.state
+            .lock()
+            .await
+            .write_snapshot(&n.cfg.datadir, c, num, ts)
+            .unwrap();
     }
 }
 
@@ -91,16 +113,26 @@ async fn differential_stage_promote_vs_direct() {
         let wire = block.to_wire_bytes();
 
         // direct path
-        assert!(matches!(d.shim_new(&wire).await.unwrap(), NewBlockOutcome::Valid(_)));
+        assert!(matches!(
+            d.shim_new(&wire).await.unwrap(),
+            NewBlockOutcome::Valid(_)
+        ));
         // staged path: stage in the "vote gap", then anchor
         assert_eq!(
             s.stage_block(&wire).await.unwrap(),
             StageOutcome::Staged(block.commitment),
             "stage must succeed at height {height}"
         );
-        assert!(matches!(s.shim_new(&wire).await.unwrap(), NewBlockOutcome::Valid(_)));
+        assert!(matches!(
+            s.shim_new(&wire).await.unwrap(),
+            NewBlockOutcome::Valid(_)
+        ));
 
-        assert_eq!(*d.head.lock().await, *s.head.lock().await, "head diverged at {height}");
+        assert_eq!(
+            *d.head.lock().await,
+            *s.head.lock().await,
+            "head diverged at {height}"
+        );
         assert_eq!(
             d.state.lock().await.digest(),
             s.state.lock().await.digest(),
@@ -111,7 +143,11 @@ async fn differential_stage_promote_vs_direct() {
         assert_eq!(rd, rs, "receipts diverged at {height}");
     }
     // every anchored block on S must have taken the fast path
-    assert_eq!(s.stats.promoted.load(Ordering::Relaxed), 30, "all 30 must promote");
+    assert_eq!(
+        s.stats.promoted.load(Ordering::Relaxed),
+        30,
+        "all 30 must promote"
+    );
     // THE byte gate: identical log files
     let ld = std::fs::read(dd.path().join("blocks.log")).unwrap();
     let ls = std::fs::read(ds.path().join("blocks.log")).unwrap();
@@ -136,9 +172,16 @@ async fn stale_staged_entry_never_promotes() {
     // by commitment to peers that might still ask for it; it just never
     // gets to promote (checked below).
     let y = LeanBlock::new(genesis, 1, 222, vec![]);
-    assert!(matches!(n.shim_new(&y.to_wire_bytes()).await.unwrap(), NewBlockOutcome::Valid(_)));
+    assert!(matches!(
+        n.shim_new(&y.to_wire_bytes()).await.unwrap(),
+        NewBlockOutcome::Valid(_)
+    ));
     assert!(
-        n.staged.lock().await.iter().any(|(c, _)| *c == x.commitment),
+        n.staged
+            .lock()
+            .await
+            .iter()
+            .any(|(c, _)| *c == x.commitment),
         "a losing same-height candidate must stay staged after an unrelated head move"
     );
     assert_eq!(n.stats.promoted.load(Ordering::Relaxed), 0);
@@ -166,15 +209,25 @@ async fn crash_between_stage_and_promote_loses_nothing() {
         let genesis = n.head.lock().await.0;
         let x = LeanBlock::new(genesis, 1, 444, vec![]);
         wire = x.to_wire_bytes();
-        assert!(matches!(n.stage_block(&wire).await.unwrap(), StageOutcome::Staged(_)));
+        assert!(matches!(
+            n.stage_block(&wire).await.unwrap(),
+            StageOutcome::Staged(_)
+        ));
         digest0 = n.state.lock().await.digest();
         // CRASH here: staged data is memory-only, log untouched
     }
     let n2 = open_node(dir.path()).await;
-    assert_eq!(n2.head.lock().await.1, 0, "staging must not persist anything");
+    assert_eq!(
+        n2.head.lock().await.1,
+        0,
+        "staging must not persist anything"
+    );
     assert_eq!(n2.state.lock().await.digest(), digest0);
     // the block still applies cleanly through the full path after restart
-    assert!(matches!(n2.shim_new(&wire).await.unwrap(), NewBlockOutcome::Valid(_)));
+    assert!(matches!(
+        n2.shim_new(&wire).await.unwrap(),
+        NewBlockOutcome::Valid(_)
+    ));
     assert_eq!(n2.head.lock().await.1, 1);
 }
 
@@ -195,7 +248,10 @@ async fn newblock_during_inflight_staging_promotes_and_matches_direct() {
         let mut txs = Vec::new();
         for k in 0..200u64 {
             let outs: Vec<Output> = (0..3)
-                .map(|j| Output { to: Address::with_last_byte(((j * 7 + k as usize) % 251) as u8), amount: 1 })
+                .map(|j| Output {
+                    to: Address::with_last_byte(((j * 7 + k as usize) % 251) as u8),
+                    amount: 1,
+                })
                 .collect();
             let t = LeanTx::sign(nonces[k as usize], outs, &sk(k), &domain);
             nonces[k as usize] += 1;
@@ -205,7 +261,10 @@ async fn newblock_during_inflight_staging_promotes_and_matches_direct() {
         let block = LeanBlock::new(hc, hn + 1, 20_000 + height, txs);
         let wire = block.to_wire_bytes();
 
-        assert!(matches!(d.shim_new(&wire).await.unwrap(), NewBlockOutcome::Valid(_)));
+        assert!(matches!(
+            d.shim_new(&wire).await.unwrap(),
+            NewBlockOutcome::Valid(_)
+        ));
 
         // fire staging; wait only until it is REGISTERED (or already done),
         // then race the anchor into it
@@ -215,18 +274,39 @@ async fn newblock_during_inflight_staging_promotes_and_matches_direct() {
         let t0 = std::time::Instant::now();
         loop {
             let registered = s.inflight.lock().await.contains_key(&block.commitment)
-                || s.staged.lock().await.iter().any(|(c, _)| *c == block.commitment);
+                || s.staged
+                    .lock()
+                    .await
+                    .iter()
+                    .any(|(c, _)| *c == block.commitment);
             if registered {
                 break;
             }
-            assert!(t0.elapsed() < Duration::from_secs(2), "staging never registered");
+            assert!(
+                t0.elapsed() < Duration::from_secs(2),
+                "staging never registered"
+            );
             tokio::time::sleep(Duration::from_micros(200)).await;
         }
-        assert!(matches!(s.shim_new(&wire).await.unwrap(), NewBlockOutcome::Valid(_)));
-        assert!(matches!(stager.await.unwrap().unwrap(), StageOutcome::Staged(_)));
+        assert!(matches!(
+            s.shim_new(&wire).await.unwrap(),
+            NewBlockOutcome::Valid(_)
+        ));
+        assert!(matches!(
+            stager.await.unwrap().unwrap(),
+            StageOutcome::Staged(_)
+        ));
 
-        assert_eq!(*d.head.lock().await, *s.head.lock().await, "head diverged at {height}");
-        assert_eq!(d.state.lock().await.digest(), s.state.lock().await.digest(), "state diverged at {height}");
+        assert_eq!(
+            *d.head.lock().await,
+            *s.head.lock().await,
+            "head diverged at {height}"
+        );
+        assert_eq!(
+            d.state.lock().await.digest(),
+            s.state.lock().await.digest(),
+            "state diverged at {height}"
+        );
     }
     assert_eq!(
         s.stats.promoted.load(Ordering::Relaxed),
@@ -255,14 +335,27 @@ async fn dead_inflight_staging_never_wedges_newblock() {
     // forge a dead in-flight entry for this commitment on this head
     let (tx, rx) = tokio::sync::watch::channel(false);
     drop(tx); // stager "panicked"
-    // (parent, claim id, signal) — the id is what release/takeover compare
-    n.inflight.lock().await.insert(x.commitment, (genesis, u64::MAX, rx));
+              // (parent, claim id, signal) — the id is what release/takeover compare
+    n.inflight
+        .lock()
+        .await
+        .insert(x.commitment, (genesis, u64::MAX, rx));
 
     let t0 = std::time::Instant::now();
-    assert!(matches!(n.shim_new(&x.to_wire_bytes()).await.unwrap(), NewBlockOutcome::Valid(_)));
-    assert!(t0.elapsed() < Duration::from_secs(2), "dead staging must not consume the full guard");
+    assert!(matches!(
+        n.shim_new(&x.to_wire_bytes()).await.unwrap(),
+        NewBlockOutcome::Valid(_)
+    ));
+    assert!(
+        t0.elapsed() < Duration::from_secs(2),
+        "dead staging must not consume the full guard"
+    );
     assert_eq!(n.head.lock().await.1, 1);
-    assert_eq!(n.stats.promoted.load(Ordering::Relaxed), 0, "must have used the full path");
+    assert_eq!(
+        n.stats.promoted.load(Ordering::Relaxed),
+        0,
+        "must have used the full path"
+    );
 }
 
 /// A NO-OP tx (bankrupt sender) names recipients the direct path never writes.
@@ -292,7 +385,12 @@ async fn a_noops_recipients_are_never_created_by_promote() {
         Address::with_last_byte(0x03),
     );
 
-    let good = LeanSigned::new(LeanTx::sign(0, vec![Output { to: r1, amount: 5 }], &sk(0), &domain));
+    let good = LeanSigned::new(LeanTx::sign(
+        0,
+        vec![Output { to: r1, amount: 5 }],
+        &sk(0),
+        &domain,
+    ));
     let bankrupt = LeanSigned::new(LeanTx::sign(
         0,
         vec![Output { to: r2, amount: 7 }, Output { to: r3, amount: 9 }],
@@ -300,14 +398,31 @@ async fn a_noops_recipients_are_never_created_by_promote() {
         &domain,
     ));
     let (hc, hn, _) = *d.head.lock().await;
-    let block =
-        LeanBlock::new(hc, hn + 1, 10_001, vec![good.raw().to_vec(), bankrupt.raw().to_vec()]);
+    let block = LeanBlock::new(
+        hc,
+        hn + 1,
+        10_001,
+        vec![good.raw().to_vec(), bankrupt.raw().to_vec()],
+    );
     let wire = block.to_wire_bytes();
 
-    assert!(matches!(d.shim_new(&wire).await.unwrap(), NewBlockOutcome::Valid(_)));
-    assert_eq!(s.stage_block(&wire).await.unwrap(), StageOutcome::Staged(block.commitment));
-    assert!(matches!(s.shim_new(&wire).await.unwrap(), NewBlockOutcome::Valid(_)));
-    assert_eq!(s.stats.promoted.load(Ordering::Relaxed), 1, "the anchor must have promoted");
+    assert!(matches!(
+        d.shim_new(&wire).await.unwrap(),
+        NewBlockOutcome::Valid(_)
+    ));
+    assert_eq!(
+        s.stage_block(&wire).await.unwrap(),
+        StageOutcome::Staged(block.commitment)
+    );
+    assert!(matches!(
+        s.shim_new(&wire).await.unwrap(),
+        NewBlockOutcome::Valid(_)
+    ));
+    assert_eq!(
+        s.stats.promoted.load(Ordering::Relaxed),
+        1,
+        "the anchor must have promoted"
+    );
 
     // the block really is "one applied, one no-op" — otherwise this gates nothing
     let rd: Vec<_> = d.receipts.lock().await.iter().cloned().collect();
@@ -323,13 +438,25 @@ async fn a_noops_recipients_are_never_created_by_promote() {
         let g = s.state.lock().await;
         (g.digest(), g.accounts.len())
     };
-    assert_eq!(len_d, len_s, "account COUNT diverged (promote created the no-op's recipients)");
+    assert_eq!(
+        len_d, len_s,
+        "account COUNT diverged (promote created the no-op's recipients)"
+    );
     assert_eq!(digest_d, digest_s, "state digest diverged");
     for (name, n) in [("direct", &d), ("staged", &s)] {
         let g = n.state.lock().await;
-        assert!(g.accounts.contains_key(&r1), "{name}: the applied output must exist");
-        assert!(!g.accounts.contains_key(&r2), "{name}: a no-op output must not be created");
-        assert!(!g.accounts.contains_key(&r3), "{name}: a no-op output must not be created");
+        assert!(
+            g.accounts.contains_key(&r1),
+            "{name}: the applied output must exist"
+        );
+        assert!(
+            !g.accounts.contains_key(&r2),
+            "{name}: a no-op output must not be created"
+        );
+        assert!(
+            !g.accounts.contains_key(&r3),
+            "{name}: a no-op output must not be created"
+        );
     }
     let rs: Vec<_> = s.receipts.lock().await.iter().cloned().collect();
     assert_eq!(rd, rs, "receipts diverged");
