@@ -976,26 +976,6 @@ impl LaneNode {
         Ok((commitment, wire))
     }
 
-    /// Shim: `arc_stageBlock` — fully validate + EXECUTE against the current
-    /// head state into a memory-only staged entry (vote-gap deferred anchor).
-    /// Never appends, never queues (speculative). Bounded to 32 entries.
-    ///
-    /// CLAIM ORDER (2026-09-15, the stage/anchor race). The CL fires
-    /// `arc_stageBlock` and then `arc_newBlock{commitment}` ~15 ms later,
-    /// while the stage is still running (~18 ms at 2.2 MB: decode 6 + recover
-    /// 5 + apply 7, plus the RPC layer's JSON parse and base64 decode of the
-    /// ~3 MB body, which is *outside* that 18 ms). Whatever the anchor cannot
-    /// see, it peer-pulls for 200-250 ms on the consensus critical path.
-    ///
-    /// So the commitment is published in `inflight` as the FIRST thing this
-    /// function does — computed by `commitment_of_wire`, which hashes the
-    /// borrowed wire bytes without materialising the tx list — and BEFORE the
-    /// head read and the already-staged probe, both of which take locks that
-    /// a concurrent commit can hold. A claim that turns out not to be ours is
-    /// withdrawn microseconds later; an anchor that misses the claim pays 200
-    /// ms. The claim is keyed on the block's DECLARED parent, which is what
-    /// the head must equal for the stage to proceed, so the retention sweeps
-    /// (`retain(|_, (p, _)| *p == new_head)`) see exactly what they saw before.
     /// Drop OUR claim on `commitment` — and only ours. Returns whether the
     /// entry was removed.
     ///
@@ -1017,6 +997,26 @@ impl LaneNode {
         }
     }
 
+    /// Shim: `arc_stageBlock` — fully validate + EXECUTE against the current
+    /// head state into a memory-only staged entry (vote-gap deferred anchor).
+    /// Never appends, never queues (speculative). Bounded to 32 entries.
+    ///
+    /// CLAIM ORDER (2026-09-15, the stage/anchor race). The CL fires
+    /// `arc_stageBlock` and then `arc_newBlock{commitment}` ~15 ms later,
+    /// while the stage is still running (~18 ms at 2.2 MB: decode 6 + recover
+    /// 5 + apply 7, plus the RPC layer's JSON parse and base64 decode of the
+    /// ~3 MB body, which is *outside* that 18 ms). Whatever the anchor cannot
+    /// see, it peer-pulls for 200-250 ms on the consensus critical path.
+    ///
+    /// So the commitment is published in `inflight` as the FIRST thing this
+    /// function does — computed by `commitment_of_wire`, which hashes the
+    /// borrowed wire bytes without materialising the tx list — and BEFORE the
+    /// head read and the already-staged probe, both of which take locks that
+    /// a concurrent commit can hold. A claim that turns out not to be ours is
+    /// withdrawn microseconds later; an anchor that misses the claim pays 200
+    /// ms. The claim is keyed on the block's DECLARED parent, which is what
+    /// the head must equal for the stage to proceed, so the retention sweeps
+    /// (`retain(|_, (p, _)| *p == new_head)`) see exactly what they saw before.
     pub async fn stage_block(&self, bytes: &[u8]) -> Result<StageOutcome, String> {
         let t0 = Instant::now();
         let lock_ns = AtomicU64::new(0);
@@ -1417,9 +1417,11 @@ impl LaneNode {
             }
             None => {
                 let Some((my_id, done_tx)) = owner else {
-                    // unreachable: the last claim round always takes the claim.
-                    // If it ever is reached, refusing is still safe — the CL
-                    // retries and the backfill re-delivers.
+                    // Reachable BY DESIGN since the takeover became id-checked
+                    // (see the claim rounds above): a claim that appeared while
+                    // we waited belongs to a live holder, so we leave with none
+                    // and refuse. Safe — the CL retries and the backfill
+                    // re-delivers.
                     let head_n = self.head.lock().await.1;
                     return Ok(NewBlockOutcome::Syncing { head: head_n });
                 };
