@@ -286,3 +286,88 @@ async fn duplicate_stage_is_still_a_noop() {
     assert_eq!(n.shim_new_by_commitment(c).await.unwrap(), NewBlockOutcome::Valid(c));
     assert_eq!(log_len(&n).await, 1);
 }
+
+// ---------------------------------------------------------------------------
+// claim OWNERSHIP: a stalled holder must not release someone else's claim
+// ---------------------------------------------------------------------------
+
+/// Records physically in `blocks.log`, counted off the length-prefix framing.
+/// `log_len` above counts through `read_block`, whose index is keyed by NUMBER,
+/// so it cannot see a block appended twice — which is the whole failure here.
+fn records_on_disk(dir: &std::path::Path) -> usize {
+    let bytes = std::fs::read(dir.join("blocks.log")).unwrap();
+    let (mut at, mut n) = (0usize, 0usize);
+    while at + 4 <= bytes.len() {
+        let len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+        let end = at + 4 + len + 4;
+        if end > bytes.len() {
+            break;
+        }
+        n += 1;
+        at = end;
+    }
+    n
+}
+
+/// THE I3 GATE. Claims used to be keyed on the commitment alone, with an
+/// unconditional release. A stage that stalled past the 2 s guard and had its
+/// claim taken over by a committer would, on finishing, delete THE COMMITTER'S
+/// claim — and a third feed of the same bytes arriving in that window sees no
+/// claim, still passes the parent-link check (the head has not moved, the
+/// committer is still inside `commit_block`) and appends the same block a
+/// second time. The state converges (total-STF), but the log diverges
+/// byte-for-byte from every other validator's, which is exactly the invariant
+/// the by-commitment serving path rests on.
+///
+/// Here the committer is parked on the `state` lock — a slow commit — with its
+/// claim live, and the stalled stage's release is replayed against it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stale_release_cannot_hand_a_second_committer_the_same_block() {
+    let dir = tempfile::tempdir().unwrap();
+    let n = node(dir.path());
+    let (c, wire) = wire_head_plus_one(&n, 300, 8).await;
+    let lock_ns = std::sync::atomic::AtomicU64::new(0);
+
+    // hold the state lock: whoever reaches `commit_block` parks there
+    let state_guard = n.state.lock().await;
+    let committer = {
+        let n = n.clone();
+        let wire = wire.clone();
+        tokio::spawn(async move { n.shim_new(&wire).await })
+    };
+    let mut held = false;
+    for _ in 0..400 {
+        if n.inflight.lock().await.contains_key(&c) {
+            held = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(held, "the committer must hold the claim before we race it");
+
+    // the stalled stage it took the claim from finishes NOW and releases
+    assert!(
+        !n.release_claim(c, u64::MAX, &lock_ns).await,
+        "a claim we do not own must not be released"
+    );
+    assert!(n.inflight.lock().await.contains_key(&c), "the committer still holds its claim");
+
+    // a third feed of the same bytes, while the commit is still in flight
+    let third = {
+        let n = n.clone();
+        let wire = wire.clone();
+        tokio::spawn(async move { n.shim_new(&wire).await })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    drop(state_guard);
+
+    assert_eq!(committer.await.unwrap().unwrap(), NewBlockOutcome::Valid(c));
+    // the third feed either acknowledges the block or SYNCs — never appends it
+    let r3 = third.await.unwrap().unwrap();
+    let ok = matches!(r3, NewBlockOutcome::Valid(x) if x == c)
+        || matches!(r3, NewBlockOutcome::Syncing { .. });
+    assert!(ok, "got {r3:?}");
+    assert_eq!(n.head.lock().await.1, 1);
+    assert_eq!(records_on_disk(dir.path()), 1, "the block is on disk exactly once");
+    assert!(n.inflight.lock().await.is_empty());
+}

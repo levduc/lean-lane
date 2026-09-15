@@ -328,11 +328,24 @@ pub struct LaneNode {
     /// point: serving `arc_getBlockBytes{commitment}` for a commitment we do
     /// not have used to read+hash up to 1024 blocks (1.24 MB each) per ask.
     pub index_floor: AtomicU64,
-    /// IN-FLIGHT stagings: commitment -> (staged_parent, completion signal).
+    /// IN-FLIGHT work on a commitment: commitment -> `Claim`.
     /// arc_newBlock awaits a matching in-flight staging (bounded guard)
     /// instead of redoing the full execution — a <=35ms wait beats a ~230ms
-    /// redo (v1.3 lost ~half the anchor races at 2.6MB blocks).
-    pub inflight: Mutex<std::collections::HashMap<B256, (B256, tokio::sync::watch::Receiver<bool>)>>,
+    /// redo (v1.3 lost ~half the anchor races at 2.6MB blocks) — and the
+    /// COMMIT of a block takes the same claim, which is what stops two feeds
+    /// of the same bytes from appending it twice.
+    ///
+    /// The `id` is what makes that exclusion sound. Keyed on the commitment
+    /// alone, a release is "whoever finishes first deletes the entry": a
+    /// stage that stalled past the 2 s guard and was taken over would, on
+    /// finishing, delete the CLAIM OF THE COMMITTER THAT TOOK IT OVER, and a
+    /// third feed arriving in that window would pass the parent-link check
+    /// (the head has not moved yet) and append the same block a second time.
+    /// Both the release and the takeover therefore compare ids: you may only
+    /// drop your own claim, and you may only steal a claim you have already
+    /// waited out (see `release_claim` and the claim rounds in
+    /// `shim_new_inner`).
+    pub inflight: Mutex<std::collections::HashMap<B256, Claim>>,
     /// `arc_stageBlock` calls that have ARRIVED but not yet returned. Raised
     /// by the RPC handler as its first statement — before the JSON parse and
     /// the base64 decode of a ~3 MB body — so it covers the window in which
@@ -388,6 +401,40 @@ pub struct StagedBlock {
     outputs: usize,
 }
 
+/// Replay `log` onto `state`, starting from the snapshot `snap` = (commitment,
+/// number, timestamp_ms) that `state` was loaded from. Each replayed tx pays
+/// one decode + one ecrecover — the honest recovery cost. Returns the new head
+/// plus what it took to get there: (head, blocks, txs, commitment index).
+fn replay_onto(
+    state: &mut FlatState,
+    log: &mut BlockLog,
+    snap: (B256, u64, u64),
+    beneficiary: Address,
+) -> std::io::Result<((B256, u64, u64), u64, u64, std::collections::HashMap<B256, u64>)> {
+    let (mut head, mut blocks, mut txs) = (snap, 0u64, 0u64);
+    let mut by_commitment = std::collections::HashMap::new();
+    log.replay(snap.1, |block| {
+        let items = decode_block_txs(&block.txs);
+        txs += items.len() as u64;
+        apply_block(state, &items, block.number, beneficiary);
+        head = (block.commitment, block.number, block.timestamp_ms);
+        by_commitment.insert(block.commitment, block.number);
+        blocks += 1;
+    })?;
+    Ok((head, blocks, txs, by_commitment))
+}
+
+/// One holder's exclusive claim on a commitment: (staged_parent, claim id,
+/// completion signal). See `LaneNode::inflight`.
+pub type Claim = (B256, u64, tokio::sync::watch::Receiver<bool>);
+
+/// Process-unique claim id. Only equality matters (ownership), so a plain
+/// relaxed counter is enough — it never wraps in any realistic lifetime.
+fn next_claim_id() -> u64 {
+    static N: AtomicU64 = AtomicU64::new(1);
+    N.fetch_add(1, Ordering::Relaxed)
+}
+
 impl LaneNode {
     /// Open (or create) the lane at `cfg.datadir`: newest snapshot + log-tail
     /// replay (each replayed tx pays one decode + one ecrecover — the honest
@@ -404,29 +451,9 @@ impl LaneNode {
             };
         let mut log = BlockLog::open(&cfg.datadir.join("blocks.log"))?;
         let beneficiary = cfg.beneficiary;
-        let mut head = (snap_commitment, snap_number, snap_ts);
-        let mut replayed_blocks = 0u64;
-        let mut replayed_txs = 0u64;
-        let mut by_commitment = std::collections::HashMap::new();
-        let mut replay_from = |state: &mut FlatState,
-                               log: &mut BlockLog,
-                               snap: (B256, u64, u64)|
-         -> std::io::Result<()> {
-            head = (snap.0, snap.1, snap.2);
-            replayed_blocks = 0;
-            replayed_txs = 0;
-            by_commitment.clear();
-            log.replay(snap.1, |block| {
-                let items = decode_block_txs(&block.txs);
-                replayed_txs += items.len() as u64;
-                apply_block(state, &items, block.number, beneficiary);
-                head = (block.commitment, block.number, block.timestamp_ms);
-                by_commitment.insert(block.commitment, block.number);
-                replayed_blocks += 1;
-            })?;
-            Ok(())
-        };
-        replay_from(&mut state, &mut log, (snap_commitment, snap_number, snap_ts))?;
+        let snap = (snap_commitment, snap_number, snap_ts);
+        let (mut head, mut replayed_blocks, mut replayed_txs, mut by_commitment) =
+            replay_onto(&mut state, &mut log, snap, beneficiary)?;
 
         // SNAPSHOT AHEAD OF THE LOG (only reachable under `LEAN_FSYNC=0`, which
         // fsyncs the snapshot but not the append — see `chain::fsync_enabled`).
@@ -459,9 +486,9 @@ impl LaneNode {
             );
             state = from;
             snap_number = at.1;
-            replay_from(&mut state, &mut log, at)?;
+            (head, replayed_blocks, replayed_txs, by_commitment) =
+                replay_onto(&mut state, &mut log, at, beneficiary)?;
         }
-        drop(replay_from);
         let recovery = RecoveryReport {
             snapshot_number: snap_number,
             replayed_blocks,
@@ -697,7 +724,7 @@ impl LaneNode {
         let new_head = *timed_lock(&self.head, &tm.lock_ns).await;
         let new_head_n = new_head.1;
         timed_lock(&self.staged, &tm.lock_ns).await.retain(|(_, e)| e.block.number >= new_head_n);
-        timed_lock(&self.inflight, &tm.lock_ns).await.retain(|_, (p, _)| *p == new_head.0);
+        timed_lock(&self.inflight, &tm.lock_ns).await.retain(|_, (p, _, _)| *p == new_head.0);
         let s = &self.stats;
         s.exec_ns.fetch_add(exec_ns, Ordering::Relaxed);
         s.append_ns.fetch_add(append_ns, Ordering::Relaxed);
@@ -885,6 +912,27 @@ impl LaneNode {
     /// ms. The claim is keyed on the block's DECLARED parent, which is what
     /// the head must equal for the stage to proceed, so the retention sweeps
     /// (`retain(|_, (p, _)| *p == new_head)`) see exactly what they saw before.
+    /// Drop OUR claim on `commitment` — and only ours. Returns whether the
+    /// entry was removed.
+    ///
+    /// The id check is the whole point: a holder that stalled past the 2 s
+    /// guard and was taken over must not delete the successor's claim when it
+    /// eventually finishes. An unchecked `remove` there re-opens the window in
+    /// which a third feed of the same bytes sees no claim, still passes the
+    /// parent-link check (the head has not moved — the taker-over is still
+    /// committing), and appends the same block a second time.
+    pub async fn release_claim(&self, commitment: B256, id: u64, lock_ns: &AtomicU64) -> bool {
+        use std::collections::hash_map::Entry;
+        let mut fl = timed_lock(&self.inflight, lock_ns).await;
+        match fl.entry(commitment) {
+            Entry::Occupied(o) if o.get().1 == id => {
+                o.remove();
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub async fn stage_block(&self, bytes: &[u8]) -> Result<StageOutcome, String> {
         let t0 = Instant::now();
         let lock_ns = AtomicU64::new(0);
@@ -895,20 +943,21 @@ impl LaneNode {
 
         // --- publish the claim before anything slow ---
         let (done_tx, done_rx) = tokio::sync::watch::channel(false);
+        let claim_id = next_claim_id();
         let claimed = {
             use std::collections::hash_map::Entry;
             let mut fl = timed_lock(&self.inflight, &lock_ns).await;
             match fl.entry(commitment_key) {
                 // someone already owns this commitment (a duplicate stage, or
                 // a by-bytes commit): never clobber their signal
-                Entry::Occupied(_) => false,
+                Entry::Occupied(_) => None,
                 Entry::Vacant(v) => {
-                    v.insert((hdr.parent, done_rx));
-                    true
+                    v.insert((hdr.parent, claim_id, done_rx));
+                    Some(claim_id)
                 }
             }
         };
-        if claimed {
+        if claimed.is_some() {
             self.stage_notify.notify_waiters();
         }
 
@@ -918,9 +967,11 @@ impl LaneNode {
         // A stage that bails on the head check (or on a decode error) must not
         // park the next anchor for the full 2 s guard. A panic drops `done_tx`
         // instead, which closes the channel and wakes waiters the same way.
-        if claimed {
+        // `release_claim` is id-checked: a stage slow enough to have been taken
+        // over signals its waiters but leaves the new owner's claim alone.
+        if let Some(id) = claimed {
             let _ = done_tx.send(true);
-            timed_lock(&self.inflight, &lock_ns).await.remove(&commitment_key);
+            self.release_claim(commitment_key, id, &lock_ns).await;
         }
         self.stage_notify.notify_waiters();
 
@@ -1072,7 +1123,7 @@ impl LaneNode {
         let new_head = *timed_lock(&self.head, &tm.lock_ns).await;
         let new_head_n = new_head.1;
         timed_lock(&self.staged, &tm.lock_ns).await.retain(|(_, e)| e.block.number >= new_head_n);
-        timed_lock(&self.inflight, &tm.lock_ns).await.retain(|_, (p, _)| *p == new_head.0);
+        timed_lock(&self.inflight, &tm.lock_ns).await.retain(|_, (p, _, _)| *p == new_head.0);
         let s = &self.stats;
         s.exec_ns.fetch_add(exec_ns, Ordering::Relaxed);
         s.append_ns.fetch_add(append_ns, Ordering::Relaxed);
@@ -1181,7 +1232,7 @@ impl LaneNode {
         // a bounded <=35 ms wait beats a ~230 ms redo — and then answers from
         // whatever the winner produced (a staged entry to promote, or a
         // canonical block to acknowledge).
-        let mut owner: Option<tokio::sync::watch::Sender<bool>> = None;
+        let mut owner: Option<(u64, tokio::sync::watch::Sender<bool>)> = None;
         if staged.is_none() {
             // Two rounds: wait for whoever holds the claim, then TAKE IT OVER
             // if it is still held. A holder that dies without signalling (a
@@ -1189,22 +1240,34 @@ impl LaneNode {
             // or one wedged past the guard must never cost us a block we can
             // commit: the second round reproduces exactly the pre-claim
             // behaviour of falling through to the full path.
+            //
+            // The takeover is ID-CHECKED: we only steal the claim we have
+            // already waited out. A claim that appeared WHILE we waited belongs
+            // to a holder that is live and may be committing right now, and
+            // stealing that one puts two committers on the same block —
+            // two identical records in `blocks.log`. In that case we fall out
+            // of the loop with no claim and answer SYNCING, which is safe: the
+            // CL retries and the backfill re-delivers.
             const CLAIM_ROUNDS: usize = 2;
+            let mut waited_on: Option<u64> = None;
             for round in 0..CLAIM_ROUNDS {
                 let (done_tx, done_rx) = tokio::sync::watch::channel(false);
+                let my_id = next_claim_id();
                 let waiter = {
                     let mut fl = timed_lock(&self.inflight, &tm.lock_ns).await;
-                    let held = fl.get(&commitment).map(|(_, rx)| rx.clone());
-                    match held {
-                        Some(rx) if round + 1 < CLAIM_ROUNDS => Some(rx),
+                    match fl.get(&commitment) {
+                        Some((_, id, rx)) if round + 1 < CLAIM_ROUNDS || waited_on != Some(*id) => {
+                            waited_on = Some(*id);
+                            Some(rx.clone())
+                        }
                         _ => {
-                            fl.insert(commitment, (head_c, done_rx));
+                            fl.insert(commitment, (head_c, my_id, done_rx));
                             None
                         }
                     }
                 };
                 let Some(mut rx) = waiter else {
-                    owner = Some(done_tx);
+                    owner = Some((my_id, done_tx));
                     break;
                 };
                 let t_wait = Instant::now();
@@ -1250,17 +1313,17 @@ impl LaneNode {
             Some(entry) => {
                 debug_assert_eq!(entry.wire, bytes);
                 tm.refine_path(PATH_STAGED);
-                if let Some(done_tx) = owner.take() {
+                if let Some((id, done_tx)) = owner.take() {
                     // never happens (a claim is only taken when nothing is
                     // staged), but leaving a claim behind would park the next
                     // feed of these bytes for the full 2 s guard
                     let _ = done_tx.send(true);
-                    timed_lock(&self.inflight, &tm.lock_ns).await.remove(&commitment);
+                    self.release_claim(commitment, id, &tm.lock_ns).await;
                 }
                 self.promote_staged(entry, tm).await.map_err(|e| e.to_string())?;
             }
             None => {
-                let Some(done_tx) = owner else {
+                let Some((my_id, done_tx)) = owner else {
                     // unreachable: the last claim round always takes the claim.
                     // If it ever is reached, refusing is still safe — the CL
                     // retries and the backfill re-delivers.
@@ -1276,7 +1339,7 @@ impl LaneNode {
                 // retention sweep already drops the entry (its parent is the
                 // old head), but a failed commit never reaches that sweep.
                 let _ = done_tx.send(true);
-                timed_lock(&self.inflight, &tm.lock_ns).await.remove(&commitment);
+                self.release_claim(commitment, my_id, &tm.lock_ns).await;
                 r.map_err(|e| e.to_string())?;
             }
         }
@@ -1363,7 +1426,7 @@ impl LaneNode {
         loop {
             let held = {
                 let fl = timed_lock(&self.inflight, &tm.lock_ns).await;
-                fl.get(&c).map(|(_, rx)| rx.clone())
+                fl.get(&c).map(|(_, _, rx)| rx.clone())
             };
             if let Some(mut rx) = held {
                 waited = true;

@@ -97,7 +97,7 @@ impl FlatState {
                 name.strip_prefix("snapshot-").and_then(|s| s.strip_suffix(".bin"))
             {
                 if let Ok(n) = numstr.parse::<u64>() {
-                    if n <= ceiling && best.as_ref().map_or(true, |(b, _)| n > *b) {
+                    if n <= ceiling && best.as_ref().is_none_or(|(b, _)| n > *b) {
                         best = Some((n, e.path()));
                     }
                 }

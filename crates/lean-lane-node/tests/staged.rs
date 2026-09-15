@@ -255,7 +255,8 @@ async fn dead_inflight_staging_never_wedges_newblock() {
     // forge a dead in-flight entry for this commitment on this head
     let (tx, rx) = tokio::sync::watch::channel(false);
     drop(tx); // stager "panicked"
-    n.inflight.lock().await.insert(x.commitment, (genesis, rx));
+    // (parent, claim id, signal) — the id is what release/takeover compare
+    n.inflight.lock().await.insert(x.commitment, (genesis, u64::MAX, rx));
 
     let t0 = std::time::Instant::now();
     assert!(matches!(n.shim_new(&x.to_wire_bytes()).await.unwrap(), NewBlockOutcome::Valid(_)));
