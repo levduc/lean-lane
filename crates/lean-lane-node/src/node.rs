@@ -91,6 +91,13 @@ pub struct Stats {
     pub backfill_pulls: AtomicU64,
     /// backward log scans started by `locate_by_commitment` (must stay 0 on the anchor path)
     pub log_scans: AtomicU64,
+    /// Anchors (`arc_newBlock{commitment}`) that WAITED on a concurrent
+    /// `arc_stageBlock` of the same block instead of pulling it from a peer.
+    /// The CL fires the stage and then the anchor ~15 ms later, while the
+    /// stage is still executing; every increment here is a ~200 ms peer round
+    /// trip that did not happen. Read it next to `path=staged` +
+    /// `wait_inflight_ms>0` in the `lean_anchor` line.
+    pub stage_race_waits: AtomicU64,
     /// last-block service times (ns) for build / stage / append. The running
     /// totals above answer "per output over the whole run"; these answer "is
     /// this node slower NOW than it was ten minutes ago", which is the only
@@ -113,6 +120,26 @@ pub fn announce_grace_ms() -> u64 {
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(250)
+    })
+}
+
+/// `LEAN_STAGE_RACE_MS` (default 40, read once). How long an `arc_newBlock`
+/// that holds none of the block waits for an `arc_stageBlock` which has
+/// ARRIVED but not yet registered its commitment (see `await_stage_race`).
+/// Only ever waited when `stage_pending > 0`. `0` disables the grace and
+/// leaves only the in-flight-claim wait (the pre-2026-09-15 behaviour).
+///
+/// 40 ms is sized off the fleet: the CL issues the anchor ~15 ms after the
+/// stage, and at 2.2 MB the stage needs ~15-20 ms of JSON parse + base64
+/// decode + wire hash before it can name itself. The alternative on a miss is
+/// a 200-250 ms peer round trip, so the grace is cheap even when it expires.
+pub fn stage_race_ms() -> u64 {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        std::env::var("LEAN_STAGE_RACE_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(40)
     })
 }
 
@@ -306,6 +333,22 @@ pub struct LaneNode {
     /// instead of redoing the full execution — a <=35ms wait beats a ~230ms
     /// redo (v1.3 lost ~half the anchor races at 2.6MB blocks).
     pub inflight: Mutex<std::collections::HashMap<B256, (B256, tokio::sync::watch::Receiver<bool>)>>,
+    /// `arc_stageBlock` calls that have ARRIVED but not yet returned. Raised
+    /// by the RPC handler as its first statement — before the JSON parse and
+    /// the base64 decode of a ~3 MB body — so it covers the window in which
+    /// the node knows a stage is coming but cannot yet know WHICH commitment
+    /// (the commitment is a function of the bytes it is still decoding).
+    ///
+    /// Without it an anchor that arrives during that window sees an empty
+    /// `inflight`, concludes the block is nowhere, and pays a 200-250 ms peer
+    /// pull on the consensus critical path for a block that lands in memory
+    /// milliseconds later. With it the anchor waits (bounded) for the stage to
+    /// name itself. Zero when no stage is in flight, so the backfill's genuine
+    /// peer pulls are not slowed at all.
+    pub stage_pending: AtomicU64,
+    /// Fires when a stage registers in `inflight` or finishes; the anchor's
+    /// grace loop waits on it rather than spinning.
+    pub stage_notify: tokio::sync::Notify,
     /// Peer RPC clients (index-aligned with cfg.peers).
     peer_clients: Vec<jsonrpsee::http_client::HttpClient>,
 }
@@ -442,6 +485,8 @@ impl LaneNode {
                 // from; below that the index is cold and a scan can still pay
                 index_floor: AtomicU64::new(snap_number + 1),
                 inflight: Mutex::new(Default::default()),
+                stage_pending: AtomicU64::new(0),
+                stage_notify: tokio::sync::Notify::new(),
                 peer_clients,
             },
             recovery,
@@ -777,64 +822,75 @@ impl LaneNode {
     /// Shim: `arc_stageBlock` — fully validate + EXECUTE against the current
     /// head state into a memory-only staged entry (vote-gap deferred anchor).
     /// Never appends, never queues (speculative). Bounded to 32 entries.
+    ///
+    /// CLAIM ORDER (2026-09-15, the stage/anchor race). The CL fires
+    /// `arc_stageBlock` and then `arc_newBlock{commitment}` ~15 ms later,
+    /// while the stage is still running (~18 ms at 2.2 MB: decode 6 + recover
+    /// 5 + apply 7, plus the RPC layer's JSON parse and base64 decode of the
+    /// ~3 MB body, which is *outside* that 18 ms). Whatever the anchor cannot
+    /// see, it peer-pulls for 200-250 ms on the consensus critical path.
+    ///
+    /// So the commitment is published in `inflight` as the FIRST thing this
+    /// function does — computed by `commitment_of_wire`, which hashes the
+    /// borrowed wire bytes without materialising the tx list — and BEFORE the
+    /// head read and the already-staged probe, both of which take locks that
+    /// a concurrent commit can hold. A claim that turns out not to be ours is
+    /// withdrawn microseconds later; an anchor that misses the claim pays 200
+    /// ms. The claim is keyed on the block's DECLARED parent, which is what
+    /// the head must equal for the stage to proceed, so the retention sweeps
+    /// (`retain(|_, (p, _)| *p == new_head)`) see exactly what they saw before.
     pub async fn stage_block(&self, bytes: &[u8]) -> Result<StageOutcome, String> {
         let t0 = Instant::now();
         let lock_ns = AtomicU64::new(0);
         let t_decode = Instant::now();
-        let block = LeanBlock::from_wire_bytes(bytes)?;
-        let decode_ns = t_decode.elapsed().as_nanos() as u64;
-        let number = block.number;
-        let (head_c, head_n, _) = *timed_lock(&self.head, &lock_ns).await;
-        if block.number != head_n + 1 || block.parent != head_c {
-            return Ok(StageOutcome::Syncing { head: head_n });
-        }
-        let commitment_key = block.commitment;
-        // Already staged against this head — our own `arc_buildBlock` result,
-        // or a duplicate `arc_stageBlock`. A cheap no-op: the entry that is
-        // there is a post-state of the same parent over the same bytes, so
-        // re-executing would only pay ecrecover + a state clone to rebuild it.
-        // Cost of the no-op is the wire decode above (unavoidable: it is what
-        // computes the commitment we key on).
-        if self.already_staged(commitment_key, head_c, &lock_ns).await {
-            if stats_enabled() {
-                println!(
-                    concat!(
-                        "lean_stage n={} total_ms={:.2} decode_ms={:.2} ",
-                        "recover_ms=0.00 apply_ms=0.00 lock_ms={:.2} noop=1",
-                    ),
-                    number,
-                    ms(t0.elapsed().as_nanos() as u64),
-                    ms(decode_ns),
-                    ms(lock_ns.load(Ordering::Relaxed)),
-                );
-            }
-            return Ok(StageOutcome::Staged(commitment_key));
-        }
+        let hdr = LeanBlock::commitment_of_wire(bytes)?;
+        let commitment_key = hdr.commitment;
+        let number = hdr.number;
+
+        // --- publish the claim before anything slow ---
         let (done_tx, done_rx) = tokio::sync::watch::channel(false);
-        timed_lock(&self.inflight, &lock_ns).await.insert(commitment_key, (head_c, done_rx));
-        let t_recover = Instant::now();
-        let items = decode_block_txs(&block.txs);
-        let recover_ns = t_recover.elapsed().as_nanos() as u64;
-        // execute against a CLONE of the head state
-        let t_apply = Instant::now();
-        let mut staged_state = timed_lock(&self.state, &lock_ns).await.clone();
-        let outcome = apply_block(&mut staged_state, &items, block.number, self.cfg.beneficiary);
-        let commitment = block.commitment;
-        let entry =
-            self.staged_entry(block, bytes.to_vec(), head_c, &items, &staged_state, outcome);
-        let apply_ns = t_apply.elapsed().as_nanos() as u64;
-        self.insert_staged(commitment, entry, &lock_ns).await;
-        // signal AFTER the staged entry is visible, then deregister
-        let _ = done_tx.send(true);
-        timed_lock(&self.inflight, &lock_ns).await.remove(&commitment_key);
+        let claimed = {
+            use std::collections::hash_map::Entry;
+            let mut fl = timed_lock(&self.inflight, &lock_ns).await;
+            match fl.entry(commitment_key) {
+                // someone already owns this commitment (a duplicate stage, or
+                // a by-bytes commit): never clobber their signal
+                Entry::Occupied(_) => false,
+                Entry::Vacant(v) => {
+                    v.insert((hdr.parent, done_rx));
+                    true
+                }
+            }
+        };
+        if claimed {
+            self.stage_notify.notify_waiters();
+        }
+
+        let r = self.stage_claimed(bytes, hdr, t_decode, &lock_ns).await;
+
+        // --- release it in EVERY outcome: Staged, Syncing, and Err ---
+        // A stage that bails on the head check (or on a decode error) must not
+        // park the next anchor for the full 2 s guard. A panic drops `done_tx`
+        // instead, which closes the channel and wakes waiters the same way.
+        if claimed {
+            let _ = done_tx.send(true);
+            timed_lock(&self.inflight, &lock_ns).await.remove(&commitment_key);
+        }
+        self.stage_notify.notify_waiters();
+
+        let (outcome, decode_ns, recover_ns, apply_ns, noop) = r?;
         let stage_ns = t0.elapsed().as_nanos() as u64;
-        self.stats.exec_ns.fetch_add(stage_ns, Ordering::Relaxed);
-        self.stats.stage_ns_last.store(stage_ns, Ordering::Relaxed);
-        if stats_enabled() {
+        // as before: only a stage that actually EXECUTED counts, so a no-op
+        // (a few ms of wire hash) cannot make `stage_ms_last` read healthy.
+        if matches!(outcome, StageOutcome::Staged(_)) && !noop {
+            self.stats.exec_ns.fetch_add(stage_ns, Ordering::Relaxed);
+            self.stats.stage_ns_last.store(stage_ns, Ordering::Relaxed);
+        }
+        if stats_enabled() && matches!(outcome, StageOutcome::Staged(_)) {
             println!(
                 concat!(
                     "lean_stage n={} total_ms={:.2} decode_ms={:.2} ",
-                    "recover_ms={:.2} apply_ms={:.2} lock_ms={:.2} noop=0",
+                    "recover_ms={:.2} apply_ms={:.2} lock_ms={:.2} noop={}",
                 ),
                 number,
                 ms(stage_ns),
@@ -842,9 +898,55 @@ impl LaneNode {
                 ms(recover_ns),
                 ms(apply_ns),
                 ms(lock_ns.load(Ordering::Relaxed)),
+                u8::from(noop),
             );
         }
-        Ok(StageOutcome::Staged(commitment))
+        Ok(outcome)
+    }
+
+    /// The body of `stage_block`, run with the commitment already claimed in
+    /// `inflight`. Split out so that EVERY exit — including `?` on a decode
+    /// error — passes through the caller's single release point.
+    /// Returns (outcome, decode_ns, recover_ns, apply_ns, noop).
+    async fn stage_claimed(
+        &self,
+        bytes: &[u8],
+        hdr: crate::chain::WireHeader,
+        t_decode: Instant,
+        lock_ns: &AtomicU64,
+    ) -> Result<(StageOutcome, u64, u64, u64, bool), String> {
+        let (head_c, head_n, _) = *timed_lock(&self.head, lock_ns).await;
+        if hdr.number != head_n + 1 || hdr.parent != head_c {
+            return Ok((StageOutcome::Syncing { head: head_n }, 0, 0, 0, false));
+        }
+        // Already staged against this head — our own `arc_buildBlock` result,
+        // or a duplicate `arc_stageBlock`. A cheap no-op: the entry that is
+        // there is a post-state of the same parent over the same bytes, so
+        // re-executing would only pay ecrecover + a state clone to rebuild it.
+        if self.already_staged(hdr.commitment, head_c, lock_ns).await {
+            let decode_ns = t_decode.elapsed().as_nanos() as u64;
+            return Ok((StageOutcome::Staged(hdr.commitment), decode_ns, 0, 0, true));
+        }
+        // the expensive half of the decode (tx bodies out of the wire); the
+        // commitment is NOT recomputed — `from_wire_bytes_with_header` re-derives
+        // the header from these same bytes and refuses a mismatch.
+        let block = LeanBlock::from_wire_bytes_with_header(bytes, hdr)?;
+        let decode_ns = t_decode.elapsed().as_nanos() as u64;
+        let t_recover = Instant::now();
+        let items = decode_block_txs(&block.txs);
+        let recover_ns = t_recover.elapsed().as_nanos() as u64;
+        // execute against a CLONE of the head state
+        let t_apply = Instant::now();
+        let mut staged_state = timed_lock(&self.state, lock_ns).await.clone();
+        let outcome = apply_block(&mut staged_state, &items, block.number, self.cfg.beneficiary);
+        let commitment = block.commitment;
+        let entry =
+            self.staged_entry(block, bytes.to_vec(), head_c, &items, &staged_state, outcome);
+        let apply_ns = t_apply.elapsed().as_nanos() as u64;
+        // visible BEFORE the caller signals completion: a waiter woken by that
+        // signal must find the entry it was waiting for.
+        self.insert_staged(commitment, entry, lock_ns).await;
+        Ok((StageOutcome::Staged(commitment), decode_ns, recover_ns, apply_ns, false))
     }
 
     /// Promote a staged block: append (fsync — the durability point), write
@@ -1182,6 +1284,74 @@ impl LaneNode {
         r
     }
 
+    /// Wait out a concurrent `arc_stageBlock` (or by-bytes commit) of exactly
+    /// this commitment, so the anchor never peer-pulls a block that is being
+    /// executed in this process right now. Returns whether it waited at all;
+    /// the caller re-checks the index and `locate_wire`.
+    ///
+    /// Two windows, both covered:
+    ///
+    /// 1. The stage has NAMED itself — `inflight` holds `c`. Wait on its watch
+    ///    channel, generously bounded (2 s), exactly as the by-bytes claim
+    ///    path does. A dropped owner (panicked stager) closes the channel and
+    ///    we fall through, so a dead stage can never wedge an anchor.
+    /// 2. The stage has ARRIVED but not yet named itself — it is in the RPC
+    ///    layer parsing ~3 MB of JSON/base64, or hashing the wire, and does
+    ///    not know its own commitment yet. `stage_pending` is non-zero exactly
+    ///    then. Wait on `stage_notify` up to `LEAN_STAGE_RACE_MS`, rechecking
+    ///    `inflight` each round. This window is real: the CL issues the anchor
+    ///    ~15 ms after the stage, and the stage's pre-registration work is the
+    ///    same order of magnitude.
+    ///
+    /// The grace in (2) is gated on `stage_pending > 0`, so a node doing a
+    /// genuine backfill — nobody staging — adds zero latency to its peer
+    /// pulls. Worst case when a stage is pending but is for a DIFFERENT block:
+    /// `LEAN_STAGE_RACE_MS` on top of a path that already costs 200-250 ms.
+    async fn await_stage_race(&self, c: B256, tm: &AnchorTimer) -> bool {
+        let grace = std::time::Duration::from_millis(stage_race_ms());
+        let t_wait = Instant::now();
+        let mut waited = false;
+        loop {
+            let held = {
+                let fl = timed_lock(&self.inflight, &tm.lock_ns).await;
+                fl.get(&c).map(|(_, rx)| rx.clone())
+            };
+            if let Some(mut rx) = held {
+                waited = true;
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    while !*rx.borrow() {
+                        if rx.changed().await.is_err() {
+                            break; // owner dropped (failed/panicked): fall through
+                        }
+                    }
+                })
+                .await;
+                break;
+            }
+            if self.stage_pending.load(Ordering::Relaxed) == 0 {
+                break;
+            }
+            let left = grace.checked_sub(t_wait.elapsed()).unwrap_or_default();
+            if left.is_zero() {
+                break;
+            }
+            waited = true;
+            // Bounded poll rather than a bare `notified()`: a notification
+            // that fires between the `inflight` peek and this await would
+            // otherwise be lost, and the cost of missing one is a 200 ms pull.
+            let _ = tokio::time::timeout(
+                left.min(std::time::Duration::from_millis(2)),
+                self.stage_notify.notified(),
+            )
+            .await;
+        }
+        if waited {
+            add_ns(&tm.wait_inflight_ns, t_wait);
+            self.stats.stage_race_waits.fetch_add(1, Ordering::Relaxed);
+        }
+        waited
+    }
+
     async fn new_by_commitment_inner(
         &self,
         c: B256,
@@ -1204,24 +1374,14 @@ impl LaneNode {
             return Ok(NewBlockOutcome::Valid(c));
         }
         // A staging or a by-bytes COMMIT of exactly this block may be in
-        // flight (the gossip backfill and this anchor racing for the same
-        // height). Wait for that result instead of queueing our own `state`
-        // and `log` locks behind it: if it was a commit, the block is
-        // canonical and this anchor is an idempotent VALID; if it was a
-        // staging, `locate_wire` below now finds the staged entry instead of
-        // falling through to a peer fetch.
-        let waiter = { self.inflight.lock().await.get(&c).map(|(_, rx)| rx.clone()) };
-        if let Some(mut rx) = waiter {
-            let t_wait = Instant::now();
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-                while !*rx.borrow() {
-                    if rx.changed().await.is_err() {
-                        break; // owner dropped (failed/panicked): fall through
-                    }
-                }
-            })
-            .await;
-            add_ns(&tm.wait_inflight_ns, t_wait);
+        // flight (our CL's own `arc_stageBlock`, fired ~15 ms ago and still
+        // running; or the gossip backfill racing this anchor for the height).
+        // Wait for that result instead of queueing our own `state` and `log`
+        // locks behind it: if it was a commit, the block is canonical and this
+        // anchor is an idempotent VALID; if it was a staging, `locate_wire`
+        // below finds the staged entry instead of falling through to a peer
+        // fetch.
+        if self.await_stage_race(c, tm).await {
             let known = { self.by_commitment.lock().await.get(&c).copied() };
             if let Some(n) = known {
                 tm.number.store(n, Ordering::Relaxed);
@@ -1239,6 +1399,28 @@ impl LaneNode {
                 _ => PATH_INDEX,
             });
             return self.shim_new_inner(&bytes, tm).await;
+        }
+        // LAST CHANCE before spending 200-250 ms on a peer: a stage may have
+        // registered while we ran `locate_wire`. Same bounded wait, then one
+        // more locate — still cheaper than the round trip it replaces.
+        if self.await_stage_race(c, tm).await {
+            let known = { self.by_commitment.lock().await.get(&c).copied() };
+            if let Some(n) = known {
+                tm.number.store(n, Ordering::Relaxed);
+                tm.set_path(PATH_INDEX);
+                return Ok(NewBlockOutcome::Valid(c));
+            }
+            let t_locate = Instant::now();
+            let located = self.locate_wire(c, "new_block").await?;
+            add_ns(&tm.locate_ns, t_locate);
+            if let Some((bytes, src)) = located {
+                tm.set_path(match src {
+                    "staged" => PATH_STAGED,
+                    "queued" => PATH_QUEUED,
+                    _ => PATH_INDEX,
+                });
+                return self.shim_new_inner(&bytes, tm).await;
+            }
         }
         let t_peer = Instant::now();
         for cl in &self.peer_clients {
@@ -1584,6 +1766,7 @@ impl LaneNode {
                 "lean_stats head={} accounts={} staged={} ",
                 "sync_queue={} by_commitment={} scan_misses={} log_scans={} ",
                 "announce_skipped_staged={} backfill_pulls={} ",
+                "stage_race_waits={} ",
                 "pool={} build_ms_last={:.1} stage_ms_last={:.1} ",
                 "append_ms_last={:.1} rss_mb={}",
             ),
@@ -1596,6 +1779,7 @@ impl LaneNode {
             s.log_scans.load(Ordering::Relaxed),
             s.announce_skipped_staged.load(Ordering::Relaxed),
             s.backfill_pulls.load(Ordering::Relaxed),
+            s.stage_race_waits.load(Ordering::Relaxed),
             pending,
             ms(s.build_ns_last.load(Ordering::Relaxed)),
             ms(s.stage_ns_last.load(Ordering::Relaxed)),

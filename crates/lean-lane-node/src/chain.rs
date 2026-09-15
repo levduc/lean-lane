@@ -50,6 +50,16 @@ pub fn genesis_commitment(chain_id: u64) -> B256 {
     keccak256(&buf)
 }
 
+/// A wire block's header fields plus its commitment, obtained without
+/// materialising the transaction list (see `LeanBlock::commitment_of_wire`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WireHeader {
+    pub parent: B256,
+    pub number: u64,
+    pub timestamp_ms: u64,
+    pub commitment: B256,
+}
+
 #[derive(Clone, Debug)]
 pub struct LeanBlock {
     pub parent: B256,
@@ -97,9 +107,10 @@ impl LeanBlock {
         w
     }
 
-    /// Strict wire decode: malformed and trailing bytes rejected; the
-    /// commitment is recomputed from content, never trusted.
-    pub fn from_wire_bytes(bytes: &[u8]) -> Result<Self, String> {
+    /// Validate the wire FRAMING and return the header fields plus the tx
+    /// count. Walks the length table without copying a single tx body, so it
+    /// is the cheap half of a decode.
+    fn scan_wire(bytes: &[u8]) -> Result<(B256, u64, u64, usize), String> {
         if bytes.len() < 52 {
             return Err("wire block too short".into());
         }
@@ -107,7 +118,6 @@ impl LeanBlock {
         let number = u64::from_le_bytes(bytes[32..40].try_into().unwrap());
         let timestamp_ms = u64::from_le_bytes(bytes[40..48].try_into().unwrap());
         let n_tx = u32::from_le_bytes(bytes[48..52].try_into().unwrap()) as usize;
-        let mut txs = Vec::with_capacity(n_tx.min(1 << 20));
         let mut at = 52usize;
         for i in 0..n_tx {
             if bytes.len() < at + 4 {
@@ -118,13 +128,65 @@ impl LeanBlock {
             if bytes.len() < at + len {
                 return Err(format!("wire block truncated at tx {i} body"));
             }
-            txs.push(bytes[at..at + len].to_vec());
             at += len;
         }
         if at != bytes.len() {
             return Err("trailing bytes after wire block".into());
         }
-        Ok(Self::new(parent, number, timestamp_ms, txs))
+        Ok((parent, number, timestamp_ms, n_tx))
+    }
+
+    /// The commitment (and header) of a wire block WITHOUT materialising its
+    /// transactions.
+    ///
+    /// The wire tail `bytes[48..]` is BYTE-IDENTICAL to the framed tx preimage
+    /// `cat` that `new` builds (`[n u32 LE]([len u32 LE][tx])*`), so the
+    /// commitment is two keccaks over borrowed slices: no per-tx `Vec`, no
+    /// re-serialisation of the block. That matters on the anchor race —
+    /// `stage_block` must publish the commitment it is working on BEFORE it
+    /// pays for the decode, or an `arc_newBlock` arriving 15 ms later misses
+    /// the in-flight claim and buys a 200 ms peer pull instead.
+    ///
+    /// Framing is validated exactly as `from_wire_bytes` validates it, so a
+    /// malformed body can never be registered as in-flight.
+    pub fn commitment_of_wire(bytes: &[u8]) -> Result<WireHeader, String> {
+        let (parent, number, timestamp_ms, _) = Self::scan_wire(bytes)?;
+        let txs_hash = keccak256(&bytes[48..]);
+        let mut pre = Vec::with_capacity(80);
+        pre.extend_from_slice(parent.as_slice());
+        pre.extend_from_slice(&number.to_le_bytes());
+        pre.extend_from_slice(&timestamp_ms.to_le_bytes());
+        pre.extend_from_slice(txs_hash.as_slice());
+        Ok(WireHeader { parent, number, timestamp_ms, commitment: keccak256(&pre) })
+    }
+
+    /// Strict wire decode: malformed and trailing bytes rejected; the
+    /// commitment is recomputed from content, never trusted.
+    pub fn from_wire_bytes(bytes: &[u8]) -> Result<Self, String> {
+        let h = Self::commitment_of_wire(bytes)?;
+        Self::from_wire_bytes_with_header(bytes, h)
+    }
+
+    /// Finish a decode whose header/commitment `commitment_of_wire` already
+    /// produced over THESE bytes: copy the tx bodies out and keep that
+    /// commitment rather than rebuilding and re-hashing the preimage. The
+    /// framing re-scan is redundant after `commitment_of_wire` but cheap
+    /// (no copies) and keeps this safe to call on its own — the header is
+    /// re-derived from the bytes and compared, never trusted.
+    pub fn from_wire_bytes_with_header(bytes: &[u8], h: WireHeader) -> Result<Self, String> {
+        let (parent, number, timestamp_ms, n_tx) = Self::scan_wire(bytes)?;
+        if parent != h.parent || number != h.number || timestamp_ms != h.timestamp_ms {
+            return Err("wire header does not match the bytes".into());
+        }
+        let mut txs = Vec::with_capacity(n_tx.min(1 << 20));
+        let mut at = 52usize;
+        for _ in 0..n_tx {
+            let len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+            at += 4;
+            txs.push(bytes[at..at + len].to_vec());
+            at += len;
+        }
+        Ok(Self { parent, number, timestamp_ms, txs, commitment: h.commitment })
     }
 
     fn payload(&self) -> Vec<u8> {
