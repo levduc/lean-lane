@@ -189,3 +189,35 @@ async fn stats_line_carries_every_growth_field() {
     assert!(n.stats.build_ns_last.load(Ordering::Relaxed) > 0, "build must be timed");
     assert!(n.stats.append_ns_last.load(Ordering::Relaxed) > 0, "append must be timed");
 }
+
+#[test]
+fn anchor_line_carries_every_timing_field() {
+    // The decide anchor's decomposition. `pre_ms` and `locate_ms` were added
+    // 2026-09-15 because `total_ms` on a `path=index` height ran to 226-443 ms
+    // with index_ms≈6 and decode_ms≈6 — ~380 ms that no field named. pre_ms is
+    // taken at RPC-handler entry (before any lock or head read), locate_ms
+    // covers the by-commitment resolve (staged -> queue -> index -> log read
+    // -> bounded scan), peer_ms the `arc_getBlockBytes` round trip.
+    let line = lean_lane_node::node::AnchorTimer::default().line(std::time::Instant::now());
+    for key in [
+        "lean_anchor ",
+        "n=",
+        "path=",
+        "total_ms=",
+        "pre_ms=",
+        "locate_ms=",
+        "peer_ms=",
+        "wait_inflight_ms=",
+        "lock_ms=",
+        "apply_ms=",
+        "append_ms=",
+        "fsync_ms=",
+        "index_ms=",
+        "announce_ms=",
+        "rss_mb=",
+        "decode_ms=",
+        "pool_ms=",
+    ] {
+        assert!(line.contains(key), "lean_anchor line is missing `{key}`: {line}");
+    }
+}

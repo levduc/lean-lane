@@ -136,9 +136,12 @@ const PATH_NAMES: [&str; 7] =
 /// atomics: the timer is passed by `&` through `shim_new` -> `promote_staged`
 /// / `commit_block`, which are async and must stay Send.
 ///
-/// The named fields do not sum to `total_ms`; the residual is the JSON/base64
-/// envelope plus whatever the route paid outside the instrumented sections
-/// (for the peer route: the awaited `arc_getBlockBytes` round trip).
+/// `total_ms` is measured from RPC-HANDLER ENTRY, not from the first thing
+/// the node does: `pre_ms` is everything before path dispatch (JSON parse,
+/// base64 decode of a ~3.4 MB body, tokio scheduling), and `locate_ms` /
+/// `peer_ms` cover the by-commitment resolve that used to be invisible. What
+/// is left in the residual is the response encode and the `Instant` reads
+/// themselves.
 ///
 /// `n=0` means the height was never learned: a by-commitment call that
 /// resolved to nothing (`path=syncing`).
@@ -146,6 +149,20 @@ const PATH_NAMES: [&str; 7] =
 pub struct AnchorTimer {
     pub number: AtomicU64,
     path: AtomicU8,
+    /// RPC handler entry -> path dispatch. Taken BEFORE any lock, any `head`
+    /// read and any parsing, so it is the one field nothing inside the node
+    /// can be blamed for: param parse, base64 decode, and however long the
+    /// task sat in the tokio queue before it ran.
+    pub pre_ns: AtomicU64,
+    /// `locate_wire` on the by-commitment route: staged map -> sync queue ->
+    /// commitment index -> log read -> bounded backward scan. Previously
+    /// UNMEASURED — a `path=index` hit that had to read and re-serialise the
+    /// block out of the log (log mutex + a 2.5 MB copy) paid entirely here
+    /// and surfaced only as `total_ms` residual. This is the ~380 ms that
+    /// `index_ms≈6 decode_ms≈6` could not account for.
+    pub locate_ns: AtomicU64,
+    /// The peer `arc_getBlockBytes{commitment}` round trip (`path=peer`).
+    pub peer_ns: AtomicU64,
     pub wait_inflight_ns: AtomicU64,
     pub lock_ns: AtomicU64,
     pub apply_ns: AtomicU64,
@@ -176,10 +193,17 @@ impl AnchorTimer {
         if !stats_enabled() {
             return;
         }
+        println!("{}", self.line(t0));
+    }
+    /// The `lean_anchor` line itself. Split out from `emit` so the field set
+    /// is gated by a test rather than by reading a fleet log and noticing
+    /// something is missing (which is how `locate_ms` came to be needed).
+    pub fn line(&self, t0: Instant) -> String {
         let g = |a: &AtomicU64| ms(a.load(Ordering::Relaxed));
-        println!(
+        format!(
             concat!(
-                "lean_anchor n={} path={} total_ms={:.2} wait_inflight_ms={:.2} ",
+                "lean_anchor n={} path={} total_ms={:.2} pre_ms={:.2} ",
+                "locate_ms={:.2} peer_ms={:.2} wait_inflight_ms={:.2} ",
                 "lock_ms={:.2} apply_ms={:.2} append_ms={:.2} fsync_ms={:.2} ",
                 "index_ms={:.2} announce_ms={:.2} rss_mb={} ",
                 "decode_ms={:.2} pool_ms={:.2}",
@@ -187,6 +211,9 @@ impl AnchorTimer {
             self.number.load(Ordering::Relaxed),
             PATH_NAMES[self.path.load(Ordering::Relaxed) as usize % PATH_NAMES.len()],
             ms(t0.elapsed().as_nanos() as u64),
+            g(&self.pre_ns),
+            g(&self.locate_ns),
+            g(&self.peer_ns),
             g(&self.wait_inflight_ns),
             g(&self.lock_ns),
             g(&self.apply_ns),
@@ -197,7 +224,7 @@ impl AnchorTimer {
             rss_mb(),
             g(&self.decode_ns),
             g(&self.pool_ns),
-        );
+        )
     }
 }
 
@@ -886,8 +913,20 @@ impl LaneNode {
     /// its commitment as a no-op; a DIFFERENT block at a known height is a
     /// loud error (fork attempt); head+2 gaps are errors (feed in order).
     pub async fn shim_new(&self, bytes: &[u8]) -> Result<NewBlockOutcome, String> {
-        let t0 = Instant::now();
+        self.shim_new_at(bytes, Instant::now()).await
+    }
+
+    /// `shim_new` with the RPC handler's ENTRY instant, so `total_ms` covers
+    /// the whole call and `pre_ms` isolates everything before dispatch (param
+    /// parse, base64 decode of the body, tokio scheduling). The plain
+    /// `shim_new` is the harness/test entry point: it starts the clock here.
+    pub async fn shim_new_at(
+        &self,
+        bytes: &[u8],
+        t0: Instant,
+    ) -> Result<NewBlockOutcome, String> {
         let tm = AnchorTimer::default();
+        add_ns(&tm.pre_ns, t0);
         tm.set_path(PATH_BYTES);
         let r = self.shim_new_inner(bytes, &tm).await;
         if matches!(r, Ok(NewBlockOutcome::Syncing { .. })) {
@@ -1027,8 +1066,17 @@ impl LaneNode {
     /// apply from our staged/queued copy, else fetch the bytes from a peer by
     /// commitment, else SYNCING.
     pub async fn shim_new_by_commitment(&self, c: B256) -> Result<NewBlockOutcome, String> {
-        let t0 = Instant::now();
+        self.shim_new_by_commitment_at(c, Instant::now()).await
+    }
+
+    /// As above, with the RPC handler's ENTRY instant (see `shim_new_at`).
+    pub async fn shim_new_by_commitment_at(
+        &self,
+        c: B256,
+        t0: Instant,
+    ) -> Result<NewBlockOutcome, String> {
         let tm = AnchorTimer::default();
+        add_ns(&tm.pre_ns, t0);
         let r = self.new_by_commitment_inner(c, &tm).await;
         if matches!(r, Ok(NewBlockOutcome::Syncing { .. })) {
             tm.set_path(PATH_SYNCING);
@@ -1058,7 +1106,10 @@ impl LaneNode {
             tm.set_path(PATH_INDEX);
             return Ok(NewBlockOutcome::Valid(c));
         }
-        if let Some((bytes, src)) = self.locate_wire(c, "new_block").await? {
+        let t_locate = Instant::now();
+        let located = self.locate_wire(c, "new_block").await?;
+        add_ns(&tm.locate_ns, t_locate);
+        if let Some((bytes, src)) = located {
             tm.set_path(match src {
                 "staged" => PATH_STAGED,
                 "queued" => PATH_QUEUED,
@@ -1066,6 +1117,7 @@ impl LaneNode {
             });
             return self.shim_new_inner(&bytes, tm).await;
         }
+        let t_peer = Instant::now();
         for cl in &self.peer_clients {
             use jsonrpsee::core::client::ClientT;
             let mut params = jsonrpsee::core::params::ObjectParams::new();
@@ -1080,12 +1132,15 @@ impl LaneNode {
             match LeanBlock::from_wire_bytes(&bytes) {
                 Ok(b) if b.commitment == c => {
                     self.stats.block_pulls.fetch_add(1, Ordering::Relaxed);
+                    add_ns(&tm.peer_ns, t_peer);
                     tm.set_path(PATH_PEER);
                     return self.shim_new_inner(&bytes, tm).await;
                 }
                 _ => continue, // peer served the wrong block: ignore it
             }
         }
+        // every peer missed or failed: that whole sweep is still peer time
+        add_ns(&tm.peer_ns, t_peer);
         let head_n = self.head.lock().await.1;
         Ok(NewBlockOutcome::Syncing { head: head_n })
     }
@@ -1196,13 +1251,14 @@ impl LaneNode {
     /// Shim: `arc_getBlockBytes` — serve a block's consensus wire bytes from
     /// the log (sync path).
     pub async fn block_wire_bytes(&self, number: u64) -> Result<Option<Vec<u8>>, String> {
-        Ok(self
-            .log
-            .lock()
-            .await
-            .read_block(number)
-            .map_err(|e| e.to_string())?
-            .map(|b| b.to_wire_bytes()))
+        // Read under the log mutex, SERIALISE outside it. `to_wire_bytes`
+        // copies the whole block (2.5 MB on the fleet) and the log mutex is
+        // exactly what the decide anchor's append needs — as one temporary in
+        // the return expression the guard lived across the copy, so every
+        // peer/CL `arc_getBlockBytes` stalled the next height's append by a
+        // memcpy it had no reason to wait for.
+        let block = { self.log.lock().await.read_block(number).map_err(|e| e.to_string())? };
+        Ok(block.map(|b| b.to_wire_bytes()))
     }
 
     /// Resolve a commitment to block bytes: staged, then the sync queue, then

@@ -89,15 +89,28 @@ pub fn module(node: Arc<LaneNode>) -> RpcModule<Arc<LaneNode>> {
         commitment: Option<B256>,
     }
     m.register_async_method("arc_newBlock", |params, node, _| async move {
+        // FIRST statement in the handler. `pre_ms` in the `lean_anchor` line
+        // is everything from here to path dispatch: param parse, the base64
+        // decode of a ~3.4 MB body, and whatever the tokio executor made this
+        // task wait for before it ran.
+        //
+        // NOT `rpc_queue_ms`: jsonrpsee hands the handler no request-receive
+        // timestamp (the third closure argument is `Extensions`, and the
+        // server inserts nothing time-related), so socket-read -> handler-entry
+        // is not observable from inside a method. This instant is the earliest
+        // point the node can name.
+        let t_entry = std::time::Instant::now();
         let p: NewBlockParams = params.parse()?;
         let outcome = match (p.block_bytes, p.commitment) {
             (Some(b64), _) => {
                 let bytes = base64::engine::general_purpose::STANDARD
                     .decode(&b64)
                     .map_err(|e| err(e.to_string()))?;
-                node.shim_new(&bytes).await.map_err(err)?
+                node.shim_new_at(&bytes, t_entry).await.map_err(err)?
             }
-            (None, Some(c)) => node.shim_new_by_commitment(c).await.map_err(err)?,
+            (None, Some(c)) => {
+                node.shim_new_by_commitment_at(c, t_entry).await.map_err(err)?
+            }
             (None, None) => return Err(err("arc_newBlock: need blockBytes or commitment")),
         };
         match outcome {
