@@ -397,25 +397,71 @@ impl LaneNode {
         set_lane_chain_id(cfg.chain_id);
         std::fs::create_dir_all(&cfg.datadir)?;
         let t0 = Instant::now();
-        let (mut state, snap_commitment, snap_number, snap_ts) =
+        let (mut state, snap_commitment, mut snap_number, snap_ts) =
             match FlatState::load_newest_snapshot(&cfg.datadir)? {
                 Some((s, c, n, t)) => (s, c, n, t),
                 None => (FlatState::default(), genesis_commitment(cfg.chain_id), 0, 0),
             };
         let mut log = BlockLog::open(&cfg.datadir.join("blocks.log"))?;
-        let mut head = (snap_commitment, snap_number, snap_ts);
         let beneficiary = cfg.beneficiary;
+        let mut head = (snap_commitment, snap_number, snap_ts);
         let mut replayed_blocks = 0u64;
         let mut replayed_txs = 0u64;
         let mut by_commitment = std::collections::HashMap::new();
-        log.replay(snap_number, |block| {
-            let items = decode_block_txs(&block.txs);
-            replayed_txs += items.len() as u64;
-            apply_block(&mut state, &items, block.number, beneficiary);
-            head = (block.commitment, block.number, block.timestamp_ms);
-            by_commitment.insert(block.commitment, block.number);
-            replayed_blocks += 1;
-        })?;
+        let mut replay_from = |state: &mut FlatState,
+                               log: &mut BlockLog,
+                               snap: (B256, u64, u64)|
+         -> std::io::Result<()> {
+            head = (snap.0, snap.1, snap.2);
+            replayed_blocks = 0;
+            replayed_txs = 0;
+            by_commitment.clear();
+            log.replay(snap.1, |block| {
+                let items = decode_block_txs(&block.txs);
+                replayed_txs += items.len() as u64;
+                apply_block(state, &items, block.number, beneficiary);
+                head = (block.commitment, block.number, block.timestamp_ms);
+                by_commitment.insert(block.commitment, block.number);
+                replayed_blocks += 1;
+            })?;
+            Ok(())
+        };
+        replay_from(&mut state, &mut log, (snap_commitment, snap_number, snap_ts))?;
+
+        // SNAPSHOT AHEAD OF THE LOG (only reachable under `LEAN_FSYNC=0`, which
+        // fsyncs the snapshot but not the append — see `chain::fsync_enabled`).
+        // Resuming from a snapshot the log cannot reach leaves a permanent hole
+        // below the head: the backfill only ever pulls `head + 1` upward, so
+        // those heights stay unservable and a re-feed of one of them is a hard
+        // error. Restart from the newest snapshot the log CAN continue from
+        // (they are never pruned, so normally the previous one) and replay from
+        // there; state and log then end at the same block and the backfill
+        // repairs the difference as ordinary lag.
+        let log_head = log.last_number().unwrap_or(0);
+        if snap_number > log_head {
+            let fallback = FlatState::load_newest_snapshot_upto(&cfg.datadir, log_head)?;
+            let (from, at) = match fallback {
+                Some((s, c, n, t)) => (s, (c, n, t)),
+                None => (FlatState::default(), (genesis_commitment(cfg.chain_id), 0, 0)),
+            };
+            eprintln!(
+                concat!(
+                    "lean_recovery WARNING snapshot {} is AHEAD of the block log ",
+                    "(last intact record {}): heights {}..={} were lost with the ",
+                    "unsynced log tail. Restarting from snapshot {} and replaying; ",
+                    "the backfill re-pulls the rest from peers.",
+                ),
+                snap_number,
+                log_head,
+                log_head + 1,
+                snap_number,
+                at.1,
+            );
+            state = from;
+            snap_number = at.1;
+            replay_from(&mut state, &mut log, at)?;
+        }
+        drop(replay_from);
         let recovery = RecoveryReport {
             snapshot_number: snap_number,
             replayed_blocks,

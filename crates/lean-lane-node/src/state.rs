@@ -74,6 +74,21 @@ impl FlatState {
     /// (state, commitment, block number). None if no snapshot exists.
     /// Returns (state, commitment, number, timestamp_ms).
     pub fn load_newest_snapshot(dir: &Path) -> std::io::Result<Option<(Self, B256, u64, u64)>> {
+        Self::load_newest_snapshot_upto(dir, u64::MAX)
+    }
+
+    /// As `load_newest_snapshot`, but never above block `ceiling`.
+    ///
+    /// Snapshots are fsync'd (tmp + `sync_all` + rename) while the block log
+    /// under `LEAN_FSYNC=0` is not, so a crash can leave a snapshot NEWER than
+    /// the last intact log record. Recovering from it would strand the node
+    /// above a permanent hole in its own log; `LaneNode::open` instead asks for
+    /// the newest snapshot the log can actually continue from. Snapshots are
+    /// never pruned, so that is normally the previous one.
+    pub fn load_newest_snapshot_upto(
+        dir: &Path,
+        ceiling: u64,
+    ) -> std::io::Result<Option<(Self, B256, u64, u64)>> {
         let mut best: Option<(u64, PathBuf)> = None;
         for e in std::fs::read_dir(dir)? {
             let e = e?;
@@ -82,7 +97,7 @@ impl FlatState {
                 name.strip_prefix("snapshot-").and_then(|s| s.strip_suffix(".bin"))
             {
                 if let Ok(n) = numstr.parse::<u64>() {
-                    if best.as_ref().map_or(true, |(b, _)| n > *b) {
+                    if n <= ceiling && best.as_ref().map_or(true, |(b, _)| n > *b) {
                         best = Some((n, e.path()));
                     }
                 }

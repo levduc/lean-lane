@@ -81,6 +81,15 @@ must be started with the same fund file.
 `LEAN_PARALLEL_RECOVERY=0` turns off rayon-parallel signature recovery
 (default on; `=0` is the measured-slower serial path).
 
+`LEAN_FSYNC=0` drops the per-append fsync on the block log (default: fsync
+every block). The log tail can then be lost in a crash — safe, because the
+head is re-derived from the log on open and the backfill re-pulls whatever is
+missing above it. Note the asymmetry: state snapshots are fsync'd whatever
+this is set to, so a crash can leave a snapshot *ahead* of the log; `open`
+detects that, warns (`lean_recovery WARNING ...`), and restarts from the
+newest snapshot the log can be continued from rather than resuming above a
+hole it could never fill.
+
 `LEAN_STATS=1` prints one line every 10 s on stdout:
 
 ```

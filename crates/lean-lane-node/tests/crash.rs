@@ -133,3 +133,79 @@ async fn total_stf_noop_never_halts() {
     assert!(!out.receipts[0].applied);
     assert_eq!(state.digest(), before, "no-op leaves state untouched");
 }
+
+/// I2: `LEAN_FSYNC=0` fsyncs the SNAPSHOT (tmp + sync_all + rename) but not the
+/// log append, so a crash can leave a durable snapshot at a height the log
+/// never reached. Resuming from that snapshot would put the head above a hole
+/// the backfill never repairs (it only pulls `head + 1` upward), leaving those
+/// heights unservable forever and turning a re-feed of one of them into the
+/// hard error "height N predates the log".
+///
+/// `open` must instead fall back to the newest snapshot the log can continue
+/// from and replay to the last intact record — state and log ending at the
+/// same block, the difference becoming ordinary lag.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_snapshot_ahead_of_the_log_falls_back_instead_of_leaving_a_hole() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("blocks.log");
+    let node = make_node(dir.path(), 2).await; // snapshot every 2 blocks
+    // Every sender is seeded BEFORE the first block: `seed_account` is a test
+    // hook, not a logged event, so an account created after a snapshot cannot
+    // be reproduced by replaying the log and the digests would not compare.
+    let domain = current_lane_domain();
+    let txs: Vec<_> = (0..12u64)
+        .map(|i| {
+            let out = vec![Output { to: Address::with_last_byte((i % 200) as u8), amount: 5 }];
+            LeanSigned::new(LeanTx::sign(0, out, &sk(900 + i), &domain))
+        })
+        .collect();
+    for t in &txs {
+        let sender = t.tx().recover_sender(&domain).unwrap();
+        node.seed_account(sender, Acct { nonce: 0, balance: lean_fee(1) + 5 * AMOUNT_UNIT }).await;
+    }
+    let mut produced = 0u64;
+    for (i, t) in txs.iter().enumerate() {
+        node.submit_raw(t.raw()).await.unwrap();
+        if (i + 1) % 3 == 0 {
+            node.produce_block(1_000 + i as u64).await.unwrap().unwrap();
+            produced += 1;
+        }
+        if produced == 3 && (i + 1) % 3 == 0 {
+            break;
+        }
+    }
+    // blocks 1..3 are in the log, snapshot at 2
+    let len3 = std::fs::metadata(&log_path).unwrap().len();
+    let digest3 = node.state.lock().await.digest();
+    let head3 = *node.head.lock().await;
+    assert_eq!(head3.1, 3);
+    for t in txs.iter().skip(9) {
+        node.submit_raw(t.raw()).await.unwrap();
+    }
+    node.produce_block(2_000).await.unwrap().unwrap(); // block 4 -> snapshot-4.bin
+    assert_eq!(node.head.lock().await.1, 4);
+    drop(node);
+    assert!(dir.path().join("snapshot-4.bin").exists());
+
+    // the crash: the snapshot survives, the log tail does not
+    std::fs::OpenOptions::new().write(true).open(&log_path).unwrap().set_len(len3).unwrap();
+
+    let (n2, report) = LaneNode::open(Config {
+        datadir: dir.path().to_path_buf(),
+        snapshot_every: 2,
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(report.snapshot_number, 2, "recovered from the snapshot BELOW the log tail");
+    assert_eq!(*n2.head.lock().await, head3, "head is the last intact record");
+    assert_eq!(n2.state.lock().await.digest(), digest3, "state matches that head exactly");
+    assert!(dir.path().join("snapshot-4.bin").exists(), "the ahead snapshot is left alone");
+
+    // no hole: height 4 is head+1 again, so it is ordinary lag the chain fills
+    for t in txs.iter().skip(9) {
+        n2.submit_raw(t.raw()).await.unwrap();
+    }
+    n2.produce_block(3_000).await.unwrap().unwrap();
+    assert_eq!(n2.head.lock().await.1, 4);
+    assert!(n2.log.lock().await.read_block(4).unwrap().is_some(), "4 is in the log now");
+}
