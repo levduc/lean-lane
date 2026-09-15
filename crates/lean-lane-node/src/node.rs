@@ -81,6 +81,13 @@ pub struct Stats {
     pub block_pulls: AtomicU64,
     /// backward log scans started by `locate_by_commitment` (must stay 0 on the anchor path)
     pub log_scans: AtomicU64,
+    /// last-block service times (ns) for build / stage / append. The running
+    /// totals above answer "per output over the whole run"; these answer "is
+    /// this node slower NOW than it was ten minutes ago", which is the only
+    /// question a drifting cadence asks.
+    pub build_ns_last: AtomicU64,
+    pub stage_ns_last: AtomicU64,
+    pub append_ns_last: AtomicU64,
 }
 
 pub struct LaneNode {
@@ -118,8 +125,8 @@ pub struct LaneNode {
     /// only its own commitment. The old blanket `clear()` on every append
     /// defeated the cache entirely in steady state (a node appending ~2
     /// blocks/s never kept a miss long enough to use it), so every repeated
-    /// lookup of a commitment nobody has -- exactly what the CL's value-sync
-    /// serving path generates -- paid another bounded backward log scan.
+    /// lookup of a commitment nobody has — exactly what the CL's value-sync
+    /// serving path generates — paid another bounded backward log scan.
     pub scan_misses: Mutex<std::collections::HashSet<B256>>,
     /// IN-FLIGHT stagings: commitment -> (staged_parent, completion signal).
     /// arc_newBlock awaits a matching in-flight staging (bounded guard)
@@ -385,6 +392,7 @@ impl LaneNode {
             s.write_snapshot(&self.cfg.datadir, commitment, block.number, block.timestamp_ms)?;
         }
         let append_ns = t_append.elapsed().as_nanos() as u64;
+        self.stats.append_ns_last.store(append_ns, Ordering::Relaxed);
 
         *self.head.lock().await = (block.commitment, block.number, block.timestamp_ms);
         self.pool.remove_transactions(evict);
@@ -427,7 +435,9 @@ impl LaneNode {
         }
         let (parent, number, _) = *self.head.lock().await;
         let block = LeanBlock::new(parent, number + 1, timestamp_ms, raw);
-        self.stats.build_ns.fetch_add(t_build.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        let build_ns = t_build.elapsed().as_nanos() as u64;
+        self.stats.build_ns.fetch_add(build_ns, Ordering::Relaxed);
+        self.stats.build_ns_last.store(build_ns, Ordering::Relaxed);
         let bn = block.number;
         let cm = block.commitment;
         self.commit_block(block, items, hashes).await?;
@@ -475,7 +485,9 @@ impl LaneNode {
         // optimization) — proves the txs apply, commitment derives from content
         let mut staged = self.state.lock().await.clone();
         apply_block(&mut staged, &items, number, self.cfg.beneficiary);
-        self.stats.build_ns.fetch_add(t_build.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        let build_ns = t_build.elapsed().as_nanos() as u64;
+        self.stats.build_ns.fetch_add(build_ns, Ordering::Relaxed);
+        self.stats.build_ns_last.store(build_ns, Ordering::Relaxed);
         Ok((block.commitment, block.to_wire_bytes()))
     }
 
@@ -538,7 +550,9 @@ impl LaneNode {
         // signal AFTER the staged entry is visible, then deregister
         let _ = done_tx.send(true);
         self.inflight.lock().await.remove(&commitment_key);
-        self.stats.exec_ns.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        let stage_ns = t0.elapsed().as_nanos() as u64;
+        self.stats.exec_ns.fetch_add(stage_ns, Ordering::Relaxed);
+        self.stats.stage_ns_last.store(stage_ns, Ordering::Relaxed);
         Ok(StageOutcome::Staged(commitment))
     }
 
@@ -581,6 +595,7 @@ impl LaneNode {
             s.write_snapshot(&self.cfg.datadir, commitment, block.number, block.timestamp_ms)?;
         }
         let append_ns = t_append.elapsed().as_nanos() as u64;
+        self.stats.append_ns_last.store(append_ns, Ordering::Relaxed);
 
         *self.head.lock().await = (block.commitment, block.number, block.timestamp_ms);
         self.pool.remove_transactions(evict);
@@ -928,6 +943,76 @@ impl LaneNode {
     pub async fn receipt(&self, hash: B256) -> Option<LeanReceipt> {
         self.receipts.lock().await.iter().rev().find(|r| r.tx_hash == hash).cloned()
     }
+
+    /// One-line periodic snapshot of everything that can grow without bound,
+    /// plus the last block's service times. Every field is a counter or a
+    /// `len()` — nothing here walks the state, the log or the pool, so it is
+    /// safe to call on a hot node. Emitted by `spawn_stats` under
+    /// `LEAN_STATS=1`; `grep lean_stats` in a node log gives the whole
+    /// growth-vs-time picture that a cadence drift needs.
+    pub async fn stats_line(&self) -> String {
+        let head = self.head.lock().await.1;
+        let accounts = self.state.lock().await.accounts.len();
+        let staged = self.staged.lock().await.len();
+        let sync_queue = self.sync_queue.lock().await.len();
+        let by_commitment = self.by_commitment.lock().await.len();
+        let scan_misses = self.scan_misses.lock().await.len();
+        let pending = self.pool.pool_size().pending;
+        let s = &self.stats;
+        let ms = |ns: u64| ns as f64 / 1_000_000.0;
+        format!(
+            // concat!, never a `\`-continued literal: a continuation keeps the
+            // next line's indentation and pads the log line with spaces.
+            // concat! cannot see captured variables, so every arg is positional.
+            concat!(
+                "lean_stats head={} accounts={} staged={} ",
+                "sync_queue={} by_commitment={} scan_misses={} log_scans={} ",
+                "pool={} build_ms_last={:.1} stage_ms_last={:.1} ",
+                "append_ms_last={:.1} rss_mb={}",
+            ),
+            head,
+            accounts,
+            staged,
+            sync_queue,
+            by_commitment,
+            scan_misses,
+            s.log_scans.load(Ordering::Relaxed),
+            pending,
+            ms(s.build_ns_last.load(Ordering::Relaxed)),
+            ms(s.stage_ns_last.load(Ordering::Relaxed)),
+            ms(s.append_ns_last.load(Ordering::Relaxed)),
+            rss_mb(),
+        )
+    }
+
+    /// `LEAN_STATS=1` -> print `stats_line()` every 10 s. Off by default (a
+    /// fleet node's log stays exactly as it is unless the flag is set). The
+    /// binary has no tracing subscriber — stdout IS its INFO channel, as for
+    /// every other line it prints.
+    pub fn spawn_stats(self: &std::sync::Arc<Self>) {
+        if std::env::var("LEAN_STATS").as_deref() != Ok("1") {
+            return;
+        }
+        let node = self.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
+            loop {
+                tick.tick().await;
+                println!("{}", node.stats_line().await);
+            }
+        });
+    }
+}
+
+/// Resident set size in MiB, from `/proc/self/statm` field 2 (resident pages).
+/// 0 on any platform or permission that does not give us the file — a stats
+/// line must never be the thing that fails.
+pub fn rss_mb() -> u64 {
+    const PAGE: u64 = 4096;
+    std::fs::read_to_string("/proc/self/statm")
+        .ok()
+        .and_then(|s| s.split_whitespace().nth(1)?.parse::<u64>().ok())
+        .map_or(0, |pages| pages * PAGE / (1024 * 1024))
 }
 
 pub struct RecoveryReport {

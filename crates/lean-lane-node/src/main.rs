@@ -81,6 +81,8 @@ async fn run(args: &[String]) -> eyre::Result<()> {
     let (node, rec) = LaneNode::open(cfg)?;
     let node = Arc::new(node);
     node.spawn_sync();
+    // LEAN_STATS=1: one `lean_stats ...` line every 10 s (see stats_line).
+    node.spawn_stats();
     println!(
         "recovered: snapshot@{} + {} blocks / {} txs replayed in {:?}",
         rec.snapshot_number, rec.replayed_blocks, rec.replayed_txs, rec.elapsed

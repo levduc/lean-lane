@@ -134,3 +134,52 @@ async fn new_block_full_discipline() {
     assert!(n.block_wire_bytes(99).await.unwrap().is_none());
     assert_eq!(n.state.lock().await.digest(), digest, "errors must never mutate state");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stats_line_carries_every_growth_field() {
+    // The LEAN_STATS line is the fleet's only view of what grows over a run,
+    // so its field set is a contract: a missing key silently blinds the next
+    // drift investigation.
+    let dir = tempfile::tempdir().unwrap();
+    let n = node(dir.path()).await;
+    seed_and_submit(&n, 42, 4).await;
+
+    let line = n.stats_line().await;
+    println!("{line}"); // visible with --nocapture: the line is read by humans
+    assert!(line.starts_with("lean_stats "), "{line}");
+    assert_eq!(line.split_whitespace().count(), 13, "one key per field: {line}");
+    for key in [
+        "head=",
+        "accounts=",
+        "staged=",
+        "sync_queue=",
+        "by_commitment=",
+        "scan_misses=",
+        "log_scans=",
+        "pool=",
+        "build_ms_last=",
+        "stage_ms_last=",
+        "append_ms_last=",
+        "rss_mb=",
+    ] {
+        assert!(line.contains(key), "stats line is missing `{key}`: {line}");
+    }
+    assert!(line.contains("head=0"), "fresh node is at height 0: {line}");
+    let pending = n.pool.pool_size().pending;
+    assert_eq!(pending, 1, "the submitted tx must be pending");
+    assert!(line.contains(&format!("pool={pending}")), "{line}");
+    assert!(!line.ends_with("rss_mb=0"), "RSS must be readable from /proc: {line}");
+
+    // after a block: the head moved and the last-append timer is populated
+    let (head_c, head_n, _) = *n.head.lock().await;
+    let (c, wire) = n.shim_build(head_c, head_n + 1, 1_000, 150_000_000).await.unwrap();
+    assert_eq!(n.shim_new(&wire).await.unwrap(), NewBlockOutcome::Valid(c));
+    let line = n.stats_line().await;
+    assert!(line.contains("head=1"), "{line}");
+    assert!(line.contains("by_commitment=1"), "{line}");
+    // the timers are sub-millisecond on a 1-tx block, so check the counters
+    // the line formats rather than the rounded text
+    use std::sync::atomic::Ordering;
+    assert!(n.stats.build_ns_last.load(Ordering::Relaxed) > 0, "build must be timed");
+    assert!(n.stats.append_ns_last.load(Ordering::Relaxed) > 0, "append must be timed");
+}
