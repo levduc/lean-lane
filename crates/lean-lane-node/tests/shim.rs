@@ -224,3 +224,40 @@ fn anchor_line_carries_every_timing_field() {
         assert!(line.contains(key), "lean_anchor line is missing `{key}`: {line}");
     }
 }
+
+/// `--receipt-ring N` bounds the in-memory receipt ring, on BOTH append paths.
+///
+/// The ring is the node's one unbounded-by-default memory sink (receipts are
+/// derived, never persisted, and only `eth_getTransactionReceipt` reads them),
+/// and at fan-out it is not small: 96 B per receipt plus 64 B per non-zero
+/// output, so ~6.4 KB each at N=100 and ~1.3 GB at the 200,000 default.
+///
+/// 0 keeps none — and is the case the old `len() == cap` eviction test got
+/// exactly wrong: at 0 it popped nothing, pushed one, and never matched again.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_receipt_ring_honours_its_configured_size() {
+    for (cap, want) in [(0usize, 0usize), (3, 3), (200_000, 8)] {
+        let dir = tempfile::tempdir().unwrap();
+        let n = LaneNode::open(Config {
+            datadir: dir.path().to_path_buf(),
+            receipt_ring: cap,
+            ..Default::default()
+        })
+        .unwrap()
+        .0;
+        // four blocks of one tx each through `commit_block`...
+        for k in 0..4u64 {
+            seed_and_submit(&n, 1_000 + k, 2).await;
+            n.produce_block(1_000 + k).await.unwrap().unwrap();
+        }
+        // ...and four through `promote_staged`
+        for k in 4..8u64 {
+            seed_and_submit(&n, 1_000 + k, 2).await;
+            let (hc, hn, ts) = *n.head.lock().await;
+            let (c, _) = n.shim_build(hc, hn + 1, ts + 1_000, 150_000_000).await.unwrap();
+            assert_eq!(n.shim_new_by_commitment(c).await.unwrap(), NewBlockOutcome::Valid(c));
+        }
+        assert_eq!(n.head.lock().await.1, 8);
+        assert_eq!(n.receipts.lock().await.len(), want, "receipt_ring {cap}");
+    }
+}

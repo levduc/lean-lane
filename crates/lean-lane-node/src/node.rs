@@ -47,6 +47,13 @@ pub struct Config {
     /// is a modulus (see `snapshot_due`).
     pub snapshot_every: u64,
     pub beneficiary: Address,
+    /// How many of the most recent receipts to keep in memory for
+    /// `eth_getTransactionReceipt`. Nothing else reads them and they are never
+    /// persisted (`exec::LeanReceipt` is derived, not stored), so this is pure
+    /// RSS with a fan-out-dependent price: a receipt is 96 B plus 64 B per
+    /// non-zero output, i.e. ~160 B at N=1 but ~6.4 KB at N=100 — 32 MB and
+    /// ~1.3 GB respectively at the 200k default. Tune it to the fan-out the
+    /// node actually carries (`--receipt-ring`); 0 keeps none at all.
     pub receipt_ring: usize,
     /// Other lean nodes' RPC urls (backfill source + push-on-append targets).
     pub peers: Vec<String>,
@@ -633,6 +640,31 @@ impl LaneNode {
         ))
     }
 
+    /// Push a block's receipts into the ring, evicting the oldest past
+    /// `cfg.receipt_ring`.
+    ///
+    /// `>=`, not `==`: a ring sized 0 means keep none, and the old `==` test
+    /// grew UNBOUNDED there (len 0 pops nothing, pushes one, and never matches
+    /// 0 again). A shrunk ring also has to drain down to its new size rather
+    /// than sit above it forever.
+    fn keep_receipts(
+        &self,
+        ring: &mut VecDeque<LeanReceipt>,
+        receipts: impl IntoIterator<Item = LeanReceipt>,
+    ) {
+        let cap = self.cfg.receipt_ring;
+        if cap == 0 {
+            ring.clear();
+            return;
+        }
+        for r in receipts {
+            while ring.len() >= cap {
+                ring.pop_front();
+            }
+            ring.push_back(r);
+        }
+    }
+
     /// Bench/genesis hook: seed an account into state + the validator's view.
     pub async fn seed_account(&self, a: Address, acct: Acct) {
         self.state.lock().await.accounts.insert(a, acct);
@@ -830,12 +862,7 @@ impl LaneNode {
         add_ns(&tm.pool_ns, t_pool);
         {
             let mut ring = timed_lock(&self.receipts, &tm.lock_ns).await;
-            for r in outcome.receipts {
-                if ring.len() == self.cfg.receipt_ring {
-                    ring.pop_front();
-                }
-                ring.push_back(r);
-            }
+            self.keep_receipts(&mut ring, outcome.receipts);
         }
         // head advanced: keep entries that are still AHEAD of the new head
         // (losing candidates for this height are dropped when the height is
@@ -1305,12 +1332,7 @@ impl LaneNode {
         add_ns(&tm.pool_ns, t_pool);
         {
             let mut ring = timed_lock(&self.receipts, &tm.lock_ns).await;
-            for r in receipts {
-                if ring.len() == self.cfg.receipt_ring {
-                    ring.pop_front();
-                }
-                ring.push_back(r);
-            }
+            self.keep_receipts(&mut ring, receipts);
         }
         // head advanced: keep entries that are still AHEAD of the new head
         // (losing candidates for this height are dropped when the height is

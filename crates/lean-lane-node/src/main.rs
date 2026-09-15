@@ -71,6 +71,7 @@ async fn run(args: &[String]) -> eyre::Result<()> {
         chain_id: arg(args, "--chain-id", 1338),
         budget_gas: arg(args, "--budget-gas", 150_000_000),
         snapshot_every: arg(args, "--snapshot-every", 1024),
+        receipt_ring: arg(args, "--receipt-ring", 200_000),
         peers,
         ..Default::default()
     };

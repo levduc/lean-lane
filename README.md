@@ -73,10 +73,18 @@ rustc than the pin — keep the lock).
 | `--fund-file` / `--fund-balance` | none / 1e15 | addresses funded at genesis; must be exactly the accounts the spammer signs with (derivation `m/44'/60'/1'/0/i` — note the `1'`) |
 | `--budget-gas` | 150,000,000 | self-drive block budget (the shim passes its own per call) |
 | `--snapshot-every` | 1024 | blocks between state snapshots (restart = snapshot + replay); `0` never snapshots, so a restart replays the whole log from genesis |
+| `--receipt-ring` | 200,000 | most-recent receipts kept in memory for `eth_getTransactionReceipt`; `0` keeps none |
 | `--chain-id` | 1338 | |
 
 Genesis is a pure function of chain id + fund file, so every node in a fleet
 must be started with the same fund file.
+
+`--receipt-ring` is pure RSS, and the price scales with fan-out: receipts are
+derived, never persisted, and nothing but `eth_getTransactionReceipt` reads
+them. One receipt is 96 B plus 64 B per non-zero output — ~160 B at N=1 but
+~6.4 KB at N=100, so the 200,000 default costs ~32 MB on single payments and
+**~1.3 GB** at N=100. A validator under a fan-out load that nobody queries
+receipts from should set it well below the default (or to `0`).
 
 `LEAN_PARALLEL_RECOVERY=0` turns off rayon-parallel signature recovery
 (default on; `=0` is the measured-slower serial path).
