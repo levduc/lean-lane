@@ -150,3 +150,26 @@ async fn staged_entry_survives_an_unrelated_head_move() {
     assert_eq!(n.block_wire_bytes_by_commitment(ca).await.unwrap(), Some(wa));
     assert!(matches!(n.shim_new_by_commitment(ca).await, Err(_) | Ok(NewBlockOutcome::Syncing { .. })));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn anchoring_a_staged_block_never_scans_the_log() {
+    // The decide anchor is the hot path: it must resolve from the staged copy
+    // and never fall into the bounded backward log scan (which reads and
+    // hashes up to 1024 blocks and was measured to grow ~1.1 ms per block of
+    // history when it ran on every decide).
+    use std::sync::atomic::Ordering;
+    let dir = tempfile::tempdir().unwrap();
+    let n = node(dir.path());
+    for nonce in 0..3 {
+        seed_and_submit(&n, 6, nonce, 2).await;
+        let (head_c, head_n, ts) = *n.head.lock().await;
+        let (c, wire) = n.shim_build(head_c, head_n + 1, ts + 1000, 1_000_000).await.unwrap();
+        assert_eq!(n.stage_block(&wire).await.unwrap(), StageOutcome::Staged(c));
+        assert_eq!(n.shim_new_by_commitment(c).await.unwrap(), NewBlockOutcome::Valid(c));
+    }
+    assert_eq!(n.stats.log_scans.load(Ordering::Relaxed), 0, "anchor path must not scan the log");
+    // and the idempotent re-anchor of a canonical block is index-only too
+    let head_c = n.head.lock().await.0;
+    assert_eq!(n.shim_new_by_commitment(head_c).await.unwrap(), NewBlockOutcome::Valid(head_c));
+    assert_eq!(n.stats.log_scans.load(Ordering::Relaxed), 0);
+}

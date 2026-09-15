@@ -79,6 +79,8 @@ pub struct Stats {
     pub announces_rx: AtomicU64,
     pub announces_known: AtomicU64,
     pub block_pulls: AtomicU64,
+    /// backward log scans started by `locate_by_commitment` (must stay 0 on the anchor path)
+    pub log_scans: AtomicU64,
 }
 
 pub struct LaneNode {
@@ -716,7 +718,14 @@ impl LaneNode {
     /// apply from our staged/queued copy, else fetch the bytes from a peer by
     /// commitment, else SYNCING.
     pub async fn shim_new_by_commitment(&self, c: B256) -> Result<NewBlockOutcome, String> {
-        if self.locate_by_commitment(c).await?.is_some() {
+        // Idempotency check against the in-process index ONLY. The block being
+        // decided is by definition not canonical yet, so a miss here is the
+        // normal case; running the bounded backward log scan for it cost one
+        // full-chain read+hash per decide (measured: +1.1 ms per block of
+        // history, 331 ms at height 300) and collapsed cadence. A canonical
+        // block older than the index still anchors correctly through the
+        // bytes path below (known-height comparison in shim_new).
+        if self.by_commitment.lock().await.contains_key(&c) {
             return Ok(NewBlockOutcome::Valid(c));
         }
         if let Some(bytes) = self.block_wire_bytes_by_commitment(c).await? {
@@ -873,6 +882,7 @@ impl LaneNode {
         const SCAN_LIMIT: u64 = 1024;
         let head_n = self.head.lock().await.1;
         let floor = head_n.saturating_sub(SCAN_LIMIT).max(1);
+        self.stats.log_scans.fetch_add(1, Ordering::Relaxed);
         for n in (floor..=head_n).rev() {
             let Some(b) = self.log.lock().await.read_block(n).map_err(|e| e.to_string())? else {
                 continue;
@@ -896,16 +906,15 @@ impl LaneNode {
         &self,
         c: B256,
     ) -> Result<Option<Vec<u8>>, String> {
-        if let Some(wire) = self.locate_by_commitment(c).await? {
-            return Ok(Some(wire));
-        }
+        // Staged and queued copies are exactly what the decide anchor asks for;
+        // check them before anything that can touch the log.
         if let Some((_, e)) = self.staged.lock().await.iter().find(|(k, _)| *k == c) {
             return Ok(Some(e.wire.clone()));
         }
         if let Some(b) = self.sync_queue.lock().await.values().find(|b| b.commitment == c) {
             return Ok(Some(b.to_wire_bytes()));
         }
-        Ok(None)
+        self.locate_by_commitment(c).await
     }
 
     pub async fn receipt(&self, hash: B256) -> Option<LeanReceipt> {
