@@ -400,6 +400,13 @@ mod tests {
     /// header paired with a DIFFERENT body must be refused, or the decode
     /// mints a block whose commitment does not bind its content (appendable,
     /// then torn on the next replay).
+    ///
+    /// Debug-only, because the guard is: the recompute is a full keccak over
+    /// the body (2.5 MB on the fleet, ~1 per stage on the consensus critical
+    /// path), which is precisely the cost `from_wire_bytes_with_header` exists
+    /// to avoid — so it stays `cfg!(debug_assertions)` and this test compiles
+    /// out of `cargo test --release` rather than failing there.
+    #[cfg(debug_assertions)]
     #[test]
     fn a_header_from_a_different_body_is_rejected() {
         let parent = B256::repeat_byte(0x11);
