@@ -41,11 +41,24 @@ pub struct Config {
     pub datadir: PathBuf,
     pub chain_id: u64,
     pub budget_gas: u64,
+    /// Blocks between full state snapshots. **0 means NEVER snapshot** — the
+    /// node then recovers by replaying the whole log from genesis, which is
+    /// what a short-lived test or a throwaway datadir wants. Any other value
+    /// is a modulus (see `snapshot_due`).
     pub snapshot_every: u64,
     pub beneficiary: Address,
     pub receipt_ring: usize,
     /// Other lean nodes' RPC urls (backfill source + push-on-append targets).
     pub peers: Vec<String>,
+}
+
+impl Config {
+    /// Is block `number` a snapshot point? `snapshot_every == 0` disables
+    /// snapshots entirely rather than panicking on `% 0`, which is what both
+    /// append paths used to do the first time they committed a block.
+    pub fn snapshot_due(&self, number: u64) -> bool {
+        self.snapshot_every != 0 && number % self.snapshot_every == 0
+    }
 }
 
 impl Default for Config {
@@ -744,7 +757,7 @@ impl LaneNode {
             self.provider.upsert(*a, state.get(a));
         }
         self.provider.set_head(block.number);
-        let snapshot_due = block.number % self.cfg.snapshot_every == 0;
+        let snapshot_due = self.cfg.snapshot_due(block.number);
         let (digest_state, commitment) = (snapshot_due.then(|| state.clone()), block.commitment);
         // pool re-base info: post-block (nonce, balance) of every touched
         // account — without this the pool never learns mined nonces are
@@ -1192,7 +1205,7 @@ impl LaneNode {
             self.provider.upsert(*a, *acct);
         }
         self.provider.set_head(block.number);
-        let snapshot_due = block.number % self.cfg.snapshot_every == 0;
+        let snapshot_due = self.cfg.snapshot_due(block.number);
         let (digest_state, commitment) = (snapshot_due.then(|| state.clone()), block.commitment);
         drop(state);
         add_ns(&tm.apply_ns, t_apply);

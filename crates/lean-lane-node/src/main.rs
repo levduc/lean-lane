@@ -1,9 +1,13 @@
 //! Lean lane node binary.
 //!
 //!   lean-lane-node run   [--datadir D] [--port P] [--block-ms T] [--budget-gas G]
-//!                        [--snapshot-every K] [--chain-id C]
+//!                        [--snapshot-every K] [--receipt-ring N] [--chain-id C]
 //!   lean-lane-node bench [--txs M] [--mix 1,10,100] [--block-ms T] [--budget-gas G]
 //!                        [--datadir D]
+//!
+//! `--snapshot-every 0` means NEVER snapshot (recovery then replays the whole
+//! log from genesis). `--receipt-ring N` caps the in-memory receipt ring; 0
+//! keeps no receipts at all (`eth_getTransactionReceipt` answers null).
 //!
 //! `bench` is the 2b' gate: generate M fan-out txs (mixed N), submit through
 //! the REAL RPC batch endpoint into the REAL reth pool, drive the

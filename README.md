@@ -72,7 +72,7 @@ rustc than the pin — keep the lock).
 | `--peers` | none | other lean nodes — gossip on append, and the backfill source when this node is behind |
 | `--fund-file` / `--fund-balance` | none / 1e15 | addresses funded at genesis; must be exactly the accounts the spammer signs with (derivation `m/44'/60'/1'/0/i` — note the `1'`) |
 | `--budget-gas` | 150,000,000 | self-drive block budget (the shim passes its own per call) |
-| `--snapshot-every` | 1024 | blocks between state snapshots (restart = snapshot + replay) |
+| `--snapshot-every` | 1024 | blocks between state snapshots (restart = snapshot + replay); `0` never snapshots, so a restart replays the whole log from genesis |
 | `--chain-id` | 1338 | |
 
 Genesis is a pure function of chain id + fund file, so every node in a fleet

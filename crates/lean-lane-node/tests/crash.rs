@@ -3,7 +3,7 @@
 //! prefix.
 
 use alloy_primitives::Address;
-use lean_lane_node::node::{Config, LaneNode};
+use lean_lane_node::node::{Config, LaneNode, NewBlockOutcome};
 use lean_lane_node::state::Acct;
 use lean_native::envelope::{current_lane_domain, LeanSigned};
 use lean_native::{lean_fee, LeanTx, Output, AMOUNT_UNIT};
@@ -208,4 +208,61 @@ async fn a_snapshot_ahead_of_the_log_falls_back_instead_of_leaving_a_hole() {
     n2.produce_block(3_000).await.unwrap().unwrap();
     assert_eq!(n2.head.lock().await.1, 4);
     assert!(n2.log.lock().await.read_block(4).unwrap().is_some(), "4 is in the log now");
+}
+
+/// `--snapshot-every 0` is the natural way to say "never snapshot", and both
+/// append paths took `block.number % self.cfg.snapshot_every` unguarded: the
+/// node panicked with a divide-by-zero on the FIRST block it committed. Zero
+/// now means never, so recovery replays the whole log from genesis.
+///
+/// Both `% 0` sites are driven here: `commit_block` (the by-bytes / self-drive
+/// path) and `promote_staged` (the vote-gap anchor).
+#[tokio::test(flavor = "multi_thread")]
+async fn snapshot_every_zero_never_snapshots_and_never_panics() {
+    let dir = tempfile::tempdir().unwrap();
+    let head;
+    {
+        let node = make_node(dir.path(), 0).await;
+        drive(&node, 12, 3).await; // 4 blocks through `commit_block`
+        assert_eq!(node.head.lock().await.1, 4);
+
+        // ...and one through `promote_staged`
+        let domain = current_lane_domain();
+        let signed = LeanSigned::new(LeanTx::sign(
+            0,
+            vec![Output { to: Address::with_last_byte(9), amount: 5 }],
+            &sk(999),
+            &domain,
+        ));
+        let sender = signed.tx().recover_sender(&domain).unwrap();
+        node.seed_account(sender, Acct { nonce: 0, balance: lean_fee(1) + 5 * AMOUNT_UNIT }).await;
+        node.submit_raw(signed.raw()).await.unwrap();
+        let (hc, hn, ts) = *node.head.lock().await;
+        let (c, _) = node.shim_build(hc, hn + 1, ts + 1_000, 150_000_000).await.unwrap();
+        assert_eq!(node.shim_new_by_commitment(c).await.unwrap(), NewBlockOutcome::Valid(c));
+        assert_eq!(node.stats.promoted.load(std::sync::atomic::Ordering::Relaxed), 1);
+        head = *node.head.lock().await;
+        assert_eq!(head.1, 5);
+    }
+
+    let snaps: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("snapshot-"))
+        .collect();
+    assert!(snaps.is_empty(), "snapshot_every 0 still wrote {snaps:?}");
+
+    // Recovery is a full replay from genesis. (The pre-block `seed_account`
+    // funding is NOT in the log, so the replayed txs are no-ops and the state
+    // is legitimately different — the documented "unsnapshotted seeds diverge"
+    // gotcha. The chain itself is what this asserts.)
+    let (n2, report) = LaneNode::open(Config {
+        datadir: dir.path().to_path_buf(),
+        snapshot_every: 0,
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(report.snapshot_number, 0, "no snapshot to start from");
+    assert_eq!(report.replayed_blocks, 5, "the whole log replays");
+    assert_eq!(*n2.head.lock().await, head);
 }
