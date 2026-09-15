@@ -92,6 +92,10 @@ async fn run(args: &[String]) -> eyre::Result<()> {
              peers backfill it and the CL certificate binds the bytes, so no fork)"
         );
     }
+    // Pin the monotonic origin for every `t_in=` field BEFORE the open, so
+    // the per-call lines are stamped against process start rather than
+    // against whenever the first RPC happened to arrive.
+    lean_lane_node::node::node_start();
     let (node, rec) = LaneNode::open(cfg)?;
     let node = Arc::new(node);
     node.spawn_sync();

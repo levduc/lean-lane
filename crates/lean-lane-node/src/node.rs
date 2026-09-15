@@ -118,6 +118,16 @@ pub struct Stats {
     /// trip that did not happen. Read it next to `path=staged` +
     /// `wait_inflight_ms>0` in the `lean_anchor` line.
     pub stage_race_waits: AtomicU64,
+    /// Anchors that sat out the COLD grace (`await_anchor_grace`) because the
+    /// stage had not even arrived, and were rewarded: a claim or a staged
+    /// entry for exactly that commitment appeared inside the window, so the
+    /// block was promoted locally instead of pulled from a peer.
+    pub anchor_grace_hits: AtomicU64,
+    /// Anchors that sat out the whole cold grace and still found nothing —
+    /// `LEAN_ANCHOR_GRACE_MS` added to a peer pull (or a SYNCING) that was
+    /// going to happen anyway. Read as a ratio against `anchor_grace_hits`:
+    /// that is what says whether the grace is paying for itself.
+    pub anchor_grace_misses: AtomicU64,
     /// last-block service times (ns) for build / stage / append. The running
     /// totals above answer "per output over the whole run"; these answer "is
     /// this node slower NOW than it was ten minutes ago", which is the only
@@ -161,6 +171,53 @@ pub fn stage_race_ms() -> u64 {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(40)
     })
+}
+
+/// `LEAN_ANCHOR_GRACE_MS` (default 60, read once). How long an
+/// `arc_newBlock{commitment}` that holds none of the block waits for an
+/// `arc_stageBlock` which has NOT EVEN ARRIVED yet (see `await_anchor_grace`).
+/// `0` disables it and leaves only the two warmer graces — the in-flight claim
+/// wait and `LEAN_STAGE_RACE_MS` — which is the pre-2026-09-15 behaviour.
+///
+/// WHY a third, colder grace (measured on the 4-validator fleet, 450 M budget,
+/// 2.5 MB / 863-tx blocks): anchor paths staged 514, **peer 515**, index 286,
+/// with `stage_race_waits=2`. So the in-flight wait almost never engaged —
+/// when the anchor landed, the stage for that block had not reached the node
+/// at all: nothing staged, nothing claimed, `stage_pending` zero. The CL
+/// spawns the stage fire-and-forget and that task must base64+JSON-encode a
+/// 2.5 MB body before it hits the wire, while the anchor is a tiny awaited
+/// request issued ~15 ms later; over a LAN the small request wins the race.
+/// Loopback never showed it because encode + localhost are both fast.
+///
+/// 60 ms is sized off that gap (encode + send of 2.5 MB, minus the ~15 ms head
+/// start the anchor gives away). The alternative on a miss is a 200-250 ms
+/// peer round trip on the consensus critical path, so the grace stays cheap
+/// even when it expires.
+pub fn anchor_grace_ms() -> u64 {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        std::env::var("LEAN_ANCHOR_GRACE_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(60)
+    })
+}
+
+/// The node's start instant, pinned the first time anything asks for it (the
+/// binary touches it in `main` before the RPC server binds, so `t_in` really
+/// is "ms since node start"). One monotonic origin for every per-call line.
+pub fn node_start() -> Instant {
+    static T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    *T0.get_or_init(Instant::now)
+}
+
+/// `t_in=` — milliseconds from `node_start()` to `t`, i.e. WHEN this call
+/// arrived rather than how long it took. It is what makes the stage-vs-anchor
+/// arrival gap measurable offline: `lean_stage t_in=` minus the `lean_anchor
+/// t_in=` of the same height is exactly the race this node keeps losing, and
+/// no in-call duration can show it.
+pub fn since_start_ms(t: Instant) -> f64 {
+    t.saturating_duration_since(node_start()).as_secs_f64() * 1_000.0
 }
 
 /// `LEAN_STATS=1` (read once). Gates every per-call timing line.
@@ -234,6 +291,11 @@ pub struct AnchorTimer {
     pub locate_ns: AtomicU64,
     /// The peer `arc_getBlockBytes{commitment}` round trip (`path=peer`).
     pub peer_ns: AtomicU64,
+    /// Every wait this anchor spent on a stage of the SAME block: the
+    /// in-flight claim's watch channel, the `LEAN_STAGE_RACE_MS` grace, and
+    /// the cold `LEAN_ANCHOR_GRACE_MS` grace. They are one number because
+    /// they answer one question — how much of this height went on waiting for
+    /// work already under way here rather than pulling it from a peer.
     pub wait_inflight_ns: AtomicU64,
     pub lock_ns: AtomicU64,
     pub apply_ns: AtomicU64,
@@ -277,7 +339,7 @@ impl AnchorTimer {
                 "locate_ms={:.2} peer_ms={:.2} wait_inflight_ms={:.2} ",
                 "lock_ms={:.2} apply_ms={:.2} append_ms={:.2} fsync_ms={:.2} ",
                 "index_ms={:.2} announce_ms={:.2} rss_mb={} ",
-                "decode_ms={:.2} pool_ms={:.2}",
+                "decode_ms={:.2} pool_ms={:.2} t_in={:.1}",
             ),
             self.number.load(Ordering::Relaxed),
             PATH_NAMES[self.path.load(Ordering::Relaxed) as usize % PATH_NAMES.len()],
@@ -295,6 +357,7 @@ impl AnchorTimer {
             rss_mb(),
             g(&self.decode_ns),
             g(&self.pool_ns),
+            since_start_ms(t0),
         )
     }
 }
@@ -1011,6 +1074,11 @@ impl LaneNode {
             q.pop_front();
         }
         q.push_back((commitment, entry));
+        drop(q);
+        // wake an anchor sitting in `await_anchor_grace` for exactly this
+        // commitment: a staged entry carries no claim, so the staged map is
+        // the only evidence it will ever see.
+        self.stage_notify.notify_waiters();
     }
 
     /// Is `commitment` already staged against `head_c`? Used to make a second
@@ -1152,6 +1220,19 @@ impl LaneNode {
     /// the head must equal for the stage to proceed, so the retention sweeps
     /// (`retain(|_, (p, _)| *p == new_head)`) see exactly what they saw before.
     pub async fn stage_block(&self, bytes: &[u8]) -> Result<StageOutcome, String> {
+        self.stage_block_at(bytes, Instant::now()).await
+    }
+
+    /// As above, with the RPC handler's ENTRY instant (see `shim_new_at`):
+    /// `t_in` in the `lean_stage` line is taken from it, so the line reports
+    /// when the stage REACHED this node — before the JSON parse and the
+    /// base64 decode of the ~3 MB body, which is exactly the part of the
+    /// stage-vs-anchor race that happens outside this function.
+    pub async fn stage_block_at(
+        &self,
+        bytes: &[u8],
+        t_in: Instant,
+    ) -> Result<StageOutcome, String> {
         let t0 = Instant::now();
         let lock_ns = AtomicU64::new(0);
         let t_decode = Instant::now();
@@ -1205,7 +1286,7 @@ impl LaneNode {
             println!(
                 concat!(
                     "lean_stage n={} total_ms={:.2} decode_ms={:.2} ",
-                    "recover_ms={:.2} apply_ms={:.2} lock_ms={:.2} noop={}",
+                    "recover_ms={:.2} apply_ms={:.2} lock_ms={:.2} noop={} t_in={:.1}",
                 ),
                 number,
                 ms(stage_ns),
@@ -1214,6 +1295,7 @@ impl LaneNode {
                 ms(apply_ns),
                 ms(lock_ns.load(Ordering::Relaxed)),
                 u8::from(noop),
+                since_start_ms(t_in),
             );
         }
         Ok(outcome)
@@ -1758,6 +1840,123 @@ impl LaneNode {
         waited
     }
 
+    /// THE COLD GRACE (`LEAN_ANCHOR_GRACE_MS`). `await_stage_race` covers a
+    /// stage that is RUNNING or has ARRIVED; this covers the fleet's actual
+    /// case, where the stage has done NEITHER when the anchor lands — nothing
+    /// staged, nothing claimed, `stage_pending` zero — because the CL spawned
+    /// it fire-and-forget and it is still encoding 2.5 MB of base64 (see
+    /// `anchor_grace_ms`).
+    ///
+    /// Returns whether evidence of the stage appeared inside the window: a
+    /// claim on `c`, a staged entry for `c`, or simply a stage ARRIVING (then
+    /// `await_stage_race` takes over and waits it out properly). The caller
+    /// re-resolves locally on `true` and falls through to the peer pull on
+    /// `false`.
+    ///
+    /// THE LAGGARD. A node that is genuinely behind gets anchors for
+    /// commitments no stage of its own will ever produce, and it must not pay
+    /// the grace on every one of them. Two cheap reads say so — a non-empty
+    /// `sync_queue` (blocks waiting on a parent we lack) or a `sync_target`
+    /// above our head (the backfill is armed) — and both skip the grace
+    /// entirely, exactly as `LEAN_STAGE_RACE_MS` is skipped when no stage is
+    /// pending. A node that is behind WITHOUT either flag set (its CL parked,
+    /// or the first anchor after falling behind) still answers SYNCING/peer
+    /// as before, just up to `LEAN_ANCHOR_GRACE_MS` later — 60 ms on top of a
+    /// path that already costs 200-250 ms, and it re-converges by the same
+    /// route it always did.
+    async fn await_anchor_grace(&self, c: B256, tm: &AnchorTimer) -> bool {
+        let grace = std::time::Duration::from_millis(anchor_grace_ms());
+        if grace.is_zero() {
+            return false;
+        }
+        // behind the network: no stage of ours is coming for this commitment
+        let head_n = self.head.lock().await.1;
+        if self.sync_target.load(Ordering::Relaxed) > head_n
+            || !self.sync_queue.lock().await.is_empty()
+        {
+            return false;
+        }
+        let t_wait = Instant::now();
+        let hit = loop {
+            // A stage that has arrived at the RPC layer is enough: hand it to
+            // `await_stage_race`, whose job is precisely that window.
+            if self.stage_pending.load(Ordering::Relaxed) > 0 {
+                break true;
+            }
+            if self.inflight.lock().await.contains_key(&c) {
+                break true;
+            }
+            if self.staged.lock().await.iter().any(|(k, _)| *k == c) {
+                break true;
+            }
+            let left = grace.checked_sub(t_wait.elapsed()).unwrap_or_default();
+            if left.is_zero() {
+                break false;
+            }
+            // Bounded poll rather than a bare `notified()`: `stage_notify` is
+            // signalled on claim insert, on staged insert and when a pending
+            // stage returns, but one that fires between the checks above and
+            // this await would otherwise be lost — and missing one costs a
+            // 200 ms pull, which is the whole thing we are here to avoid.
+            let _ = tokio::time::timeout(
+                left.min(std::time::Duration::from_millis(2)),
+                self.stage_notify.notified(),
+            )
+            .await;
+        };
+        add_ns(&tm.wait_inflight_ns, t_wait);
+        let ctr = if hit {
+            &self.stats.anchor_grace_hits
+        } else {
+            &self.stats.anchor_grace_misses
+        };
+        ctr.fetch_add(1, Ordering::Relaxed);
+        hit
+    }
+
+    /// Re-resolve `c` from LOCAL sources only: wait out any in-flight stage of
+    /// it, re-read the commitment index, then `locate_wire` (staged -> sync
+    /// queue -> index -> bounded scan). `Ok(None)` means the block is still
+    /// nowhere in this process and the caller may spend a peer round trip.
+    ///
+    /// `always_locate` forces the `locate_wire` even when `await_stage_race`
+    /// waited on nothing. The hot path leaves it off on its second attempt —
+    /// no wait means nothing can have changed since the first locate, and one
+    /// locate per attempt is what keeps `log_scans` at 0 on the anchor path.
+    /// The cold-grace caller turns it on, because its evidence may be a STAGED
+    /// ENTRY, which carries no claim for `await_stage_race` to see.
+    async fn resolve_local(
+        &self,
+        c: B256,
+        tm: &AnchorTimer,
+        always_locate: bool,
+    ) -> Result<Option<NewBlockOutcome>, String> {
+        let waited = self.await_stage_race(c, tm).await;
+        if waited {
+            let known = { self.by_commitment.lock().await.get(&c).copied() };
+            if let Some(n) = known {
+                tm.number.store(n, Ordering::Relaxed);
+                tm.set_path(PATH_INDEX);
+                return Ok(Some(NewBlockOutcome::Valid(c)));
+            }
+        }
+        if !waited && !always_locate {
+            return Ok(None);
+        }
+        let t_locate = Instant::now();
+        let located = self.locate_wire(c, "new_block").await?;
+        add_ns(&tm.locate_ns, t_locate);
+        if let Some((bytes, src)) = located {
+            tm.set_path(match src {
+                "staged" => PATH_STAGED,
+                "queued" => PATH_QUEUED,
+                _ => PATH_INDEX,
+            });
+            return self.shim_new_inner(&bytes, tm).await.map(Some);
+        }
+        Ok(None)
+    }
+
     async fn new_by_commitment_inner(
         &self,
         c: B256,
@@ -1785,47 +1984,22 @@ impl LaneNode {
         // Wait for that result instead of queueing our own `state` and `log`
         // locks behind it: if it was a commit, the block is canonical and this
         // anchor is an idempotent VALID; if it was a staging, `locate_wire`
-        // below finds the staged entry instead of falling through to a peer
-        // fetch.
-        if self.await_stage_race(c, tm).await {
-            let known = { self.by_commitment.lock().await.get(&c).copied() };
-            if let Some(n) = known {
-                tm.number.store(n, Ordering::Relaxed);
-                tm.set_path(PATH_INDEX);
-                return Ok(NewBlockOutcome::Valid(c));
-            }
-        }
-        let t_locate = Instant::now();
-        let located = self.locate_wire(c, "new_block").await?;
-        add_ns(&tm.locate_ns, t_locate);
-        if let Some((bytes, src)) = located {
-            tm.set_path(match src {
-                "staged" => PATH_STAGED,
-                "queued" => PATH_QUEUED,
-                _ => PATH_INDEX,
-            });
-            return self.shim_new_inner(&bytes, tm).await;
+        // finds the staged entry instead of falling through to a peer fetch.
+        if let Some(o) = self.resolve_local(c, tm, true).await? {
+            return Ok(o);
         }
         // LAST CHANCE before spending 200-250 ms on a peer: a stage may have
         // registered while we ran `locate_wire`. Same bounded wait, then one
         // more locate — still cheaper than the round trip it replaces.
-        if self.await_stage_race(c, tm).await {
-            let known = { self.by_commitment.lock().await.get(&c).copied() };
-            if let Some(n) = known {
-                tm.number.store(n, Ordering::Relaxed);
-                tm.set_path(PATH_INDEX);
-                return Ok(NewBlockOutcome::Valid(c));
-            }
-            let t_locate = Instant::now();
-            let located = self.locate_wire(c, "new_block").await?;
-            add_ns(&tm.locate_ns, t_locate);
-            if let Some((bytes, src)) = located {
-                tm.set_path(match src {
-                    "staged" => PATH_STAGED,
-                    "queued" => PATH_QUEUED,
-                    _ => PATH_INDEX,
-                });
-                return self.shim_new_inner(&bytes, tm).await;
+        if let Some(o) = self.resolve_local(c, tm, false).await? {
+            return Ok(o);
+        }
+        // ...and the fleet's real case: the stage has not ARRIVED yet, so
+        // neither wait above had anything to wait on. Sit out the cold grace
+        // and re-resolve once if it pays off (see `await_anchor_grace`).
+        if self.await_anchor_grace(c, tm).await {
+            if let Some(o) = self.resolve_local(c, tm, true).await? {
+                return Ok(o);
             }
         }
         let t_peer = Instant::now();
@@ -2145,11 +2319,12 @@ impl LaneNode {
                 Err(_) => "error",
             };
             println!(
-                "lean_locate caller={} hit={} scanned={} ms={:.2}",
+                "lean_locate caller={} hit={} scanned={} ms={:.2} t_in={:.1}",
                 caller,
                 hit,
                 scanned,
                 ms(t0.elapsed().as_nanos() as u64),
+                since_start_ms(t0),
             );
         }
         r
@@ -2204,7 +2379,7 @@ impl LaneNode {
                 "lean_stats head={} accounts={} staged={} ",
                 "sync_queue={} by_commitment={} scan_misses={} log_scans={} ",
                 "announce_skipped_staged={} backfill_pulls={} ",
-                "stage_race_waits={} ",
+                "stage_race_waits={} anchor_grace_hits={} anchor_grace_misses={} ",
                 "pool={} build_ms_last={:.1} stage_ms_last={:.1} ",
                 "append_ms_last={:.1} rss_mb={}",
             ),
@@ -2218,6 +2393,8 @@ impl LaneNode {
             s.announce_skipped_staged.load(Ordering::Relaxed),
             s.backfill_pulls.load(Ordering::Relaxed),
             s.stage_race_waits.load(Ordering::Relaxed),
+            s.anchor_grace_hits.load(Ordering::Relaxed),
+            s.anchor_grace_misses.load(Ordering::Relaxed),
             pending,
             ms(s.build_ns_last.load(Ordering::Relaxed)),
             ms(s.stage_ns_last.load(Ordering::Relaxed)),

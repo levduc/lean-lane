@@ -197,10 +197,12 @@ async fn stats_line_carries_every_growth_field() {
     assert!(line.starts_with("lean_stats "), "{line}");
     assert_eq!(
         line.split_whitespace().count(),
-        16,
+        18,
         "one key per field: {line}"
     );
     for key in [
+        "anchor_grace_hits=",
+        "anchor_grace_misses=",
         "head=",
         "accounts=",
         "staged=",
@@ -278,6 +280,10 @@ fn anchor_line_carries_every_timing_field() {
         "rss_mb=",
         "decode_ms=",
         "pool_ms=",
+        // `t_in=` (2026-09-15): WHEN the call arrived, ms since node start, on
+        // the same monotonic clock as `lean_stage`/`lean_locate`. No in-call
+        // duration can show the stage-vs-anchor ARRIVAL gap; this can.
+        "t_in=",
     ] {
         assert!(
             line.contains(key),

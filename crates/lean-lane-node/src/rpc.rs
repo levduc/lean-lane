@@ -168,6 +168,7 @@ pub fn module(node: Arc<LaneNode>) -> RpcModule<Arc<LaneNode>> {
         // FIRST statement in the handler — see `StagePending`. Everything
         // below it (param parse, base64 decode of ~3 MB) is the window in
         // which the node knows a stage is coming but not yet which block.
+        let t_entry = std::time::Instant::now();
         let _pending = StagePending::new(&node);
         let p: NewBlockParams = params.parse()?;
         let block_bytes = p
@@ -176,7 +177,7 @@ pub fn module(node: Arc<LaneNode>) -> RpcModule<Arc<LaneNode>> {
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(&block_bytes)
             .map_err(|e| err(e.to_string()))?;
-        match node.stage_block(&bytes).await.map_err(err)? {
+        match node.stage_block_at(&bytes, t_entry).await.map_err(err)? {
             crate::node::StageOutcome::Staged(commitment) => Ok::<_, ErrorObjectOwned>(
                 json!({ "status": "STAGED", "commitment": format!("{commitment}") }),
             ),

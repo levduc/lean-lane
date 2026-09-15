@@ -226,25 +226,24 @@ async fn anchor_waits_for_a_stage_that_has_not_registered_yet() {
     assert!(n.inflight.lock().await.is_empty());
 }
 
-/// The grace is gated on `stage_pending`: with no stage in flight a
-/// by-commitment anchor for a block we simply do not have must fall through to
-/// SYNCING immediately, not sit out `LEAN_STAGE_RACE_MS`. Otherwise every
-/// genuine backfill would pay the grace on top of its pull.
+/// THIS grace is gated on `stage_pending`: with no stage in flight a
+/// by-commitment anchor must not sit out `LEAN_STAGE_RACE_MS`, or every
+/// genuine backfill would pay it on top of its pull.
+///
+/// The anchor does still wait here — for `LEAN_ANCHOR_GRACE_MS`, the COLD
+/// grace added later for the case where the stage has not even arrived (see
+/// `anchor_grace.rs`). What this test gates is that `stage_race_waits` stays
+/// at zero: the two graces are separate windows with separate counters, and
+/// the warm one must not fire on an empty node.
 #[tokio::test(flavor = "multi_thread")]
-async fn no_stage_pending_means_no_wait() {
+async fn no_stage_pending_means_no_stage_race_wait() {
     let dir = tempfile::tempdir().unwrap();
     let n = node(dir.path());
-    let t = std::time::Instant::now();
     let r = n
         .shim_new_by_commitment(B256::repeat_byte(0xab))
         .await
         .unwrap();
     assert!(matches!(r, NewBlockOutcome::Syncing { head: 0 }));
-    assert!(
-        t.elapsed() < Duration::from_millis(30),
-        "took {:?}",
-        t.elapsed()
-    );
     assert_eq!(n.stats.stage_race_waits.load(Ordering::Relaxed), 0);
 }
 
@@ -316,11 +315,13 @@ async fn a_failed_stage_leaves_no_claim() {
     assert!(n.inflight.lock().await.is_empty());
     assert!(n.staged.lock().await.is_empty());
 
+    // (the anchor still sits out the COLD `LEAN_ANCHOR_GRACE_MS` here — no
+    // stage is coming, but it cannot know that; see `anchor_grace.rs`)
     let t = std::time::Instant::now();
     let r = n.shim_new_by_commitment(orphan.commitment).await.unwrap();
     assert!(matches!(r, NewBlockOutcome::Syncing { head: 0 }));
     assert!(
-        t.elapsed() < Duration::from_millis(30),
+        t.elapsed() < Duration::from_millis(500),
         "took {:?}",
         t.elapsed()
     );
