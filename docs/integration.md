@@ -69,10 +69,13 @@ lane.
 | decide (anchor) | `arc_newBlock(decided bytes)` | wait-and-poll up to 30 s (SYNCING-aware); the returned commitment must equal the certificate's lean commitment (it is recomputed locally, so a mismatch is a bug, not an attack) |
 | decide (v0.2) | `arc_newBlock{commitment = EVM header prev_randao}` | the node holds the bytes (staged at validation); the CL carries none |
 | sync serve | `arc_getBlockBytes(number)` | re-framed with the EVM payload; verified against the height's certificate before it is sent |
+| sync serve (v0.2) | `arc_getBlockBytes{commitment = EVM header prev_randao}` | no number mapping and no scan: the header names the block. The CL recomputes the commitment from the bytes and checks it against the header before framing them; a height this node cannot answer is skipped and a peer serves it |
 | sync receive | same as validate, then `arc_newBlock` | |
 
-Certificate: `value_id = keccak(evm_block_hash ‖ lean_commitment)`; without a
-lean payload `value_id = evm_block_hash` (stock).
+Certificate: v0.1 `value_id = keccak(evm_block_hash ‖ lean_commitment)`; without
+a lean payload `value_id = evm_block_hash` (stock). v0.2 votes the plain EVM
+block hash always — the lean block is bound by the header's `prev_randao`
+instead, so the value id is upstream's.
 
 **Transient errors.** Every verb retries transport errors for ~15 s (30 × 500 ms,
 covers a node restart with snapshot replay). Past that the CL treats the node as

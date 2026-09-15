@@ -860,7 +860,11 @@ impl LaneNode {
     /// `scan_misses` so a repeated unknown commitment costs one hash check
     /// instead of another full scan.
     async fn locate_by_commitment(&self, c: B256) -> Result<Option<Vec<u8>>, String> {
-        if let Some(n) = self.by_commitment.lock().await.get(&c).copied() {
+        // Drop the index guard BEFORE reading the log: `block_wire_bytes`
+        // awaits the log lock, and holding the commitment index across that
+        // await serialises every other lookup behind one disk read.
+        let hit = { self.by_commitment.lock().await.get(&c).copied() };
+        if let Some(n) = hit {
             return self.block_wire_bytes(n).await;
         }
         if self.scan_misses.lock().await.contains(&c) {
