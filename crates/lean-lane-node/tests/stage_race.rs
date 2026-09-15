@@ -498,3 +498,77 @@ async fn a_conflicting_block_at_a_known_height_is_still_an_error() {
     assert_eq!(records_on_disk(dir.path()), 1, "the fork was not appended");
     assert_eq!(n.head.lock().await.0, c1);
 }
+
+// ---------------------------------------------------------------------------
+// (head, state) atomicity: a staged entry's parent and its post-state
+// ---------------------------------------------------------------------------
+
+/// THE ATOMICITY GATE. `stage_claimed` read the head in one critical section
+/// and cloned the state in another. A commit landing in between produced an
+/// entry whose `staged_parent` was the OLD head and whose post-state was built
+/// on the NEW one — a block executed against a parent it does not descend
+/// from, kept in the staged map and servable by commitment. The pairing is
+/// exactly what `promote_staged` trusts instead of re-executing.
+///
+/// Driven deterministically: the stage is parked on the `staged` lock, which
+/// its already-staged probe takes and which sits precisely between the head
+/// read and the state clone. The commit that advances the head past it is a
+/// self-driven `produce_block`, NOT `shim_new` — `shim_new` takes the `staged`
+/// lock before it commits anything and would park alongside the stage, while
+/// `commit_block` takes it only in its retention sweep, after the head write.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_commit_between_the_head_read_and_the_state_clone_stages_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let n = node(dir.path());
+    // B: a child of genesis assembled off the head, never through the pool
+    let (cb, wb) = wire_head_plus_one(&n, 1_000, 4).await;
+    // A: a DIFFERENT child of genesis, driven out of the pool
+    let a_tx = funded_tx(&n, 2_000, 0, 4).await;
+    n.submit_raw(&a_tx).await.unwrap();
+
+    // park whoever asks for `staged` next
+    let staged_guard = n.staged.lock().await;
+
+    let staging = {
+        let n = n.clone();
+        let wb = wb.clone();
+        tokio::spawn(async move { n.stage_block(&wb).await })
+    };
+    let mut claimed = false;
+    for _ in 0..400 {
+        if n.inflight.lock().await.contains_key(&cb) {
+            claimed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(claimed, "the stage never registered its claim");
+    // ...and is now past its head read, parked on `staged`
+    tokio::time::sleep(Duration::from_millis(25)).await;
+
+    let committer = {
+        let n = n.clone();
+        tokio::spawn(async move { n.produce_block(9_000).await })
+    };
+    let mut moved = false;
+    for _ in 0..400 {
+        if n.head.lock().await.1 == 1 {
+            moved = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(moved, "the commit never advanced the head");
+    drop(staged_guard);
+
+    assert_eq!(committer.await.unwrap().unwrap(), Some(1));
+    // the head moved under the stage: it must refuse, not stage a post-state
+    // of a parent it never re-checked
+    assert_eq!(staging.await.unwrap().unwrap(), StageOutcome::Syncing { head: 1 });
+    assert!(
+        !n.staged.lock().await.iter().any(|(c, _)| *c == cb),
+        "staged an entry whose post-state is not its parent's",
+    );
+    assert_eq!(n.head.lock().await.1, 1);
+    assert!(n.inflight.lock().await.is_empty());
+}

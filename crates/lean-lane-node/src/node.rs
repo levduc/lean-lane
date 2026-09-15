@@ -303,6 +303,28 @@ enum Link {
     AlreadyCanonical,
 }
 
+/// LOCK ORDER (the whole of it — audited 2026-09-15).
+///
+/// Almost every lock in this node is taken ALONE: acquired, used, dropped
+/// inside one statement or one short block, never while holding another. Two
+/// deliberate exceptions, and they agree:
+///
+///   1. `commit_gate` -> anything. `commit_block` and `promote_staged` hold
+///      the gate across the whole append (the linkage decision, the state
+///      write, the log append, the head write and the bookkeeping sweeps) and
+///      take `head`, `state`, `log`, `receipts`, `by_commitment`,
+///      `scan_misses`, `staged` and `inflight` under it — one at a time.
+///   2. `head` -> `state`, nested in the two staging paths (`stage_claimed`
+///      and `shim_build`) so that the head a staged entry names as its parent
+///      and the state it executes on are read ATOMICALLY. That is the same
+///      order (1) uses sequentially — head first, via `link_to_head`, then
+///      state — so the two cannot deadlock against each other.
+///
+/// Nothing anywhere takes `state` before `head`. The serving path
+/// (`locate_by_commitment`, `get_block_bytes`, `stats_line`) and admission
+/// take single locks only, and no lock is held across an await other than a
+/// lock acquisition — the `head` guard in (2) spans exactly the `state`
+/// acquire.
 pub struct LaneNode {
     pub cfg: Config,
     pub pool: LanePool,
@@ -990,21 +1012,32 @@ impl LaneNode {
         let block = LeanBlock::new(parent, number, timestamp_ms, raw);
         let commitment = block.commitment;
         let wire = block.to_wire_bytes();
-        // staged execution: full state copy (I1 simplicity; CoW is a later
-        // optimization) — proves the txs apply, commitment derives from content
-        let mut staged = self.state.lock().await.clone();
-        let outcome = apply_block(&mut staged, &items, number, self.cfg.beneficiary);
-        // Keep the result. Re-checking the head first: `head` was read before
-        // the state clone, so a block that landed in between would make
-        // `staged` a post-state of a DIFFERENT parent. `staged_parent` already
-        // stops such an entry from promoting, but an entry that can never
-        // promote is only a way to serve wrong bytes by commitment, so drop it.
+        // Staged execution against a full state copy (I1 simplicity; CoW is a
+        // later optimization) — proves the txs apply; the commitment derives
+        // from content alone and is returned either way.
+        //
+        // The head is re-read and the state cloned in ONE critical section
+        // (same lock order and for the same reason as `stage_claimed`): `head`
+        // was read at the top of this function, before the pool pick, so a
+        // block landing in between would otherwise make `staged` a post-state
+        // of a DIFFERENT parent than the `staged_parent` recorded with it. The
+        // post-hoc head check this replaces could only see a move that had
+        // already finished, never one racing the clone itself.
         let lock_ns = AtomicU64::new(0);
-        let still_head = timed_lock(&self.head, &lock_ns).await.0 == head_c;
-        if still_head && !self.already_staged(commitment, head_c, &lock_ns).await {
-            let entry =
-                self.staged_entry(block, wire.clone(), head_c, &items, &staged, outcome);
-            self.insert_staged(commitment, entry, &lock_ns).await;
+        let on_head = {
+            let head = timed_lock(&self.head, &lock_ns).await;
+            if head.0 == head_c {
+                Some(timed_lock(&self.state, &lock_ns).await.clone())
+            } else {
+                None
+            }
+        };
+        if let Some(mut staged) = on_head {
+            let outcome = apply_block(&mut staged, &items, number, self.cfg.beneficiary);
+            if !self.already_staged(commitment, head_c, &lock_ns).await {
+                let entry = self.staged_entry(block, wire.clone(), head_c, &items, &staged, outcome);
+                self.insert_staged(commitment, entry, &lock_ns).await;
+            }
         }
         let build_ns = t_build.elapsed().as_nanos() as u64;
         self.stats.build_ns.fetch_add(build_ns, Ordering::Relaxed);
@@ -1132,15 +1165,18 @@ impl LaneNode {
         t_decode: Instant,
         lock_ns: &AtomicU64,
     ) -> Result<(StageOutcome, u64, u64, u64, bool), String> {
-        let (head_c, head_n, _) = *timed_lock(&self.head, lock_ns).await;
-        if hdr.number != head_n + 1 || hdr.parent != head_c {
-            return Ok((StageOutcome::Syncing { head: head_n }, 0, 0, 0, false));
+        // PRELIMINARY head read: a cheap bail for a block that plainly does
+        // not connect. NOT the one the entry is built on — see the atomic read
+        // below.
+        let (head_c0, head_n0, _) = *timed_lock(&self.head, lock_ns).await;
+        if hdr.number != head_n0 + 1 || hdr.parent != head_c0 {
+            return Ok((StageOutcome::Syncing { head: head_n0 }, 0, 0, 0, false));
         }
         // Already staged against this head — our own `arc_buildBlock` result,
         // or a duplicate `arc_stageBlock`. A cheap no-op: the entry that is
         // there is a post-state of the same parent over the same bytes, so
         // re-executing would only pay ecrecover + a state clone to rebuild it.
-        if self.already_staged(hdr.commitment, head_c, lock_ns).await {
+        if self.already_staged(hdr.commitment, head_c0, lock_ns).await {
             let decode_ns = t_decode.elapsed().as_nanos() as u64;
             return Ok((StageOutcome::Staged(hdr.commitment), decode_ns, 0, 0, true));
         }
@@ -1155,9 +1191,39 @@ impl LaneNode {
         let t_recover = Instant::now();
         let items = decode_block_txs(&block.txs);
         let recover_ns = t_recover.elapsed().as_nanos() as u64;
-        // execute against a CLONE of the head state
+        // ATOMIC (head, state). A staged entry is a post-state PLUS the parent
+        // it claims to descend from, and promotion trusts that pairing rather
+        // than re-executing. Reading the head in one critical section and
+        // cloning the state in another let a commit land in between: the entry
+        // then carried the OLD head as `staged_parent` and the NEW head's
+        // state as its post-state — a block executed against a parent it does
+        // not descend from, kept in the staged map and servable by commitment.
+        //
+        // LOCK ORDER: `head` then `state`, nested here and only here. It is the
+        // order every committer already uses sequentially (`commit_gate` ->
+        // `link_to_head`'s head read -> `state`), and nothing anywhere takes
+        // `state` before `head`, so no cycle exists. The head guard spans
+        // exactly one await — acquiring `state` — and nothing else; the clone
+        // that follows was already paid under `state` alone, and a committer
+        // blocked on `head` here would block on `state` a line later anyway.
+        //
+        // The re-check is also the authoritative linkage test: the preliminary
+        // one above is only a fast bail.
         let t_apply = Instant::now();
-        let mut staged_state = timed_lock(&self.state, lock_ns).await.clone();
+        let (head_c, mut staged_state) = {
+            let head = timed_lock(&self.head, lock_ns).await;
+            let (head_c, head_n, _) = *head;
+            if block.number != head_n + 1 || block.parent != head_c {
+                return Ok((
+                    StageOutcome::Syncing { head: head_n },
+                    decode_ns,
+                    recover_ns,
+                    0,
+                    false,
+                ));
+            }
+            (head_c, timed_lock(&self.state, lock_ns).await.clone())
+        };
         let outcome = apply_block(&mut staged_state, &items, block.number, self.cfg.beneficiary);
         let commitment = block.commitment;
         let entry =
