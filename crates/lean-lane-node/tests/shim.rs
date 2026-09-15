@@ -153,7 +153,7 @@ async fn stats_line_carries_every_growth_field() {
     let line = n.stats_line().await;
     println!("{line}"); // visible with --nocapture: the line is read by humans
     assert!(line.starts_with("lean_stats "), "{line}");
-    assert_eq!(line.split_whitespace().count(), 13, "one key per field: {line}");
+    assert_eq!(line.split_whitespace().count(), 15, "one key per field: {line}");
     for key in [
         "head=",
         "accounts=",
@@ -162,6 +162,8 @@ async fn stats_line_carries_every_growth_field() {
         "by_commitment=",
         "scan_misses=",
         "log_scans=",
+        "announce_skipped_staged=",
+        "backfill_pulls=",
         "pool=",
         "build_ms_last=",
         "stage_ms_last=",

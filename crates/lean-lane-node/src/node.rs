@@ -79,6 +79,16 @@ pub struct Stats {
     pub announces_rx: AtomicU64,
     pub announces_known: AtomicU64,
     pub block_pulls: AtomicU64,
+    /// Announcements ignored because we ALREADY HOLD the block (staged for
+    /// the vote gap, a staging/commit in flight, or a staged entry at that
+    /// height): our own CL's anchor is milliseconds away, so pulling 2.5 MB
+    /// from the announcer only to promote the copy we already executed is
+    /// pure duplicate work on the consensus critical path.
+    pub announce_skipped_staged: AtomicU64,
+    /// Block-byte pulls made by the BACKFILL loop specifically. `block_pulls`
+    /// counts these AND the by-commitment anchor's peer fetch; this one is the
+    /// "are we pulling blocks we did not need" number.
+    pub backfill_pulls: AtomicU64,
     /// backward log scans started by `locate_by_commitment` (must stay 0 on the anchor path)
     pub log_scans: AtomicU64,
     /// last-block service times (ns) for build / stage / append. The running
@@ -88,6 +98,22 @@ pub struct Stats {
     pub build_ns_last: AtomicU64,
     pub stage_ns_last: AtomicU64,
     pub append_ns_last: AtomicU64,
+}
+
+/// `LEAN_ANNOUNCE_GRACE_MS` (default 250, read once). How long an announcement
+/// for head+1 that we do NOT already hold waits for our own CL to anchor that
+/// height before arming the backfill. It exists only for the node whose CL is
+/// parked or dead: on a healthy validator the anchor always wins this race, so
+/// the grace costs nothing and saves a 2.5 MB pull per announcing peer per
+/// height. `0` disables it (pull immediately, the pre-2026-09-15 behaviour).
+pub fn announce_grace_ms() -> u64 {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        std::env::var("LEAN_ANNOUNCE_GRACE_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(250)
+    })
 }
 
 /// `LEAN_STATS=1` (read once). Gates every per-call timing line.
@@ -996,40 +1022,111 @@ impl LaneNode {
             pos.map(|i| q.remove(i).unwrap().1)
         };
         let mut staged = take_staged().await;
+        // v1.3.1 + 2026-09-15: the COMMIT of a block is now an exclusive claim
+        // in `inflight`, taken get-or-insert under ONE guard, so two feeds of
+        // the same bytes (the backfill's pull and the CL's anchor racing for
+        // the same height) cannot both pass the parent-link check and append
+        // it twice. Whoever loses the claim waits for the winner's result —
+        // a bounded <=35 ms wait beats a ~230 ms redo — and then answers from
+        // whatever the winner produced (a staged entry to promote, or a
+        // canonical block to acknowledge).
+        let mut owner: Option<tokio::sync::watch::Sender<bool>> = None;
         if staged.is_none() {
-            // v1.3.1: an IN-FLIGHT staging for this commitment on this head?
-            // Await its completion (bounded guard) instead of re-executing.
-            let waiter = timed_lock(&self.inflight, &tm.lock_ns)
-                .await
-                .get(&commitment)
-                .filter(|(p, _)| *p == head_c)
-                .map(|(_, rx)| rx.clone());
-            if let Some(mut rx) = waiter {
+            // Two rounds: wait for whoever holds the claim, then TAKE IT OVER
+            // if it is still held. A holder that dies without signalling (a
+            // panicked stager — `dead_inflight_staging_never_wedges_newblock`)
+            // or one wedged past the guard must never cost us a block we can
+            // commit: the second round reproduces exactly the pre-claim
+            // behaviour of falling through to the full path.
+            const CLAIM_ROUNDS: usize = 2;
+            for round in 0..CLAIM_ROUNDS {
+                let (done_tx, done_rx) = tokio::sync::watch::channel(false);
+                let waiter = {
+                    let mut fl = timed_lock(&self.inflight, &tm.lock_ns).await;
+                    let held = fl.get(&commitment).map(|(_, rx)| rx.clone());
+                    match held {
+                        Some(rx) if round + 1 < CLAIM_ROUNDS => Some(rx),
+                        _ => {
+                            fl.insert(commitment, (head_c, done_rx));
+                            None
+                        }
+                    }
+                };
+                let Some(mut rx) = waiter else {
+                    owner = Some(done_tx);
+                    break;
+                };
                 let t_wait = Instant::now();
                 let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
                     while !*rx.borrow() {
                         if rx.changed().await.is_err() {
-                            break; // stager dropped (failed/panicked): fall through
+                            break; // owner dropped (failed/panicked): fall through
                         }
                     }
                 })
                 .await;
                 add_ns(&tm.wait_inflight_ns, t_wait);
+                // a STAGING finished: promote its entry (the v1.3.1 case)
                 staged = take_staged().await;
+                if staged.is_some() {
+                    break;
+                }
+                // a COMMIT finished: the block is ours already, anchoring it is
+                // a no-op. Answer VALID instead of appending it a second time.
+                let (head_c2, head_n2, _) = *timed_lock(&self.head, &tm.lock_ns).await;
+                if head_c2 == commitment
+                    || self.by_commitment.lock().await.get(&commitment) == Some(&number)
+                {
+                    tm.refine_path(PATH_INDEX);
+                    return Ok(NewBlockOutcome::Valid(commitment));
+                }
+                if number != head_n2 + 1 || block.parent != head_c2 {
+                    // head moved elsewhere while we waited: this no longer
+                    // connects, so queue it rather than commit off-chain
+                    {
+                        let mut q = timed_lock(&self.sync_queue, &tm.lock_ns).await;
+                        if q.len() < 512 {
+                            q.insert(block.parent, block);
+                        }
+                    }
+                    self.sync_notify.notify_one();
+                    return Ok(NewBlockOutcome::Syncing { head: head_n2 });
+                }
+                // still committable and the claim is free again: take it
             }
         }
         match staged {
             Some(entry) => {
                 debug_assert_eq!(entry.wire, bytes);
                 tm.refine_path(PATH_STAGED);
+                if let Some(done_tx) = owner.take() {
+                    // never happens (a claim is only taken when nothing is
+                    // staged), but leaving a claim behind would park the next
+                    // feed of these bytes for the full 2 s guard
+                    let _ = done_tx.send(true);
+                    timed_lock(&self.inflight, &tm.lock_ns).await.remove(&commitment);
+                }
                 self.promote_staged(entry, tm).await.map_err(|e| e.to_string())?;
             }
             None => {
+                let Some(done_tx) = owner else {
+                    // unreachable: the last claim round always takes the claim.
+                    // If it ever is reached, refusing is still safe — the CL
+                    // retries and the backfill re-delivers.
+                    let head_n = self.head.lock().await.1;
+                    return Ok(NewBlockOutcome::Syncing { head: head_n });
+                };
                 let t_recover = Instant::now();
                 let items = decode_block_txs(&block.txs);
                 add_ns(&tm.decode_ns, t_recover);
                 let evict = items.iter().map(|(_, _, h)| *h).collect();
-                self.commit_block(block, items, evict, tm).await.map_err(|e| e.to_string())?;
+                let r = self.commit_block(block, items, evict, tm).await;
+                // release the claim in BOTH outcomes: `commit_block`'s own
+                // retention sweep already drops the entry (its parent is the
+                // old head), but a failed commit never reaches that sweep.
+                let _ = done_tx.send(true);
+                timed_lock(&self.inflight, &tm.lock_ns).await.remove(&commitment);
+                r.map_err(|e| e.to_string())?;
             }
         }
         let t_ann = Instant::now();
@@ -1106,6 +1203,32 @@ impl LaneNode {
             tm.set_path(PATH_INDEX);
             return Ok(NewBlockOutcome::Valid(c));
         }
+        // A staging or a by-bytes COMMIT of exactly this block may be in
+        // flight (the gossip backfill and this anchor racing for the same
+        // height). Wait for that result instead of queueing our own `state`
+        // and `log` locks behind it: if it was a commit, the block is
+        // canonical and this anchor is an idempotent VALID; if it was a
+        // staging, `locate_wire` below now finds the staged entry instead of
+        // falling through to a peer fetch.
+        let waiter = { self.inflight.lock().await.get(&c).map(|(_, rx)| rx.clone()) };
+        if let Some(mut rx) = waiter {
+            let t_wait = Instant::now();
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while !*rx.borrow() {
+                    if rx.changed().await.is_err() {
+                        break; // owner dropped (failed/panicked): fall through
+                    }
+                }
+            })
+            .await;
+            add_ns(&tm.wait_inflight_ns, t_wait);
+            let known = { self.by_commitment.lock().await.get(&c).copied() };
+            if let Some(n) = known {
+                tm.number.store(n, Ordering::Relaxed);
+                tm.set_path(PATH_INDEX);
+                return Ok(NewBlockOutcome::Valid(c));
+            }
+        }
         let t_locate = Instant::now();
         let located = self.locate_wire(c, "new_block").await?;
         add_ns(&tm.locate_ns, t_locate);
@@ -1163,29 +1286,85 @@ impl LaneNode {
         }
     }
 
+    /// Do we already hold the announced block? Three ways, all hash lookups:
+    /// the exact commitment is STAGED (we validated and executed it for
+    /// consensus in the vote gap), a staging/commit for it is IN FLIGHT, or —
+    /// for the head+1 case — we hold *some* staged candidate at that height
+    /// (the announcer may be naming a different candidate for the height our
+    /// CL is about to anchor; either way the anchor, not a pull, settles it).
+    ///
+    /// No log read, no commitment resolve: the `announce_never_scans_the_log`
+    /// invariant holds.
+    async fn holds_announced(&self, commitment: B256, number: u64, head_n: u64) -> bool {
+        {
+            let q = self.staged.lock().await;
+            if q.iter().any(|(c, e)| {
+                *c == commitment || (number == head_n + 1 && e.block.number == number)
+            }) {
+                return true;
+            }
+        }
+        self.inflight.lock().await.contains_key(&commitment)
+    }
+
     /// Handle a peer's announcement: known -> ignore (the universal in-sync
-    /// case, zero further traffic); head+1 -> pull the block from peers (the
-    /// announcer is among them and provably has it); further ahead -> arm the
-    /// backfill (existing machinery).
+    /// case, zero further traffic); ALREADY HELD (staged/in-flight) -> ignore,
+    /// our own CL anchors it in milliseconds; head+1 and not held -> wait out
+    /// `LEAN_ANNOUNCE_GRACE_MS` for that anchor, then arm the backfill if it
+    /// never came; further ahead -> arm the backfill at once (existing
+    /// machinery — this is the genuine laggard).
+    ///
+    /// WHY the grace (2026-09-15). A validator stages every height for the
+    /// vote gap, so when a peer's announcement for head+1 lands it already has
+    /// the block, fully executed, in memory — and the CL's `arc_newBlock`
+    /// anchor for it is milliseconds behind. Arming the backfill there pulled
+    /// 2.5 MB per announcing peer per height and ran a SECOND commit of the
+    /// same block (`apply_block` + provider upserts under the `state` lock)
+    /// that the anchor then had to wait behind: measured on the 4-validator
+    /// fleet as ~1.5 `lean_anchor` lines per height, duplicate on 617 of 781
+    /// heights, `pre_ms` p90 226-443 ms and max 1.5 s. The self-healing
+    /// property is untouched: a node whose CL is parked holds nothing staged,
+    /// so it arms after the grace, and a node more than one height behind arms
+    /// immediately.
     ///
     /// INVARIANT (tested: `announce_never_scans_the_log`): this path never
-    /// resolves a commitment, so it can never reach the backward log scan. An
-    /// announcement is decided on NUMBERS alone — a block above our head
-    /// cannot be in our log, and one at or below it is never pulled backwards
-    /// — so a peer announcing at 2 blk/s costs us one head read, whatever the
-    /// commitment is.
+    /// resolves a commitment against the LOG, so it can never reach the
+    /// backward log scan. It decides on numbers plus two in-memory hash
+    /// lookups — a block above our head cannot be in our log, and one at or
+    /// below it is never pulled backwards.
     pub async fn on_announce(&self, commitment: B256, number: u64) {
         self.stats.announces_rx.fetch_add(1, Ordering::Relaxed);
-        let (head_c, head_n, _) = *self.head.lock().await;
+        let head_n = self.head.lock().await.1;
         if number <= head_n {
             // known height: our chain already has a block there (commitment
             // equality is irrelevant to traffic — never pull backwards)
-            let _ = commitment;
             self.stats.announces_known.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        let _ = head_c;
-        // ahead of us: raise the target and let the backfill pull the gap
+        if self.holds_announced(commitment, number, head_n).await {
+            self.stats.announce_skipped_staged.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        if number == head_n + 1 {
+            // One height behind and nothing staged for it. Either our CL is
+            // about to anchor it (the common case: the announcement simply
+            // beat our own `arc_stageBlock`/`arc_newBlock`) or our CL is gone.
+            // Give the anchor the grace window before spending a pull.
+            let grace = announce_grace_ms();
+            if grace > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(grace)).await;
+                let head_n = self.head.lock().await.1;
+                if number <= head_n {
+                    self.stats.announces_known.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                if self.holds_announced(commitment, number, head_n).await {
+                    self.stats.announce_skipped_staged.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+            }
+        }
+        // genuinely behind: raise the target and let the backfill pull the gap
         // (for head+1 the backfill's first fetch IS the direct pull-from-peers;
         // the announcer is in the peer set and provably serves it)
         self.sync_target.fetch_max(number, Ordering::Relaxed);
@@ -1227,6 +1406,7 @@ impl LaneNode {
                                     b64,
                                 ) {
                                     node.stats.block_pulls.fetch_add(1, Ordering::Relaxed);
+                                    node.stats.backfill_pulls.fetch_add(1, Ordering::Relaxed);
                                     if matches!(
                                         node.shim_new(&bytes).await,
                                         Ok(NewBlockOutcome::Valid(_))
@@ -1403,6 +1583,7 @@ impl LaneNode {
             concat!(
                 "lean_stats head={} accounts={} staged={} ",
                 "sync_queue={} by_commitment={} scan_misses={} log_scans={} ",
+                "announce_skipped_staged={} backfill_pulls={} ",
                 "pool={} build_ms_last={:.1} stage_ms_last={:.1} ",
                 "append_ms_last={:.1} rss_mb={}",
             ),
@@ -1413,6 +1594,8 @@ impl LaneNode {
             by_commitment,
             scan_misses,
             s.log_scans.load(Ordering::Relaxed),
+            s.announce_skipped_staged.load(Ordering::Relaxed),
+            s.backfill_pulls.load(Ordering::Relaxed),
             pending,
             ms(s.build_ns_last.load(Ordering::Relaxed)),
             ms(s.stage_ns_last.load(Ordering::Relaxed)),
