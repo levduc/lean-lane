@@ -110,10 +110,16 @@ pub struct LaneNode {
     /// bounded backward scan of the log (see `locate_by_commitment`).
     pub by_commitment: Mutex<std::collections::HashMap<B256, u64>>,
     /// Commitments a bounded backward scan has already failed to find
-    /// (bounded to 4096; cleared whenever a block is appended, since a new
-    /// block can turn an old miss into a hit). Turns a repeated
-    /// unknown-commitment lookup into one hash check instead of another
-    /// full scan.
+    /// (bounded to 4096). Turns a repeated unknown-commitment lookup into one
+    /// hash check instead of another full scan.
+    ///
+    /// Invalidation is EXACT, not wholesale: a miss for commitment `c` can
+    /// only turn into a hit when `c` ITSELF is appended, so an append removes
+    /// only its own commitment. The old blanket `clear()` on every append
+    /// defeated the cache entirely in steady state (a node appending ~2
+    /// blocks/s never kept a miss long enough to use it), so every repeated
+    /// lookup of a commitment nobody has -- exactly what the CL's value-sync
+    /// serving path generates -- paid another bounded backward log scan.
     pub scan_misses: Mutex<std::collections::HashSet<B256>>,
     /// IN-FLIGHT stagings: commitment -> (staged_parent, completion signal).
     /// arc_newBlock awaits a matching in-flight staging (bounded guard)
@@ -373,7 +379,8 @@ impl LaneNode {
         let t_append = Instant::now();
         self.log.lock().await.append(&block)?;
         self.by_commitment.lock().await.insert(block.commitment, block.number);
-        self.scan_misses.lock().await.clear();
+        // exact invalidation: only THIS commitment can have gone miss -> hit
+        self.scan_misses.lock().await.remove(&block.commitment);
         if let Some(s) = digest_state {
             s.write_snapshot(&self.cfg.datadir, commitment, block.number, block.timestamp_ms)?;
         }
@@ -568,7 +575,8 @@ impl LaneNode {
         let t_append = Instant::now();
         self.log.lock().await.append(&block)?;
         self.by_commitment.lock().await.insert(block.commitment, block.number);
-        self.scan_misses.lock().await.clear();
+        // exact invalidation: only THIS commitment can have gone miss -> hit
+        self.scan_misses.lock().await.remove(&block.commitment);
         if let Some(s) = digest_state {
             s.write_snapshot(&self.cfg.datadir, commitment, block.number, block.timestamp_ms)?;
         }

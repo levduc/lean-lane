@@ -95,6 +95,7 @@ async fn scan_finds_canonical_blocks_when_the_index_is_cold() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn unknown_commitment_is_cached_as_a_miss() {
+    use std::sync::atomic::Ordering;
     let dir = tempfile::tempdir().unwrap();
     let n = node(dir.path());
     advance(&n, 5, 0).await;
@@ -102,9 +103,45 @@ async fn unknown_commitment_is_cached_as_a_miss() {
     let unknown = B256::repeat_byte(9);
     assert_eq!(n.block_wire_bytes_by_commitment(unknown).await.unwrap(), None);
     assert!(n.scan_misses.lock().await.contains(&unknown));
+    let scans = n.stats.log_scans.load(Ordering::Relaxed);
     assert_eq!(n.block_wire_bytes_by_commitment(unknown).await.unwrap(), None);
+    assert_eq!(
+        n.stats.log_scans.load(Ordering::Relaxed),
+        scans,
+        "a cached miss must not scan the log again"
+    );
+    // Appending an UNRELATED block must NOT drop the cached miss: a miss for
+    // commitment c can only turn into a hit when c itself is appended, so the
+    // cache survives (the old blanket clear() made it useless in steady state).
     advance(&n, 5, 2).await;
-    assert!(n.scan_misses.lock().await.is_empty());
+    assert!(
+        n.scan_misses.lock().await.contains(&unknown),
+        "an unrelated append cannot turn a miss into a hit"
+    );
+    let scans = n.stats.log_scans.load(Ordering::Relaxed);
+    assert_eq!(n.block_wire_bytes_by_commitment(unknown).await.unwrap(), None);
+    assert_eq!(n.stats.log_scans.load(Ordering::Relaxed), scans, "still cached after an append");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn appending_a_missed_commitment_drops_its_cached_miss() {
+    // The one case where a miss DOES become a hit: the missed commitment is
+    // itself appended. Its entry must be gone and the bytes must be served.
+    let dir = tempfile::tempdir().unwrap();
+    let n = node(dir.path());
+    advance(&n, 7, 0).await;
+    seed_and_submit(&n, 7, 1, 2).await;
+    let (head_c, head_n, ts) = *n.head.lock().await;
+    // built but NOT staged: unknown to the index, the staged map and the queue
+    let (c, wire) = n.shim_build(head_c, head_n + 1, ts + 1000, 1_000_000).await.unwrap();
+    assert_eq!(n.block_wire_bytes_by_commitment(c).await.unwrap(), None);
+    assert!(n.scan_misses.lock().await.contains(&c));
+    assert_eq!(n.shim_new(&wire).await.unwrap(), NewBlockOutcome::Valid(c));
+    assert!(
+        !n.scan_misses.lock().await.contains(&c),
+        "appending the missed commitment must drop its cached miss"
+    );
+    assert_eq!(n.block_wire_bytes_by_commitment(c).await.unwrap(), Some(wire));
 }
 
 #[tokio::test(flavor = "multi_thread")]
