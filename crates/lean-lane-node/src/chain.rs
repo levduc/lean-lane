@@ -169,14 +169,28 @@ impl LeanBlock {
 
     /// Finish a decode whose header/commitment `commitment_of_wire` already
     /// produced over THESE bytes: copy the tx bodies out and keep that
-    /// commitment rather than rebuilding and re-hashing the preimage. The
-    /// framing re-scan is redundant after `commitment_of_wire` but cheap
-    /// (no copies) and keeps this safe to call on its own — the header is
-    /// re-derived from the bytes and compared, never trusted.
-    pub fn from_wire_bytes_with_header(bytes: &[u8], h: WireHeader) -> Result<Self, String> {
+    /// commitment rather than rebuilding and re-hashing the preimage.
+    ///
+    /// TRUST BOUNDARY — read before adding a caller. Only the three header
+    /// fields are re-derived from the bytes and compared; `h.commitment` is
+    /// TAKEN ON FAITH. It binds `keccak256(bytes[48..])`, and recomputing that
+    /// is the whole cost this function exists to avoid (it is what
+    /// `commitment_of_wire` already paid over these same bytes). So the
+    /// caller's obligation is: pass the `WireHeader` that `commitment_of_wire`
+    /// returned for the SAME slice, never one computed over a different body —
+    /// otherwise the block is appendable under a commitment that does not
+    /// match its content, `from_payload` rejects that record on the next
+    /// replay, and the log is silently truncated there. `pub(crate)` for that
+    /// reason; both callers (`from_wire_bytes` and `node::stage_claimed`) hash
+    /// and decode the one slice. Debug builds recompute and reject a mismatch,
+    /// so a violating caller fails in tests rather than on the fleet.
+    pub(crate) fn from_wire_bytes_with_header(bytes: &[u8], h: WireHeader) -> Result<Self, String> {
         let (parent, number, timestamp_ms, n_tx) = Self::scan_wire(bytes)?;
         if parent != h.parent || number != h.number || timestamp_ms != h.timestamp_ms {
             return Err("wire header does not match the bytes".into());
+        }
+        if cfg!(debug_assertions) && Self::commitment_of_wire(bytes)?.commitment != h.commitment {
+            return Err("wire header commitment does not match the bytes".into());
         }
         let mut txs = Vec::with_capacity(n_tx.min(1 << 20));
         let mut at = 52usize;
@@ -350,5 +364,46 @@ impl BlockLog {
         self.file.read_exact(&mut payload)?;
         self.file.seek(SeekFrom::End(0))?;
         Ok(LeanBlock::from_payload(&payload))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// I1: `from_wire_bytes_with_header` trusts `h.commitment` in release. The
+    /// guard that keeps that trust honest is the debug-build recompute — a
+    /// header paired with a DIFFERENT body must be refused, or the decode
+    /// mints a block whose commitment does not bind its content (appendable,
+    /// then torn on the next replay).
+    #[test]
+    fn a_header_from_a_different_body_is_rejected() {
+        let parent = B256::repeat_byte(0x11);
+        let a = LeanBlock::new(parent, 7, 1_000, vec![vec![0xaa; 16]]);
+        let b = LeanBlock::new(parent, 7, 1_000, vec![vec![0xbb; 16]]);
+        // same header fields, different txs
+        assert_ne!(a.commitment, b.commitment);
+        let ha = LeanBlock::commitment_of_wire(&a.to_wire_bytes()).unwrap();
+        let hb = LeanBlock::commitment_of_wire(&b.to_wire_bytes()).unwrap();
+        // the three re-derived fields agree, so only the commitment check can
+        // catch this pairing
+        assert_eq!(ha.parent, hb.parent);
+        assert_eq!((ha.number, ha.timestamp_ms), (hb.number, hb.timestamp_ms));
+        let err = LeanBlock::from_wire_bytes_with_header(&b.to_wire_bytes(), ha).unwrap_err();
+        assert!(err.contains("commitment"), "{err}");
+    }
+
+    /// The matched pairing every in-crate caller passes still decodes, and to
+    /// exactly what a full `from_wire_bytes` produces.
+    #[test]
+    fn a_matched_header_decodes_to_the_full_block() {
+        let b = LeanBlock::new(B256::repeat_byte(0x22), 3, 9, vec![vec![1, 2, 3], vec![4]]);
+        let wire = b.to_wire_bytes();
+        let h = LeanBlock::commitment_of_wire(&wire).unwrap();
+        let got = LeanBlock::from_wire_bytes_with_header(&wire, h).unwrap();
+        assert_eq!(got.commitment, b.commitment);
+        assert_eq!(got.txs, b.txs);
+        let full = LeanBlock::from_wire_bytes(&wire).unwrap();
+        assert_eq!(full.commitment, b.commitment);
     }
 }

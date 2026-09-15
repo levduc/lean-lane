@@ -927,9 +927,12 @@ impl LaneNode {
             let decode_ns = t_decode.elapsed().as_nanos() as u64;
             return Ok((StageOutcome::Staged(hdr.commitment), decode_ns, 0, 0, true));
         }
-        // the expensive half of the decode (tx bodies out of the wire); the
-        // commitment is NOT recomputed — `from_wire_bytes_with_header` re-derives
-        // the header from these same bytes and refuses a mismatch.
+        // the expensive half of the decode (tx bodies out of the wire). The
+        // commitment is NOT recomputed: `hdr` is the header `commitment_of_wire`
+        // produced over THESE bytes at the top of `stage_block` — the trust
+        // boundary `from_wire_bytes_with_header` documents (it re-derives and
+        // compares the three header fields always, the commitment in debug
+        // builds, and takes `hdr.commitment` on faith in release).
         let block = LeanBlock::from_wire_bytes_with_header(bytes, hdr)?;
         let decode_ns = t_decode.elapsed().as_nanos() as u64;
         let t_recover = Instant::now();
