@@ -6,9 +6,10 @@
 //!   domain = keccak("ARC_LEAN_NATIVE_TRANSFER"(24B) || chain_id u64 BE).
 //! v is the RAW recovery id (0/1). Tx hash = keccak(full canonical bytes).
 //!
-//! This mirrors ~/reth-fork/crates/lean-native (the source of truth). The
-//! `pinned_vector_matches_fork` test reproduces the fork's `gen_vector` example
-//! byte-for-byte — if either side changes the format, that test breaks FIRST.
+//! An independent re-implementation of `crates/lean-native` (the source of
+//! truth), kept as a cross-check. The `pinned_vector_matches_fork` test
+//! reproduces lean-native's `gen_vector` example byte-for-byte — if either
+//! side changes the format, that test breaks FIRST.
 
 use alloy_primitives::{keccak256, Address, B256};
 use k256::ecdsa::SigningKey;
@@ -60,7 +61,7 @@ pub fn build_fanout_tx(
 mod tests {
     use super::*;
 
-    /// Byte-for-byte against ~/reth-fork `cargo run -p lean-native --example
+    /// Byte-for-byte against `cargo run -p lean-native --example
     /// gen_vector` (sk=0x..01, chain 1338, nonce 7, two outputs). Pins wire
     /// format, signing domain, RFC6979 determinism, and v convention across
     /// the two independent implementations.

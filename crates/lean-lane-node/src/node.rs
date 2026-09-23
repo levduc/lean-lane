@@ -1,10 +1,8 @@
-//! The lane node composition: reth's pool as a LIBRARY (validator + ordering +
-//! eviction, unmodified — exactly the 2a wiring) + flat-state total STF +
-//! append-only log + a build-execute-commit driver loop.
-//!
-//! The driver is BOTH the offline harness and the future proposer path; the CL
-//! shim splits it into `buildBlock(budget)` / `newBlock(bytes)` / `getHead`
-//! (contract listed in LEAN-NATIVE.md; not implemented here).
+//! The lane node: reth's pool as a LIBRARY (validator + ordering + eviction,
+//! unmodified) + flat-state total STF + append-only log, driven by the
+//! consensus layer through the shim verbs (`arc_buildBlock`, `arc_stageBlock`,
+//! `arc_newBlock`, `arc_getHead`, `arc_getBlockBytes`; contract in
+//! `docs/integration.md`) plus node-to-node gossip and backfill.
 
 use crate::chain::{genesis_commitment, BlockLog, LeanBlock};
 use crate::exec::apply_block;

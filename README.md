@@ -18,17 +18,18 @@ exact contract.
 
 ## Get it
 
-Single branch `main`, tag `v0.1.0`:
-
 ```bash
 git clone git@github.com:levduc/lean-lane.git
 ```
 
-Branch `v0.2` carries the commitment-addressed verbs (`arc_newBlock{commitment}`, `arc_getBlockBytes{commitment}`) the Arc CL series `lean-lane-v0.2` uses, plus the 2026-09-15 performance fixes (no log scan on the serving path, the proposer stages its own block, no re-pull of held blocks, the anchor waits for an in-flight stage, one commit gate per append). The anchor also waits a short grace (`LEAN_ANCHOR_GRACE_MS`, default 60 ms, `0` disables) for a stage that has not ARRIVED yet: on a LAN the CL's tiny `arc_newBlock{commitment}` beats its own fire-and-forget `arc_stageBlock`, whose task is still encoding a 2.5 MB body, and the anchor was paying a 200-250 ms peer pull for a block landing milliseconds later (fleet, 450 M budget: `path=peer` on 515 of 1,315 anchors). Optional diagnostics, all off by default: `LEAN_STATS=1` (stats every 10 s + per-call anchor/stage/locate lines, each stamped `t_in=<ms since node start>` so the stage-vs-anchor ARRIVAL gap is measurable offline), `LEAN_FSYNC=0`, `LEAN_ANNOUNCE_GRACE_MS`, `LEAN_STAGE_RACE_MS`.
+| branch | what |
+|---|---|
+| `main` (tag `v0.1.0`) | the by-bytes shim contract (`arc_newBlock{blockBytes}`) that the Arc CL series `lean-lane-v0.1` (tag `lean-lane-v0.1.0`) drives |
+| `v0.2` | adds the commitment-addressed verbs (`arc_newBlock{commitment}`, `arc_getBlockBytes{commitment}`) the Arc CL v0.2 series uses, plus the performance work measured on the 4-validator fleet: no log scan on the serving path, the proposer stages its own block, no re-pull of held blocks, the anchor waits for an in-flight or not-yet-arrived stage, one commit gate per append |
+| `v0.3-dev` | cleanup on top of `v0.2`, same shim contract: commitment index complete from log replay (no log scan at all), every setting is a CLI flag, diagnostics through `tracing`, no self-drive mode, no `bench` subcommand, no receipt ring |
 
-The matching Arc consensus-layer changes are the `lean-lane-v0.1` branch of
-`levduc/arc-node` (tag `lean-lane-v0.1.0`); its
-`docs/lean-lane-integration.md` explains how the two fit together.
+The shim contract — what a consensus layer must call and what it gets back —
+is `docs/integration.md` in this repo.
 
 ## Verify a machine in one command
 

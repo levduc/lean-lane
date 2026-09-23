@@ -226,7 +226,7 @@ pub enum TxType {
     /// Call to the GasGuzzler contract (function selected by `--guzzler-fn-weights`).
     Guzzler,
     /// Lean fan-out native transfer (tx type 0x50, 1 sig -> N recipients) for
-    /// the lean payment lane. Wire format mirrored from ~/reth-fork lean-native.
+    /// the lean payment lane. Wire format mirrored from `crates/lean-native`.
     Fanout,
 }
 

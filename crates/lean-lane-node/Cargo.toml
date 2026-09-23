@@ -3,7 +3,7 @@ name = "lean-lane-node"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-description = "Standalone lean payment-lane node: reth as a mempool library + flat-state fan-out executor + append-only log. No MPT, no receipts root, no Ethereum header — the CL is the source of truth (increment 2b')."
+description = "Standalone lean payment-lane node: reth as a mempool library + flat-state fan-out executor + append-only log. No MPT, no receipts root, no Ethereum header — the CL is the source of truth."
 publish = false
 
 [dependencies]

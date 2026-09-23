@@ -51,8 +51,9 @@ are JSON-RPC **errors** (protocol violations); lag is never an error, it is
 `SYNCING`.
 
 Also served, not part of the CL contract: `eth_sendRawTransaction`,
-`arc_sendRawTxBatch`, `txpool_status`, `eth_getTransactionCount`
-(**pool-inclusive**), and `arc_announceBlock` (node-to-node gossip).
+`arc_sendRawTxBatch`, `txpool_status`, `eth_getTransactionCount` (the
+**committed** nonce, block tag ignored — not pool-inclusive), and
+`arc_announceBlock` (node-to-node gossip).
 
 Total-STF semantics: an invalid transaction inside a block is a no-op, never a
 block rejection. A byzantine proposer can waste bytes; it cannot fork or halt the
@@ -93,6 +94,8 @@ restarted while its lean node was down — both recovered without operator actio
   fleet fails closed with decode errors.
 - Never wipe a lean chain under a live consensus chain: certificates bind the
   destroyed bytes and laggards can never sync that span.
-- `eth_getTransactionCount` is pool-inclusive: generate offline corpora only
+- `eth_getTransactionCount` returns the committed nonce, not a pool-inclusive
+  one: a corpus generated while the pool still holds txs from the same senders
+  restarts at nonces that are already pooled. Generate offline corpora only
   against an empty pool.
 - Fan-out drains sender balances one way; refund by regenerating genesis.

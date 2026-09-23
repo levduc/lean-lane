@@ -93,7 +93,7 @@ pub fn module(node: Arc<LaneNode>) -> RpcModule<Arc<LaneNode>> {
     })
     .unwrap();
 
-    // ---- CL shim (contract: docs/lean-lane-integration.md in the arc repo) ----
+    // ---- CL shim (contract: docs/integration.md) ----
 
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
@@ -206,8 +206,8 @@ pub fn module(node: Arc<LaneNode>) -> RpcModule<Arc<LaneNode>> {
     })
     .unwrap();
 
-    // Committed-state nonce (block tag ignored — the lane has instant finality).
-    // Spammers/wallets use this for nonce resync; the pool tracks pending on top.
+    // The COMMITTED nonce (block tag ignored — the lane has instant finality),
+    // not pool-inclusive: pending txs in the pool are not counted.
     m.register_async_method("eth_getTransactionCount", |params, node, _| async move {
         let mut seq = params.sequence();
         let addr: alloy_primitives::Address = seq.next().map_err(|e| err(e.to_string()))?;

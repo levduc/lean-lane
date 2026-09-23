@@ -3,7 +3,7 @@ name = "lean-native"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-description = "Lean fan-out native transfer type for the Arc payment lane: fixed-width codec, 1-signature->N-recipients, deterministic parallel execution (offline increment 1 — not wired into the engine)"
+description = "Lean fan-out native transfer type (0x50) for the Arc payment lane: fixed-width codec, 1 signature -> N recipients, EIP-2718 envelope and reth pool integration"
 publish = false
 
 [dependencies]

@@ -1,8 +1,5 @@
-//! Lean fan-out native transfer for the Arc payment lane — increment 1 (offline).
-//!
-//! One signature, N recipients, fixed-width encoding (no RLP), deterministic
-//! parallel execution. See `LEAN-NATIVE.md` at the fork root for the design doc,
-//! byte tables and the reth touchpoints for increment 2 (engine integration).
+//! Lean fan-out native transfer for the Arc payment lane: one signature,
+//! N recipients, fixed-width encoding (no RLP).
 //!
 //! Canonical wire format (little-endian integers, fixed width, no RLP). The
 //! SAME bytes serve every role: signing preimage (minus sig), the EIP-2718
@@ -22,12 +19,13 @@
 //! ~1.8e28 wei — both fine for a payment lane; documented trade, saves
 //! 8B/output vs u128 wei.
 //!
-//! Block execution semantics (BOTH executors implement exactly this — the rule
-//! set is the spec, the serial executor is its reference implementation):
-//! * Whole-tx atomic: any invalidity (bad version, N=0, N>MAX, nonce mismatch,
-//!   output-sum overflow, insufficient funds) rejects the ENTIRE tx; state
-//!   untouched. A lane block containing an invalid lean tx is itself invalid
-//!   (builder never packs one; validators reject the block).
+//! Block execution semantics (implemented by the node, `lean-lane-node`'s
+//! `exec::apply_block`). The state transition is TOTAL:
+//! * Whole-tx atomic: any invalidity (nonce mismatch, output-sum overflow,
+//!   insufficient funds) makes the ENTIRE tx a no-op; state untouched. The
+//!   BLOCK stays valid — an invalid tx never rejects the block that carries
+//!   it, so a byzantine proposer can waste bytes but cannot halt or fork the
+//!   lane. (Malformed bytes that do not decode or recover are skipped.)
 //! * Same-block incoming credits are NOT spendable: a sender's spendable
 //!   balance during a block is its block-start balance minus its own earlier
 //!   debits in that block. This is what makes sender-partitioned parallel
@@ -39,9 +37,7 @@
 //! * The fixed per-tx fee accumulates to the beneficiary as one deferred
 //!   credit at end of block (Arc credits the beneficiary every tx; deferral is
 //!   the standard trick that removes the all-tx write conflict — same result).
-//! * One receipt per TX (not per output): status + one transfer log per
-//!   NON-ZERO output (zero-value outputs emit no log — consensus bug #3 in the
-//!   project ledger was exactly an extra log on a zero-value transfer).
+//! * No receipts or logs are produced or committed.
 
 pub mod envelope;
 pub mod pool;
@@ -62,7 +58,7 @@ pub const AMOUNT_UNIT: u128 = 1_000_000_000;
 /// Gas accounting for the lean type: `gas(tx) = GAS_BASE + GAS_PER_OUTPUT * N`.
 /// Gas is the PACKING WEIGHT (block budgeting + pool ordering) and, multiplied
 /// by the lane's protocol-fixed gas price, the fee. The fee is gas-proportional
-/// (changed from increment 1's flat fee): it keeps reth's generic pool cost
+/// (not a flat fee): it keeps reth's generic pool cost
 /// arithmetic (`max_fee_per_gas * gas_limit + value`) exactly right with no
 /// overrides — and is economically saner for large fan-outs anyway.
 /// `GAS_PER_OUTPUT = 5000` is a cold-account-credit-shaped weight; a lane can

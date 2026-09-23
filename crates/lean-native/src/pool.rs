@@ -1,4 +1,4 @@
-//! Pool integration (increment 2a): `ArcPooledTx` — the lean-aware pool
+//! Pool integration: `ArcPooledTx` — the lean-aware pool
 //! transaction, usable with reth's UNMODIFIED `EthTransactionValidator` and
 //! `Pool` (the validator accepts type `0x50` via its existing
 //! `with_custom_tx_type` hook; funds/nonce/gas checks run through the generic

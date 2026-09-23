@@ -2,7 +2,7 @@
 //! type that carries every Ethereum tx variant PLUS the lean fan-out transfer
 //! as tx type `0x50`.
 //!
-//! Design (increment 2a): the alloy `EthereumTxEnvelope` is a closed enum, so
+//! Design: the alloy `EthereumTxEnvelope` is a closed enum, so
 //! the lean type rides in a fork-local wrapper enum that delegates all trait
 //! surface to alloy for the Ethereum variants and implements it natively for
 //! the lean variant. The wrapper implements everything reth's
