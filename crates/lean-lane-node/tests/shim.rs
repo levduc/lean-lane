@@ -197,7 +197,7 @@ async fn stats_line_carries_every_growth_field() {
     assert!(line.starts_with("lean_stats "), "{line}");
     assert_eq!(
         line.split_whitespace().count(),
-        18,
+        16,
         "one key per field: {line}"
     );
     for key in [
@@ -208,8 +208,6 @@ async fn stats_line_carries_every_growth_field() {
         "staged=",
         "sync_queue=",
         "by_commitment=",
-        "scan_misses=",
-        "log_scans=",
         "announce_skipped_staged=",
         "backfill_pulls=",
         "stage_race_waits=",

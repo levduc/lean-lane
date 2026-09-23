@@ -101,7 +101,7 @@ hole it could never fill.
 `LEAN_STATS=1` prints one line every 10 s on stdout:
 
 ```
-lean_stats head=812 accounts=44913 staged=1 sync_queue=0 by_commitment=812 scan_misses=0 log_scans=0 pool=1974 build_ms_last=12.9 stage_ms_last=21.6 append_ms_last=9.8 rss_mb=1842
+lean_stats head=812 accounts=44913 staged=1 sync_queue=0 by_commitment=812 pool=1974 build_ms_last=12.9 stage_ms_last=21.6 append_ms_last=9.8 rss_mb=1842
 ```
 
 Everything in it is either a counter or a `len()` (it never walks the state,

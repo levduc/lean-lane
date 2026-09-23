@@ -354,14 +354,10 @@ impl BlockLog {
         Ok(AppendTiming { write_ns, fsync_ns })
     }
 
-    /// Replay all intact records, invoking `f` for blocks with
-    /// `number > after_number`; truncates the file past the last intact
-    /// record. Returns the number of blocks replayed.
-    pub fn replay(
-        &mut self,
-        after_number: u64,
-        mut f: impl FnMut(&LeanBlock),
-    ) -> std::io::Result<u64> {
+    /// Replay all intact records in order, invoking `f` for every one;
+    /// truncates the file past the last intact record. Returns the number of
+    /// intact records.
+    pub fn replay(&mut self, mut f: impl FnMut(&LeanBlock)) -> std::io::Result<u64> {
         self.file.seek(SeekFrom::Start(0))?;
         let mut bytes = Vec::new();
         self.file.read_to_end(&mut bytes)?;
@@ -382,10 +378,8 @@ impl BlockLog {
                 break;
             };
             self.index.insert(block.number, (at as u64, len as u32));
-            if block.number > after_number {
-                f(&block);
-                replayed += 1;
-            }
+            f(&block);
+            replayed += 1;
             good_end = end;
             at = end;
         }

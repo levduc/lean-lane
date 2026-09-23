@@ -111,113 +111,6 @@ async fn lookup_by_commitment_survives_reopen() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn scan_finds_canonical_blocks_when_the_index_is_cold() {
-    use std::sync::atomic::Ordering;
-    let dir = tempfile::tempdir().unwrap();
-    let n = node(dir.path());
-    let (c1, w1) = advance(&n, 4, 0).await;
-    let (c2, w2) = advance(&n, 4, 1).await;
-    let (c3, w3) = advance(&n, 4, 2).await;
-    n.by_commitment.lock().await.clear();
-    // A cold index means the index is not COMPLETE down to these heights —
-    // that is what index_floor states, and what makes the scan worth running.
-    // (In production the only cold range is below the snapshot a process
-    // opened on; above index_floor a miss is proof of absence and the scan is
-    // skipped, which is the whole point of the floor.)
-    let head_n = n.head.lock().await.1;
-    n.index_floor.store(head_n + 1, Ordering::Relaxed);
-    assert_eq!(
-        n.block_wire_bytes_by_commitment(c1).await.unwrap(),
-        Some(w1)
-    );
-    assert_eq!(
-        n.block_wire_bytes_by_commitment(c2).await.unwrap(),
-        Some(w2)
-    );
-    assert_eq!(
-        n.block_wire_bytes_by_commitment(c3).await.unwrap(),
-        Some(w3)
-    );
-    let idx = n.by_commitment.lock().await;
-    assert!(idx.contains_key(&c1));
-    assert!(idx.contains_key(&c2));
-    assert!(idx.contains_key(&c3));
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn unknown_commitment_is_cached_as_a_miss() {
-    use std::sync::atomic::Ordering;
-    let dir = tempfile::tempdir().unwrap();
-    let n = node(dir.path());
-    advance(&n, 5, 0).await;
-    advance(&n, 5, 1).await;
-    let unknown = B256::repeat_byte(9);
-    assert_eq!(
-        n.block_wire_bytes_by_commitment(unknown).await.unwrap(),
-        None
-    );
-    assert!(n.scan_misses.lock().await.contains(&unknown));
-    let scans = n.stats.log_scans.load(Ordering::Relaxed);
-    assert_eq!(
-        n.block_wire_bytes_by_commitment(unknown).await.unwrap(),
-        None
-    );
-    assert_eq!(
-        n.stats.log_scans.load(Ordering::Relaxed),
-        scans,
-        "a cached miss must not scan the log again"
-    );
-    // Appending an UNRELATED block must NOT drop the cached miss: a miss for
-    // commitment c can only turn into a hit when c itself is appended, so the
-    // cache survives (the old blanket clear() made it useless in steady state).
-    advance(&n, 5, 2).await;
-    assert!(
-        n.scan_misses.lock().await.contains(&unknown),
-        "an unrelated append cannot turn a miss into a hit"
-    );
-    let scans = n.stats.log_scans.load(Ordering::Relaxed);
-    assert_eq!(
-        n.block_wire_bytes_by_commitment(unknown).await.unwrap(),
-        None
-    );
-    assert_eq!(
-        n.stats.log_scans.load(Ordering::Relaxed),
-        scans,
-        "still cached after an append"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn appending_a_missed_commitment_drops_its_cached_miss() {
-    // The one case where a miss DOES become a hit: the missed commitment is
-    // itself appended. Its entry must be gone and the bytes must be served.
-    let dir = tempfile::tempdir().unwrap();
-    let n = node(dir.path());
-    advance(&n, 7, 0).await;
-    seed_and_submit(&n, 7, 1, 2).await;
-    let (head_c, head_n, ts) = *n.head.lock().await;
-    let (c, wire) = n
-        .shim_build(head_c, head_n + 1, ts + 1000, 1_000_000)
-        .await
-        .unwrap();
-    // `arc_buildBlock` self-stages its result; drop the staged copy, because
-    // this test needs a commitment that really is unknown to the index, the
-    // staged map AND the queue — that is what makes the lookup a cached miss.
-    n.staged.lock().await.clear();
-    assert_eq!(n.block_wire_bytes_by_commitment(c).await.unwrap(), None);
-    assert!(n.scan_misses.lock().await.contains(&c));
-    assert_eq!(n.shim_new(&wire).await.unwrap(), NewBlockOutcome::Valid(c));
-    assert!(
-        !n.scan_misses.lock().await.contains(&c),
-        "appending the missed commitment must drop its cached miss"
-    );
-    assert_eq!(
-        n.block_wire_bytes_by_commitment(c).await.unwrap(),
-        Some(wire)
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn new_block_by_commitment_promotes_a_staged_block() {
     let dir = tempfile::tempdir().unwrap();
     let n = node(dir.path());
@@ -285,98 +178,13 @@ async fn staged_entry_survives_an_unrelated_head_move() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn announce_never_scans_the_log() {
-    // A peer announcing a commitment we have never seen must cost us one head
-    // read, not a backward log scan: the announce path decides on NUMBERS
-    // alone. (Fleet symptom this guards: lean-node CPU per block growing ~3x
-    // on peered validators while a lone-fast one stayed flat.)
-    use std::sync::atomic::Ordering;
-    let dir = tempfile::tempdir().unwrap();
-    let n = node(dir.path());
-    for nonce in 0..3 {
-        advance(&n, 8, nonce).await;
-    }
-    let head_n = n.head.lock().await.1;
-    // unknown commitment, ahead of us (the SYNCING-arming case) ...
-    n.on_announce(B256::repeat_byte(0xa1), head_n + 1).await;
-    // ... and one at a height we already have (the in-sync case)
-    n.on_announce(B256::repeat_byte(0xa2), head_n).await;
-    assert_eq!(
-        n.stats.log_scans.load(Ordering::Relaxed),
-        0,
-        "the announce path must never scan the log"
-    );
-    assert_eq!(n.stats.announces_rx.load(Ordering::Relaxed), 2);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn serving_an_unknown_commitment_does_not_scan_above_the_index_floor() {
-    // arc_getBlockBytes{commitment} for something we do not have: the index is
-    // complete from index_floor up, so there is nothing to scan. This is the
-    // per-ask cost that used to read+hash up to 1024 blocks.
-    use std::sync::atomic::Ordering;
-    let dir = tempfile::tempdir().unwrap();
-    let n = node(dir.path());
-    for nonce in 0..3 {
-        advance(&n, 9, nonce).await;
-    }
-    assert_eq!(
-        n.block_wire_bytes_by_commitment_for(B256::repeat_byte(0xb7), "get_bytes")
-            .await
-            .unwrap(),
-        None
-    );
-    assert_eq!(
-        n.stats.log_scans.load(Ordering::Relaxed),
-        0,
-        "nothing to scan above the floor"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn anchoring_a_staged_block_never_scans_the_log() {
-    // The decide anchor is the hot path: it must resolve from the staged copy
-    // and never fall into the bounded backward log scan (which reads and
-    // hashes up to 1024 blocks and was measured to grow ~1.1 ms per block of
-    // history when it ran on every decide).
-    use std::sync::atomic::Ordering;
-    let dir = tempfile::tempdir().unwrap();
-    let n = node(dir.path());
-    for nonce in 0..3 {
-        seed_and_submit(&n, 6, nonce, 2).await;
-        let (head_c, head_n, ts) = *n.head.lock().await;
-        let (c, wire) = n
-            .shim_build(head_c, head_n + 1, ts + 1000, 1_000_000)
-            .await
-            .unwrap();
-        assert_eq!(n.stage_block(&wire).await.unwrap(), StageOutcome::Staged(c));
-        assert_eq!(
-            n.shim_new_by_commitment(c).await.unwrap(),
-            NewBlockOutcome::Valid(c)
-        );
-    }
-    assert_eq!(
-        n.stats.log_scans.load(Ordering::Relaxed),
-        0,
-        "anchor path must not scan the log"
-    );
-    // and the idempotent re-anchor of a canonical block is index-only too
-    let head_c = n.head.lock().await.0;
-    assert_eq!(
-        n.shim_new_by_commitment(head_c).await.unwrap(),
-        NewBlockOutcome::Valid(head_c)
-    );
-    assert_eq!(n.stats.log_scans.load(Ordering::Relaxed), 0);
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn a_built_block_anchors_from_its_own_staged_copy() {
     // THE proposer path (2026-09-15). `arc_buildBlock` used to execute on a
     // throwaway copy, so at decide the proposer's own
     // `arc_newBlock{commitment}` found nothing staged and pulled its own block
     // back from a peer over HTTP (`path=peer`, 150-300 ms, on the consensus
     // critical path). Build must now leave a staged entry, and the anchor must
-    // take the promote path with zero peer traffic and zero log scans.
+    // take the promote path with zero peer traffic.
     use std::sync::atomic::Ordering;
     let dir = tempfile::tempdir().unwrap();
     let n = node(dir.path());
@@ -407,11 +215,6 @@ async fn a_built_block_anchors_from_its_own_staged_copy() {
         n.stats.block_pulls.load(Ordering::Relaxed),
         0,
         "the proposer must never fetch its own block from a peer"
-    );
-    assert_eq!(
-        n.stats.log_scans.load(Ordering::Relaxed),
-        0,
-        "and never scan the log"
     );
     // staged map drained by the retention sweep, not leaking an entry a height
     assert!(n.staged.lock().await.len() <= 1);
@@ -533,4 +336,47 @@ async fn self_staging_respects_the_32_entry_cap() {
     let q = n.staged.lock().await;
     assert_eq!(q.len(), before);
     assert_eq!(q.iter().filter(|(k, _)| *k == c).count(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn every_commitment_resolves_after_reopen_from_a_snapshot() {
+    // The commitment index is rebuilt from the WHOLE log at open, including
+    // the records below the snapshot the state is loaded from. Every block
+    // ever appended must still be served by commitment, and must still anchor
+    // as an idempotent VALID.
+    let dir = tempfile::tempdir().unwrap();
+    let open = || {
+        LaneNode::open(Config {
+            datadir: dir.path().to_path_buf(),
+            snapshot_every: 3,
+            ..Default::default()
+        })
+        .unwrap()
+    };
+    let mut blocks = Vec::new();
+    {
+        let (n, _) = open();
+        for nonce in 0..7u32 {
+            blocks.push(advance(&n, 31, nonce).await);
+        }
+    }
+    let (n, rec) = open();
+    assert_eq!(rec.snapshot_number, 6, "reopened from the snapshot at 6");
+    assert_eq!(rec.replayed_blocks, 1, "and replayed only block 7");
+    for (c, wire) in &blocks {
+        assert_eq!(
+            n.block_wire_bytes_by_commitment(*c).await.unwrap().as_ref(),
+            Some(wire)
+        );
+        assert_eq!(
+            n.shim_new_by_commitment(*c).await.unwrap(),
+            NewBlockOutcome::Valid(*c)
+        );
+    }
+    assert_eq!(
+        n.block_wire_bytes_by_commitment(B256::repeat_byte(9))
+            .await
+            .unwrap(),
+        None
+    );
 }

@@ -109,8 +109,6 @@ pub struct Stats {
     /// counts these AND the by-commitment anchor's peer fetch; this one is the
     /// "are we pulling blocks we did not need" number.
     pub backfill_pulls: AtomicU64,
-    /// backward log scans started by `locate_by_commitment` (must stay 0 on the anchor path)
-    pub log_scans: AtomicU64,
     /// Anchors (`arc_newBlock{commitment}`) that WAITED on a concurrent
     /// `arc_stageBlock` of the same block instead of pulling it from a peer.
     /// The CL fires the stage and then the anchor ~15 ms later, while the
@@ -283,7 +281,7 @@ pub struct AnchorTimer {
     /// task sat in the tokio queue before it ran.
     pub pre_ns: AtomicU64,
     /// `locate_wire` on the by-commitment route: staged map -> sync queue ->
-    /// commitment index -> log read -> bounded backward scan. Previously
+    /// commitment index -> log read. Previously
     /// UNMEASURED — a `path=index` hit that had to read and re-serialise the
     /// block out of the log (log mutex + a 2.5 MB copy) paid entirely here
     /// and surfaced only as `total_ms` residual. This is the ~380 ms that
@@ -380,8 +378,8 @@ enum Link {
 ///   1. `commit_gate` -> anything. `commit_block` and `promote_staged` hold
 ///      the gate across the whole append (the linkage decision, the state
 ///      write, the log append, the head write and the bookkeeping sweeps) and
-///      take `head`, `state`, `log`, `receipts`, `by_commitment`,
-///      `scan_misses`, `staged` and `inflight` under it — one at a time.
+///      take `head`, `state`, `log`, `receipts`, `by_commitment`, `staged`
+///      and `inflight` under it — one at a time.
 ///   2. `head` -> `state`, nested in the two staging paths (`stage_claimed`
 ///      and `shim_build`) so that the head a staged entry names as its parent
 ///      and the state it executes on are read ATOMICALLY. That is the same
@@ -437,31 +435,10 @@ pub struct LaneNode {
     /// ahead of the new head are kept — a losing candidate at the settled
     /// height stays servable by commitment to a peer that still asks for it.
     pub staged: Mutex<std::collections::VecDeque<(B256, StagedBlock)>>,
-    /// commitment -> block number for canonical blocks known to this
-    /// process (replayed at open, appended since). Misses fall back to a
-    /// bounded backward scan of the log (see `locate_by_commitment`).
+    /// commitment -> block number for EVERY canonical block: filled from the
+    /// whole log at open, extended on every append. Complete from height 1,
+    /// so a miss is proof the block is not canonical here.
     pub by_commitment: Mutex<std::collections::HashMap<B256, u64>>,
-    /// Commitments a bounded backward scan has already failed to find
-    /// (bounded to 4096). Turns a repeated unknown-commitment lookup into one
-    /// hash check instead of another full scan.
-    ///
-    /// Invalidation is EXACT, not wholesale: a miss for commitment `c` can
-    /// only turn into a hit when `c` ITSELF is appended, so an append removes
-    /// only its own commitment. The old blanket `clear()` on every append
-    /// defeated the cache entirely in steady state (a node appending ~2
-    /// blocks/s never kept a miss long enough to use it), so every repeated
-    /// lookup of a commitment nobody has — exactly what the CL's value-sync
-    /// serving path generates — paid another bounded backward log scan.
-    pub scan_misses: Mutex<std::collections::HashSet<B256>>,
-    /// Lowest block number `by_commitment` is COMPLETE from (everything at or
-    /// above it that this node has appended is indexed: replay fills it at
-    /// open, every append adds to it). A backward log scan can therefore only
-    /// ever discover something BELOW this — above it, a miss is proof of
-    /// absence. In steady state (head more than SCAN_LIMIT past the snapshot
-    /// the process opened on) this makes the scan range empty, which is the
-    /// point: serving `arc_getBlockBytes{commitment}` for a commitment we do
-    /// not have used to read+hash up to 1024 blocks (1.24 MB each) per ask.
-    pub index_floor: AtomicU64,
     /// IN-FLIGHT work on a commitment: commitment -> `Claim`.
     /// arc_newBlock awaits a matching in-flight staging (bounded guard)
     /// instead of redoing the full execution — a <=35ms wait beats a ~230ms
@@ -535,7 +512,7 @@ pub struct StagedBlock {
 }
 
 /// What a log replay reports: (head, blocks replayed, txs replayed, the
-/// commitment -> number index built on the way).
+/// commitment -> number index of EVERY record in the log).
 type Replayed = (
     (B256, u64, u64),
     u64,
@@ -547,6 +524,9 @@ type Replayed = (
 /// number, timestamp_ms) that `state` was loaded from. Each replayed tx pays
 /// one decode + one ecrecover — the honest recovery cost. Returns the new head
 /// plus what it took to get there: (head, blocks, txs, commitment index).
+///
+/// The commitment index covers every intact record, below the snapshot too,
+/// so it is complete from height 1: a miss is proof of absence.
 fn replay_onto(
     state: &mut FlatState,
     log: &mut BlockLog,
@@ -555,12 +535,15 @@ fn replay_onto(
 ) -> std::io::Result<Replayed> {
     let (mut head, mut blocks, mut txs) = (snap, 0u64, 0u64);
     let mut by_commitment = std::collections::HashMap::new();
-    log.replay(snap.1, |block| {
+    log.replay(|block| {
+        by_commitment.insert(block.commitment, block.number);
+        if block.number <= snap.1 {
+            return;
+        }
         let items = decode_block_txs(&block.txs);
         txs += items.len() as u64;
         apply_block(state, &items, block.number, beneficiary);
         head = (block.commitment, block.number, block.timestamp_ms);
-        by_commitment.insert(block.commitment, block.number);
         blocks += 1;
     })?;
     Ok((head, blocks, txs, by_commitment))
@@ -702,10 +685,6 @@ impl LaneNode {
                 sync_target: AtomicU64::new(0),
                 staged: Mutex::new(Default::default()),
                 by_commitment: Mutex::new(by_commitment),
-                scan_misses: Mutex::new(Default::default()),
-                // replay indexed every block above the snapshot it started
-                // from; below that the index is cold and a scan can still pay
-                index_floor: AtomicU64::new(snap_number + 1),
                 inflight: Mutex::new(Default::default()),
                 stage_pending: AtomicU64::new(0),
                 stage_notify: tokio::sync::Notify::new(),
@@ -923,8 +902,6 @@ impl LaneNode {
             .lock()
             .await
             .insert(block.commitment, block.number);
-        // exact invalidation: only THIS commitment can have gone miss -> hit
-        self.scan_misses.lock().await.remove(&block.commitment);
         add_ns(&tm.index_ns, t_index);
         if let Some(s) = digest_state {
             let t_snap = Instant::now();
@@ -1452,8 +1429,6 @@ impl LaneNode {
             .lock()
             .await
             .insert(block.commitment, block.number);
-        // exact invalidation: only THIS commitment can have gone miss -> hit
-        self.scan_misses.lock().await.remove(&block.commitment);
         add_ns(&tm.index_ns, t_index);
         if let Some(s) = digest_state {
             let t_snap = Instant::now();
@@ -1916,13 +1891,12 @@ impl LaneNode {
 
     /// Re-resolve `c` from LOCAL sources only: wait out any in-flight stage of
     /// it, re-read the commitment index, then `locate_wire` (staged -> sync
-    /// queue -> index -> bounded scan). `Ok(None)` means the block is still
+    /// queue -> index). `Ok(None)` means the block is still
     /// nowhere in this process and the caller may spend a peer round trip.
     ///
     /// `always_locate` forces the `locate_wire` even when `await_stage_race`
     /// waited on nothing. The hot path leaves it off on its second attempt —
-    /// no wait means nothing can have changed since the first locate, and one
-    /// locate per attempt is what keeps `log_scans` at 0 on the anchor path.
+    /// no wait means nothing can have changed since the first locate.
     /// The cold-grace caller turns it on, because its evidence may be a STAGED
     /// ENTRY, which carries no claim for `await_stage_race` to see.
     async fn resolve_local(
@@ -1962,13 +1936,9 @@ impl LaneNode {
         c: B256,
         tm: &AnchorTimer,
     ) -> Result<NewBlockOutcome, String> {
-        // Idempotency check against the in-process index ONLY. The block being
-        // decided is by definition not canonical yet, so a miss here is the
-        // normal case; running the bounded backward log scan for it cost one
-        // full-chain read+hash per decide (measured: +1.1 ms per block of
-        // history, 331 ms at height 300) and collapsed cadence. A canonical
-        // block older than the index still anchors correctly through the
-        // bytes path below (known-height comparison in shim_new).
+        // Idempotency check against the commitment index, which is complete
+        // for every canonical block. The block being decided is by definition
+        // not canonical yet, so a miss here is the normal case.
         let t_index = Instant::now();
         let known = self.by_commitment.lock().await.get(&c).copied();
         add_ns(&tm.index_ns, t_index);
@@ -2059,8 +2029,7 @@ impl LaneNode {
     /// (the announcer may be naming a different candidate for the height our
     /// CL is about to anchor; either way the anchor, not a pull, settles it).
     ///
-    /// No log read, no commitment resolve: the `announce_never_scans_the_log`
-    /// invariant holds.
+    /// No log read, no commitment resolve.
     async fn holds_announced(&self, commitment: B256, number: u64, head_n: u64) -> bool {
         {
             let q = self.staged.lock().await;
@@ -2093,11 +2062,9 @@ impl LaneNode {
     /// so it arms after the grace, and a node more than one height behind arms
     /// immediately.
     ///
-    /// INVARIANT (tested: `announce_never_scans_the_log`): this path never
-    /// resolves a commitment against the LOG, so it can never reach the
-    /// backward log scan. It decides on numbers plus two in-memory hash
-    /// lookups — a block above our head cannot be in our log, and one at or
-    /// below it is never pulled backwards.
+    /// This path never touches the log: it decides on numbers plus two
+    /// in-memory hash lookups — a block above our head cannot be in our log,
+    /// and one at or below it is never pulled backwards.
     pub async fn on_announce(&self, commitment: B256, number: u64) {
         self.stats.announces_rx.fetch_add(1, Ordering::Relaxed);
         let head_n = self.head.lock().await.1;
@@ -2218,28 +2185,10 @@ impl LaneNode {
     }
 
     /// Resolve a commitment to block bytes: staged, then the sync queue, then
-    /// the in-process index, then — only where the index is provably
-    /// incomplete — a bounded backward scan of the log. Returns the bytes and
-    /// WHERE they came from (the `hit=` field of `lean_locate`).
-    ///
-    /// The scan is the expensive branch: it reads and keccaks up to
-    /// `SCAN_LIMIT` blocks (1.24 MB each on the fleet), so it is now capped at
-    /// `index_floor - 1`. `by_commitment` is complete from `index_floor`
-    /// upward, so above that line a miss is proof of absence and scanning
-    /// cannot find anything the index did not already have — which is exactly
-    /// the case a peer's `arc_getBlockBytes{commitment}` for a block we have
-    /// not appended hits, on every ask, at a cost that grows with height.
-    /// Below `index_floor` (blocks older than the snapshot this process opened
-    /// on) the scan still runs, unchanged.
-    ///
-    /// A scan that finds nothing is remembered in `scan_misses` (exact
-    /// invalidation: only the appended commitment is removed) so a repeated
-    /// unknown commitment costs one hash check.
-    async fn locate_inner(
-        &self,
-        c: B256,
-        scanned: &mut u64,
-    ) -> Result<Option<(Vec<u8>, &'static str)>, String> {
+    /// the commitment index (complete from height 1, so a miss there is final).
+    /// Returns the bytes and WHERE they came from (the `hit=` field of
+    /// `lean_locate`).
+    async fn locate_inner(&self, c: B256) -> Result<Option<(Vec<u8>, &'static str)>, String> {
         // Staged and queued copies are exactly what the decide anchor asks for;
         // check them before anything that can touch the log.
         if let Some((_, e)) = self.staged.lock().await.iter().find(|(k, _)| *k == c) {
@@ -2258,46 +2207,10 @@ impl LaneNode {
         // awaits the log lock, and holding the commitment index across that
         // await serialises every other lookup behind one disk read.
         let hit = { self.by_commitment.lock().await.get(&c).copied() };
-        if let Some(n) = hit {
-            return Ok(self.block_wire_bytes(n).await?.map(|w| (w, "index")));
+        match hit {
+            Some(n) => Ok(self.block_wire_bytes(n).await?.map(|w| (w, "index"))),
+            None => Ok(None),
         }
-        if self.scan_misses.lock().await.contains(&c) {
-            return Ok(None);
-        }
-        const SCAN_LIMIT: u64 = 1024;
-        let head_n = self.head.lock().await.1;
-        let floor = head_n.saturating_sub(SCAN_LIMIT).max(1);
-        // never re-walk what the index already covers completely
-        let ceil = self
-            .index_floor
-            .load(Ordering::Relaxed)
-            .saturating_sub(1)
-            .min(head_n);
-        if ceil >= floor {
-            self.stats.log_scans.fetch_add(1, Ordering::Relaxed);
-            for n in (floor..=ceil).rev() {
-                *scanned += 1;
-                let Some(b) = self
-                    .log
-                    .lock()
-                    .await
-                    .read_block(n)
-                    .map_err(|e| e.to_string())?
-                else {
-                    continue;
-                };
-                self.by_commitment.lock().await.insert(b.commitment, n);
-                if b.commitment == c {
-                    return Ok(Some((b.to_wire_bytes(), "scan")));
-                }
-            }
-        }
-        let mut misses = self.scan_misses.lock().await;
-        if misses.len() >= 4096 {
-            misses.clear();
-        }
-        misses.insert(c);
-        Ok(None)
     }
 
     /// `locate_inner` + one `lean_locate` line per call under `LEAN_STATS=1`.
@@ -2310,8 +2223,7 @@ impl LaneNode {
         caller: &'static str,
     ) -> Result<Option<(Vec<u8>, &'static str)>, String> {
         let t0 = Instant::now();
-        let mut scanned = 0u64;
-        let r = self.locate_inner(c, &mut scanned).await;
+        let r = self.locate_inner(c).await;
         if stats_enabled() {
             let hit = match &r {
                 Ok(Some((_, h))) => *h,
@@ -2319,10 +2231,9 @@ impl LaneNode {
                 Err(_) => "error",
             };
             println!(
-                "lean_locate caller={} hit={} scanned={} ms={:.2} t_in={:.1}",
+                "lean_locate caller={} hit={} ms={:.2} t_in={:.1}",
                 caller,
                 hit,
-                scanned,
                 ms(t0.elapsed().as_nanos() as u64),
                 since_start_ms(t0),
             );
@@ -2367,7 +2278,6 @@ impl LaneNode {
         let staged = self.staged.lock().await.len();
         let sync_queue = self.sync_queue.lock().await.len();
         let by_commitment = self.by_commitment.lock().await.len();
-        let scan_misses = self.scan_misses.lock().await.len();
         let pending = self.pool.pool_size().pending;
         let s = &self.stats;
         let ms = |ns: u64| ns as f64 / 1_000_000.0;
@@ -2377,7 +2287,7 @@ impl LaneNode {
             // concat! cannot see captured variables, so every arg is positional.
             concat!(
                 "lean_stats head={} accounts={} staged={} ",
-                "sync_queue={} by_commitment={} scan_misses={} log_scans={} ",
+                "sync_queue={} by_commitment={} ",
                 "announce_skipped_staged={} backfill_pulls={} ",
                 "stage_race_waits={} anchor_grace_hits={} anchor_grace_misses={} ",
                 "pool={} build_ms_last={:.1} stage_ms_last={:.1} ",
@@ -2388,8 +2298,6 @@ impl LaneNode {
             staged,
             sync_queue,
             by_commitment,
-            scan_misses,
-            s.log_scans.load(Ordering::Relaxed),
             s.announce_skipped_staged.load(Ordering::Relaxed),
             s.backfill_pulls.load(Ordering::Relaxed),
             s.stage_race_waits.load(Ordering::Relaxed),

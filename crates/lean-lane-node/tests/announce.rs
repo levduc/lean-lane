@@ -195,11 +195,6 @@ async fn announcing_a_different_candidate_at_a_staged_height_pulls_nothing() {
         "no HTTP request may be made"
     );
     assert_eq!(n.stats.backfill_pulls.load(Ordering::Relaxed), 0);
-    assert_eq!(
-        n.stats.log_scans.load(Ordering::Relaxed),
-        0,
-        "and still no log scan"
-    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -351,10 +346,5 @@ async fn the_anchor_waits_out_an_in_flight_commit_of_the_same_block() {
         n.stats.block_pulls.load(Ordering::Relaxed),
         0,
         "and no peer fetch"
-    );
-    assert_eq!(
-        n.stats.log_scans.load(Ordering::Relaxed),
-        0,
-        "and no log scan"
     );
 }
