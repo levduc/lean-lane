@@ -1,2 +1,7 @@
 target/
 lean-lane-data/
+
+# bench: the real fleet topology and run artefacts never enter git
+bench/fleet/fleet.env
+bench/runs/
+__pycache__/

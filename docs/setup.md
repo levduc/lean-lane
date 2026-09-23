@@ -40,14 +40,8 @@ Enable on all validators together, from height 1 of a fresh chain.
 - `scripts/lean-replay-bench.py SRC_RPC TGT_RPC` — replays a live node's
   canonical blocks into a fresh node and reports pure import throughput.
 
-## Measured (4-validator fleet, Arc CL, 500 ms pacer, blocks 100 % of budget)
+## Measured
 
-| config | blk/s | tx/s | payments/s |
-|---|---|---|---|
-| N=1, 100 M gas | 1.96 | 6,401 | 6,401 |
-| N=100, 150 M gas | 1.93 | 555 | 55,534 |
-| N=100, 225 M gas | 1.93 | 833 | 83,286 |
-| mixed N (avg 3.8), 225 M, parallel recovery | 1.86 | 10,504 | 39,484 |
-
-Pure import (no consensus): ~1.0 M outputs/s. Execution is 7–15 % of a height;
-consensus transport is the bound. Run-to-run spread ±15 %, n=1 for most points.
+Fleet numbers, and the runner and protocol that produced them, live in
+`bench/README.md`. Pure import (no consensus) is ~1.0 M outputs/s; execution
+is 7–15 % of a height, consensus transport is the bound.

@@ -142,3 +142,5 @@ python3 scripts/lean-replay-bench.py SRC_RPC TGT_RPC   # import rate from a live
   commitment formula, SYNCING semantics) and what the consensus layer does at
   each phase. This is the plug-and-play boundary.
 - `docs/setup.md` — fresh-machine and multi-machine notes.
+- `bench/README.md` — the multi-machine fleet runner, the measurement
+  protocol, and the reference numbers.

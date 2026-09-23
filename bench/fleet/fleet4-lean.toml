@@ -1,0 +1,36 @@
+# fleet4-lean — quake scenario for the 4-machine lean-lane fleet.
+#
+# Rendered LOCALLY only: `bench/fleet/fleet up` runs `quake -f <per-run copy of
+# this file> setup` inside the arc checkout ($ARC_DIR), then split-compose.py
+# moves validators 2..4 onto their own hosts. Never start it as-is on one box.
+#
+# The per-run copy is templated by up.sh (this file is never edited):
+#   ARC_PAYMENT_LEAN_BUDGET_GAS  <- $BUDGET_GAS
+#   @PEER_RPCS@                  <- http://<FLEET_IPS[i]>:8560 for every validator
+#   LANE=evm                     strips every ARC_PAYMENT_LEAN_* line (stock CL)
+#
+# Each CL drives the lean node on ITS OWN host, reached from the container via
+# the docker bridge gateway 172.17.0.1.
+
+cl.config.execution_persistence_backpressure = true
+
+[cl.env]
+ARC_PAYMENT_LEAN_LANE = "1"
+ARC_PAYMENT_LEAN_BUDGET_GAS = "150000000"
+ARC_PAYMENT_LEAN_PEER_RPCS = "@PEER_RPCS@"
+
+[nodes.validator1]
+cl_suggested_fee_recipient = "0x1111111111111111111111111111111111111111"
+cl.env = { ARC_PAYMENT_LEAN_RPC = "http://172.17.0.1:8560" }
+
+[nodes.validator2]
+cl_suggested_fee_recipient = "0x2222222222222222222222222222222222222222"
+cl.env = { ARC_PAYMENT_LEAN_RPC = "http://172.17.0.1:8560" }
+
+[nodes.validator3]
+cl_suggested_fee_recipient = "0x3333333333333333333333333333333333333333"
+cl.env = { ARC_PAYMENT_LEAN_RPC = "http://172.17.0.1:8560" }
+
+[nodes.validator4]
+cl_suggested_fee_recipient = "0x4444444444444444444444444444444444444444"
+cl.env = { ARC_PAYMENT_LEAN_RPC = "http://172.17.0.1:8560" }

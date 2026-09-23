@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# fleet [--dry-run] <command> — run the lean payment lane (or, LANE=evm, the
+# plain EVM lane) on a small multi-machine fleet and measure it.
+#
+#   up                      render (quake) + ship + boot + health gate
+#   load                    LOAD_SECS of offered load + per-minute sampler
+#   status | health         agreement / the boot health gate again
+#   logs                    capture CL/EL logs on every machine and pull them here
+#   set-gas-limit [gas]     EVM lane: change the block gas limit live (governance)
+#   restart-cl <n>          fault leg: bounce validator n's CL
+#   kill-lean <n> <secs>    fault leg: validator n's lean node down for <secs>
+#   down                    capture + pull logs, then stop (data is kept)
+#   purge <run-id> --yes    delete a run's data on every machine (root container)
+#
+# Validator 1 is THIS machine; 2..N are reached with $SSH_CMD. Each machine runs
+# one CL+EL pair (docker, rendered by the arc checkout's quake) and one lean
+# node as a host process on :8560. Config: bench/fleet/fleet.env (copy the
+# .example); knobs such as LANE, BUDGET_GAS, FANOUT, LOAD_SECS can be given in
+# the environment and always win over the file. See bench/README.md.
+#
+# Ops landmines this script is built around:
+#  - lean nodes start BEFORE the CLs: a CL that boots while its lean node is
+#    down parks forever ("Manual intervention required");
+#  - some ssh transports' exit codes lie (tailscale ssh after its session
+#    check expires): every remote effect is verified by reading it back;
+#  - kill and launch are separate remote calls; remote daemons are
+#    `(setsid nohup .. &) </dev/null`; processes are matched by binary path,
+#    never `pkill -f` (which matches the shell carrying the pattern);
+#  - RPC bodies go through files, never argv (a full block is ~1 MB);
+#  - never wipe a lean chain under a live CL chain; enable the lane from
+#    height 1 of a fresh chain only;
+#  - container-written data is root-owned: wipe it through a root container.
+set -uo pipefail
+FLEET_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+DRY=0
+if [ "${1:-}" = --dry-run ]; then DRY=1; shift; fi
+# shellcheck source=lib.sh
+. "$FLEET_DIR/lib.sh"
+# shellcheck source=up.sh
+. "$FLEET_DIR/up.sh"
+# shellcheck source=load.sh
+. "$FLEET_DIR/load.sh"
+# shellcheck source=ops.sh
+. "$FLEET_DIR/ops.sh"
+
+ACTION=${1:-}; [ $# -gt 0 ] && shift
+fleet_init "$ACTION"
+dry && say "DRY RUN — nothing is executed; config $CFG, $N validators, ARC_DIR=${ARC_DIR:-unset}"
+
+# Sourceable for tests: FLEET_SOURCE_ONLY=1 . bench/fleet/fleet defines every
+# function, dispatches nothing and touches no machine.
+if [ -n "${FLEET_SOURCE_ONLY:-}" ]; then return 0 2>/dev/null || exit 0; fi
+
+case "$ACTION" in
+  up) up ;;
+  load) load ;;
+  status) status ;;
+  health) health_gate ;;
+  logs) capture_logs; pull_logs ;;
+  set-gas-limit) set_gas_limit "$@" ;;
+  restart-cl) restart_cl "$@" ;;
+  kill-lean) kill_lean "$@" ;;
+  down) down ;;
+  purge) purge "$@" ;;
+  *) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac
