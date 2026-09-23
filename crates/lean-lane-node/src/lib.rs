@@ -10,6 +10,7 @@ pub mod chain;
 pub mod exec;
 pub mod metrics;
 pub mod node;
+pub mod pool;
 pub mod provider;
 pub mod rpc;
 pub mod state;

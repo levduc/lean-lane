@@ -40,7 +40,6 @@
 //! * No receipts or logs are produced or committed.
 
 pub mod envelope;
-pub mod pool;
 
 use alloy_primitives::{keccak256, Address, B256};
 use secp256k1::ecdsa::{RecoverableSignature, RecoveryId};

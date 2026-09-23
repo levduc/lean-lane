@@ -7,21 +7,17 @@
 use crate::chain::{genesis_commitment, BlockLog, LeanBlock};
 use crate::exec::{apply_block, execute, Delta};
 use crate::metrics::{rss_mb, AnchorPath, Metrics, PathCell};
+use crate::pool::{ArcPooledTx, LanePool};
 use crate::provider::LeanProvider;
 use crate::state::{Acct, FlatState};
 use alloy_consensus::Transaction as _;
 use alloy_eips::eip2718::Decodable2718;
 use alloy_primitives::{Address, B256, U256};
 use lean_native::envelope::{set_lane_chain_id, ArcTxEnvelope, LEAN_TX_TYPE};
-use lean_native::pool::ArcPooledTx;
 use lean_native::LeanTx;
-use reth_evm_ethereum::EthEvmConfig;
 use reth_primitives_traits::SignerRecoverable;
-use reth_transaction_pool::blobstore::InMemoryBlobStore;
-use reth_transaction_pool::validate::{EthTransactionValidator, EthTransactionValidatorBuilder};
 use reth_transaction_pool::{
-    CoinbaseTipOrdering, Pool, PoolConfig, PoolTransaction, SubPoolLimit, TransactionOrigin,
-    TransactionPool, TransactionPoolExt,
+    PoolTransaction, TransactionOrigin, TransactionPool, TransactionPoolExt,
 };
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -34,12 +30,6 @@ mod commit;
 mod shim;
 mod stage;
 mod sync;
-
-pub type LanePool = Pool<
-    EthTransactionValidator<LeanProvider, ArcPooledTx, EthEvmConfig>,
-    CoinbaseTipOrdering<ArcPooledTx>,
-    InMemoryBlobStore,
->;
 
 pub struct Config {
     pub datadir: PathBuf,
@@ -344,37 +334,7 @@ impl LaneNode {
         let provider = LeanProvider::new();
         provider.load_from(&state);
         provider.set_head(head.1);
-        let validator =
-            EthTransactionValidatorBuilder::new(provider.clone(), EthEvmConfig::mainnet())
-                .with_custom_tx_type(LEAN_TX_TYPE)
-                .build(InMemoryBlobStore::default());
-        // Lane pool caps: the fleet launchers' deep-pool trio (counts 400k /
-        // 512MB / big account slots) — default reth caps (~10k) reject bulk
-        // ingress (measured: first bench run bounced 1,772 of 30k).
-        let big = SubPoolLimit {
-            max_txs: 400_000,
-            max_size: 512 * 1024 * 1024,
-        };
-        let pool_cfg = PoolConfig {
-            pending_limit: big,
-            basefee_limit: big,
-            queued_limit: big,
-            // 256 was too small for payment-lane senders: with per-node pools
-            // governed to ~30k txs over ~200 senders, drain is BURSTY (a node's
-            // pool empties only on its own proposer turns), so per-sender depth
-            // variance crossed 256 -> reth flags the sender as a spammer
-            // (ExceededSenderTransactionsCapacity) and DROPS the tx; the nonce
-            // gap then poisons the sender's whole remaining stream. Measured
-            // 2026-08-26: 62% of a 2.4M-tx feed bounced, blocks 35-42% full.
-            max_account_slots: 4096,
-            ..Default::default()
-        };
-        let pool = Pool::new(
-            validator,
-            CoinbaseTipOrdering::default(),
-            InMemoryBlobStore::default(),
-            pool_cfg,
-        );
+        let pool = crate::pool::new_lane_pool(provider.clone());
         let peer_clients = cfg
             .peers
             .iter()

@@ -1,9 +1,10 @@
 //! Pool integration: `ArcPooledTx` — the lean-aware pool
-//! transaction, usable with reth's UNMODIFIED `EthTransactionValidator` and
+//! transaction (moved here from lean-native, which is now only the wire
+//! format and signing), usable with reth's UNMODIFIED `EthTransactionValidator` and
 //! `Pool` (the validator accepts type `0x50` via its existing
 //! `with_custom_tx_type` hook; funds/nonce/gas checks run through the generic
 //! accessors, which the lean variant answers synthetically — see
-//! `envelope.rs`).
+//! `lean_native::envelope`).
 //!
 //! `Pooled == Consensus == ArcTxEnvelope`: the lane carries no blob sidecars,
 //! so the pooled and consensus wire forms coincide and the std reflexive
@@ -12,7 +13,7 @@
 //! the validator rejects 4844 on the lane, and the blob-specific
 //! `EthPoolTransaction` methods below answer "not a blob transaction".
 
-use crate::envelope::ArcTxEnvelope;
+use crate::provider::LeanProvider;
 use alloy_consensus::transaction::{Recovered, TxHashRef};
 use alloy_consensus::{InMemorySize, Transaction};
 use alloy_eips::eip2718::{Encodable2718, Typed2718};
@@ -22,8 +23,14 @@ use alloy_eips::eip4844::BlobTransactionValidationError;
 use alloy_eips::eip7594::BlobTransactionSidecarVariant;
 use alloy_eips::eip7702::SignedAuthorization;
 use alloy_primitives::{Address, Bytes, TxHash, TxKind, B256, U256};
+use lean_native::envelope::ArcTxEnvelope;
+use lean_native::envelope::LEAN_TX_TYPE;
+use reth_evm_ethereum::EthEvmConfig;
+use reth_transaction_pool::blobstore::InMemoryBlobStore;
+use reth_transaction_pool::validate::{EthTransactionValidator, EthTransactionValidatorBuilder};
 use reth_transaction_pool::{
-    EthBlobTransactionSidecar, EthPoolTransaction, EthPooledTransaction, PoolTransaction,
+    CoinbaseTipOrdering, EthBlobTransactionSidecar, EthPoolTransaction, EthPooledTransaction, Pool,
+    PoolConfig, PoolTransaction, SubPoolLimit,
 };
 use std::sync::Arc;
 
@@ -37,6 +44,48 @@ impl ArcPooledTx {
     pub fn new(transaction: Recovered<ArcTxEnvelope>, encoded_length: usize) -> Self {
         Self(EthPooledTransaction::new(transaction, encoded_length))
     }
+}
+
+/// The lane's transaction pool: reth's unmodified validator and pool over
+/// `ArcPooledTx`, answering state questions from the node's `LeanProvider`.
+pub type LanePool = Pool<
+    EthTransactionValidator<LeanProvider, ArcPooledTx, EthEvmConfig>,
+    CoinbaseTipOrdering<ArcPooledTx>,
+    InMemoryBlobStore,
+>;
+
+/// Build the lane pool over `provider` with the lane's caps.
+pub fn new_lane_pool(provider: LeanProvider) -> LanePool {
+    let validator = EthTransactionValidatorBuilder::new(provider, EthEvmConfig::mainnet())
+        .with_custom_tx_type(LEAN_TX_TYPE)
+        .build(InMemoryBlobStore::default());
+    // Lane pool caps: the fleet launchers' deep-pool trio (counts 400k /
+    // 512MB / big account slots) — default reth caps (~10k) reject bulk
+    // ingress (measured: first bench run bounced 1,772 of 30k).
+    let big = SubPoolLimit {
+        max_txs: 400_000,
+        max_size: 512 * 1024 * 1024,
+    };
+    let pool_cfg = PoolConfig {
+        pending_limit: big,
+        basefee_limit: big,
+        queued_limit: big,
+        // 256 was too small for payment-lane senders: with per-node pools
+        // governed to ~30k txs over ~200 senders, drain is BURSTY (a node's
+        // pool empties only on its own proposer turns), so per-sender depth
+        // variance crossed 256 -> reth flags the sender as a spammer
+        // (ExceededSenderTransactionsCapacity) and DROPS the tx; the nonce
+        // gap then poisons the sender's whole remaining stream. Measured
+        // 2026-08-26: 62% of a 2.4M-tx feed bounced, blocks 35-42% full.
+        max_account_slots: 4096,
+        ..Default::default()
+    };
+    Pool::new(
+        validator,
+        CoinbaseTipOrdering::default(),
+        InMemoryBlobStore::default(),
+        pool_cfg,
+    )
 }
 
 // --- alloy Transaction + friends by delegation to the envelope --------------
@@ -197,17 +246,14 @@ impl EthPoolTransaction for ArcPooledTx {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::envelope::{current_lane_domain, LeanSigned, LEAN_TX_TYPE};
-    use crate::{lean_fee, LeanTx, Output};
     use alloy_eips::Decodable2718;
+    use lean_native::envelope::{current_lane_domain, LeanSigned, LEAN_TX_TYPE};
+    use lean_native::{lean_fee, LeanTx, Output};
     use secp256k1::SecretKey;
 
-    // NOTE: the provider-backed pool ADMISSION tests (funded-accept + stale-nonce/
+    // The provider-backed pool ADMISSION tests (funded-accept + stale-nonce/
     // insufficient-funds/oversized-N/unconfigured-type rejects, real
-    // Pool::add_external_transaction round-trip) live in
-    // `lean-lane-node/tests/admission.rs` — they need a StateProviderFactory, and
-    // `LeanProvider` lives in that crate. Keeping them out of lean-native is what
-    // lets lean-native stay free of any provider dependency.
+    // Pool::add_external_transaction round-trip) live in `tests/admission.rs`.
 
     fn sk(i: u64) -> SecretKey {
         let mut b = [0u8; 32];
@@ -240,7 +286,7 @@ mod tests {
         let mut zero = vec![LEAN_TX_TYPE];
         zero.extend_from_slice(&0u32.to_le_bytes());
         zero.extend_from_slice(&0u16.to_le_bytes());
-        zero.extend_from_slice(&[0u8; crate::SIG_LEN]);
+        zero.extend_from_slice(&[0u8; lean_native::SIG_LEN]);
         assert!(ArcTxEnvelope::decode_2718(&mut zero.as_slice()).is_err());
         // garbage recovery id -> decodes, but signer recovery must fail
         let good = lean_pooled(1, 6, 0);
@@ -255,7 +301,7 @@ mod tests {
     fn pool_cost_is_fee_plus_value() {
         let tx = lean_pooled(3, 7, 0);
         let expected =
-            U256::from(lean_fee(3)) + U256::from((100u128 + 101 + 102) * crate::AMOUNT_UNIT);
+            U256::from(lean_fee(3)) + U256::from((100u128 + 101 + 102) * lean_native::AMOUNT_UNIT);
         assert_eq!(*tx.cost(), expected);
     }
 }

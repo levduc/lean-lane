@@ -6,8 +6,8 @@ the workspace builds against upstream reth `v2.3.0`.
 
 | crate | what |
 |---|---|
-| `crates/lean-native` | the fan-out transaction wire format (`0x50`, one signature, N outputs, 72 + 28N bytes) and its pool integration |
-| `crates/lean-lane-node` | the node: flat nonce+balance state, keccak commitment chain, append-only log + snapshots, gossip/backfill self-healing, and the JSON-RPC shim the consensus layer drives |
+| `crates/lean-native` | the fan-out transaction wire format (`0x50`, one signature, N outputs, 72 + 28N bytes) and its signing (no reth dependency) |
+| `crates/lean-lane-node` | the node: the reth pool integration (`ArcPooledTx`), flat nonce+balance state, keccak commitment chain, append-only log + snapshots, gossip/backfill self-healing, and the JSON-RPC shim the consensus layer drives |
 | `crates/spammer` | load generator (EVM transfers and lean fan-out, weighted mixes) |
 
 The node has **no Ethereum header, no state trie, no forkchoice**. A block is
