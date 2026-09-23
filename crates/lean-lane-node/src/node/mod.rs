@@ -27,6 +27,7 @@ use tokio::sync::Mutex;
 
 mod build;
 mod commit;
+mod peers;
 mod shim;
 mod stage;
 mod sync;
@@ -59,6 +60,12 @@ pub struct Config {
     /// waits for an `arc_stageBlock` that has not ARRIVED yet (see
     /// `await_anchor_grace`). 0 disables it.
     pub anchor_grace_ms: u64,
+    /// How many peers one block pull (anchor fallback, backfill) asks
+    /// CONCURRENTLY; the first valid answer wins (see `peers::pull_block`).
+    pub peer_fanout: usize,
+    /// How many peers hear an announce-on-append: `None` = all of them, else
+    /// a fresh random subset of this size per block.
+    pub announce_fanout: Option<usize>,
 }
 
 impl Config {
@@ -82,6 +89,8 @@ impl Default for Config {
             stats: false,
             announce_grace_ms: 250,
             anchor_grace_ms: 60,
+            peer_fanout: 3,
+            announce_fanout: None,
         }
     }
 }
@@ -335,17 +344,7 @@ impl LaneNode {
         provider.load_from(&state);
         provider.set_head(head.1);
         let pool = crate::pool::new_lane_pool(provider.clone());
-        let peer_clients = cfg
-            .peers
-            .iter()
-            .filter_map(|u| {
-                jsonrpsee::http_client::HttpClientBuilder::default()
-                    .max_request_size(64 * 1024 * 1024)
-                    .request_timeout(std::time::Duration::from_secs(4))
-                    .build(u)
-                    .ok()
-            })
-            .collect();
+        let peer_clients = Self::peer_clients(&cfg.peers);
         Ok((
             Self {
                 cfg,

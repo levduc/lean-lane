@@ -82,6 +82,8 @@ read an environment variable as a fallback, shown in the table.
 | `--stats` (env `LEAN_STATS=1`) | off | one `lean_stats` line (counters and sizes) at info every 10 s |
 | `--announce-grace-ms` (env `LEAN_ANNOUNCE_GRACE_MS`) | 250 | how long an announcement for head+1 that this node does not hold waits for its own CL's anchor before the backfill pulls it; `0` pulls at once |
 | `--anchor-grace-ms` (env `LEAN_ANCHOR_GRACE_MS`) | 60 | how long an `arc_newBlock{commitment}` that holds none of the block waits for a stage that has not arrived yet before pulling from a peer; `0` disables |
+| `--peer-fanout` | 3 | how many peers one block pull (the anchor's peer fallback, the backfill) asks concurrently; the peer order is shuffled per request and the first answer whose bytes hash to the requested block wins |
+| `--announce-fanout` | all peers | how many peers hear the announce-on-append: a random subset of this size per block (bounds gossip on large networks) |
 
 The consensus layer always drives the chain (`arc_buildBlock` /
 `arc_newBlock`); there is no self-driving mode, so `--shim` is accepted and

@@ -306,27 +306,13 @@ impl LaneNode {
                 return Ok(o);
             }
         }
-        for cl in &self.peer_clients {
-            use jsonrpsee::core::client::ClientT;
-            let mut params = jsonrpsee::core::params::ObjectParams::new();
-            let _ = params.insert("commitment", format!("{c}"));
-            let r: Result<serde_json::Value, _> = cl.request("arc_getBlockBytes", params).await;
-            let Ok(v) = r else { continue };
-            let Some(b64) = v.get("blockBytes").and_then(|x| x.as_str()) else {
-                continue;
-            };
-            let Ok(bytes) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
-            else {
-                continue;
-            };
-            match LeanBlock::from_wire_bytes(&bytes) {
-                Ok(b) if b.commitment == c => {
-                    Metrics::inc(&self.metrics.block_pulls);
-                    path.set(AnchorPath::Peer);
-                    return self.shim_new_inner(&bytes, path).await;
-                }
-                _ => continue, // peer served the wrong block: ignore it
-            }
+        let fetched = self
+            .pull_block(peers::BlockQuery::Commitment(c), |h| h.commitment == c)
+            .await;
+        if let Some(bytes) = fetched {
+            Metrics::inc(&self.metrics.block_pulls);
+            path.set(AnchorPath::Peer);
+            return self.shim_new_inner(&bytes, path).await;
         }
         // every peer missed or failed
         let head_n = self.head.lock().await.1;

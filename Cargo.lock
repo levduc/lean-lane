@@ -2890,6 +2890,7 @@ dependencies = [
  "eyre",
  "jsonrpsee",
  "lean-native",
+ "rand 0.8.6",
  "rayon",
  "reth-chainspec",
  "reth-db-models",

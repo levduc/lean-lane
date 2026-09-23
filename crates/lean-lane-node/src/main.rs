@@ -67,6 +67,14 @@ struct RunArgs {
     /// Wait for a not-yet-arrived stage before an anchor pulls from a peer (ms).
     #[arg(long, default_value_t = 60, env = "LEAN_ANCHOR_GRACE_MS")]
     anchor_grace_ms: u64,
+    /// Peers asked concurrently for a missing block (anchor fallback,
+    /// backfill); the order is shuffled per request, first valid answer wins.
+    #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u64).range(1..))]
+    peer_fanout: u64,
+    /// Peers announced to on every append: a random subset of this size per
+    /// block (default: all peers).
+    #[arg(long)]
+    announce_fanout: Option<usize>,
 }
 
 #[tokio::main]
@@ -109,6 +117,8 @@ async fn run(args: RunArgs) -> eyre::Result<()> {
         stats: args.stats,
         announce_grace_ms: args.announce_grace_ms,
         anchor_grace_ms: args.anchor_grace_ms,
+        peer_fanout: args.peer_fanout as usize,
+        announce_fanout: args.announce_fanout,
         ..Default::default()
     };
     let port = args.port;

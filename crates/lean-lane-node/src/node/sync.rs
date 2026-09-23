@@ -22,9 +22,10 @@ impl LaneNode {
     /// healthy chain every validator's CL anchors every block into its own
     /// node, so full-block pushes were 100% redundant link saturation
     /// (measured: wifi validator moved 11.2MB per 1.65MB block under v1.1
-    /// push). Receivers pull only what they don't have.
+    /// push). Receivers pull only what they don't have. Sent to every peer,
+    /// or to a random `--announce-fanout` subset per block (`announce_targets`).
     pub(super) fn announce_to_peers(&self, commitment: B256, number: u64) {
-        for c in self.peer_clients.clone() {
+        for c in self.announce_targets() {
             tokio::spawn(async move {
                 use jsonrpsee::core::client::ClientT;
                 let mut params = jsonrpsee::core::params::ObjectParams::new();
@@ -120,7 +121,8 @@ impl LaneNode {
     }
 
     /// Background backfill: when a SYNCING entry exists, fetch gap blocks
-    /// (head+1 upward) from peers and apply in order; queued blocks drain via
+    /// (head+1 upward) from peers — shuffled and raced, first valid answer
+    /// wins (`pull_block`) — and apply in order; queued blocks drain via
     /// the shim_new apply path. Gives up after ~10s without progress; retried
     /// on the next trigger.
     pub fn spawn_sync(self: &std::sync::Arc<Self>) {
@@ -138,34 +140,22 @@ impl LaneNode {
                     if last_progress.elapsed() > std::time::Duration::from_secs(10) {
                         break; // give up; next SYNCING trigger retries
                     }
-                    let (_, head_n, _) = *node.head.lock().await;
+                    let (head_c, head_n, _) = *node.head.lock().await;
                     let want = head_n + 1;
+                    let fetched = node
+                        .pull_block(peers::BlockQuery::Number(want), |h| {
+                            h.number == want && h.parent == head_c
+                        })
+                        .await;
                     let mut got = false;
-                    for c in &node.peer_clients {
-                        use jsonrpsee::core::client::ClientT;
-                        let mut params = jsonrpsee::core::params::ObjectParams::new();
-                        let _ = params.insert("number", want);
-                        let r: Result<serde_json::Value, _> =
-                            c.request("arc_getBlockBytes", params).await;
-                        if let Ok(v) = r {
-                            if let Some(b64) = v.get("blockBytes").and_then(|x| x.as_str()) {
-                                if let Ok(bytes) = base64::Engine::decode(
-                                    &base64::engine::general_purpose::STANDARD,
-                                    b64,
-                                ) {
-                                    Metrics::inc(&node.metrics.block_pulls);
-                                    Metrics::inc(&node.metrics.backfill_pulls);
-                                    let path = PathCell::default();
-                                    if matches!(
-                                        node.shim_new_inner(&bytes, &path).await,
-                                        Ok(NewBlockOutcome::Valid(_))
-                                    ) {
-                                        got = true;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
+                    if let Some(bytes) = fetched {
+                        Metrics::inc(&node.metrics.block_pulls);
+                        Metrics::inc(&node.metrics.backfill_pulls);
+                        let path = PathCell::default();
+                        got = matches!(
+                            node.shim_new_inner(&bytes, &path).await,
+                            Ok(NewBlockOutcome::Valid(_))
+                        );
                     }
                     if got {
                         last_progress = std::time::Instant::now();
