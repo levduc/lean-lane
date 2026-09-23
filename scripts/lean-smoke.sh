@@ -142,11 +142,11 @@ if [ "$MIXED" = 1 ]; then
   say "avg N=$AVG_N (mix realized)"
 fi
 
-# ---- V4: replay invariance — a FRESH node with LEAN_PARALLEL_RECOVERY=1 must
-# reach the same head commitment from the same block bytes.
+# ---- V4: replay invariance — a FRESH node fed the same block bytes must reach
+# the same head commitment.
 RP=8574
-say "V4: replaying $HEIGHTS blocks into a parallel-recovery node on :$RP"
-LEAN_PARALLEL_RECOVERY=1 setsid "$BIN" run --datadir "$RUN/replay" --port $RP --bind 127.0.0.1 \
+say "V4: replaying $HEIGHTS blocks into a fresh node on :$RP"
+setsid "$BIN" run --datadir "$RUN/replay" --port $RP --bind 127.0.0.1 \
   --chain-id $CHAIN --shim --fund-file "$FUND" \
   --fund-balance 10000000000000000000 > "$RUN/replay.log" 2>&1 &
 disown
@@ -160,10 +160,10 @@ for h in $(seq 1 "$HEIGHTS"); do
   echo "$r" | grep -q '"commitment"' || { echo "FAIL: V4 replay rejected block $h"; echo "$r" | head -c 200; exit 1; }
 done
 RC=$(rpc $RP arc_getHead '{}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["result"]["commitment"])')
-[ "$RC" = "${comms[0]}" ] || { echo "FAIL: V4 DIVERGENCE — parallel-recovery replay head $RC vs ${comms[0]}"; exit 1; }
+[ "$RC" = "${comms[0]}" ] || { echo "FAIL: V4 DIVERGENCE — replay head $RC vs ${comms[0]}"; exit 1; }
 pid=$(ss -ltnp 2>/dev/null | grep ":$RP " | grep -oP 'pid=\K[0-9]+' | head -1)
 [ -n "${pid:-}" ] && kill -9 "$pid" 2>/dev/null
-say "V4 ok: parallel-recovery node reached identical commitment"
+say "V4 ok: replay node reached identical commitment"
 echo
 echo "✅ PASS — lean lane runs from this repo alone"
 echo "   $HEIGHTS heights · $txs transactions · $outs payments · avg N=$AVG_N · 3/3 nodes at ${comms[0]:0:18}..."

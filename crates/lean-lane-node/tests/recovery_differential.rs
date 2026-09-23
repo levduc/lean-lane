@@ -1,14 +1,33 @@
-//! V3 (roadmap §8): the consensus-critical gate for parallel recovery.
-//! `decode_block_txs_parallel` must return the IDENTICAL item vector — order,
-//! skips, senders, hashes — as the serial path, on mixed-N blocks with invalid
-//! entries interleaved. A single divergence here is a chain split.
+//! The consensus-critical gate for parallel recovery: `decode_block_txs`
+//! (rayon) must return the IDENTICAL item vector — order, skips, senders,
+//! hashes — as a plain serial decode, on mixed-N blocks with invalid entries
+//! interleaved. A single divergence here is a chain split.
 
-use alloy_eips::Encodable2718;
-use alloy_primitives::Address;
-use lean_lane_node::node::{decode_block_txs_parallel, decode_block_txs_serial};
+use alloy_eips::{Decodable2718, Encodable2718};
+use alloy_primitives::{Address, B256};
+use lean_lane_node::node::decode_block_txs as decode_block_txs_parallel;
 use lean_native::envelope::{current_lane_domain, ArcTxEnvelope, LeanSigned};
 use lean_native::{LeanTx, Output};
+use reth_primitives_traits::SignerRecoverable;
 use secp256k1::SecretKey;
+
+/// The serial oracle: one tx at a time, same skips.
+fn decode_block_txs_serial(txs: &[Vec<u8>]) -> Vec<(Address, LeanTx, B256)> {
+    let mut items = Vec::with_capacity(txs.len());
+    for bytes in txs {
+        let Ok(env) = ArcTxEnvelope::decode_2718(&mut bytes.as_slice()) else {
+            continue;
+        };
+        let Ok(signer) = env.recover_signer() else {
+            continue;
+        };
+        if let ArcTxEnvelope::Lean(lean) = env {
+            let hash = *lean.hash();
+            items.push((signer, lean.tx().clone(), hash));
+        }
+    }
+    items
+}
 
 fn sk(i: u64) -> SecretKey {
     let mut b = [0u8; 32];

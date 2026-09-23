@@ -1,20 +1,12 @@
-//! Lean lane node binary.
+//! Lean lane node binary. `lean-lane-node run --help` lists every flag.
 //!
-//!   lean-lane-node run   [--datadir D] [--port P] [--block-ms T] [--budget-gas G]
-//!                        [--snapshot-every K] [--receipt-ring N] [--chain-id C]
-//!   lean-lane-node bench [--txs M] [--mix 1,10,100] [--block-ms T] [--budget-gas G]
-//!                        [--datadir D]
-//!
-//! `--snapshot-every 0` means NEVER snapshot (recovery then replays the whole
-//! log from genesis). `--receipt-ring N` caps the in-memory receipt ring; 0
-//! keeps no receipts at all (`eth_getTransactionReceipt` answers null).
-//!
-//! `bench` is the 2b' gate: generate M fan-out txs (mixed N), submit through
-//! the REAL RPC batch endpoint into the REAL reth pool, drive the
-//! build-execute-commit loop at a fixed cadence, and report sustained
-//! outputs/s + the per-stage split + log bytes/output + recovery time.
+//! `bench` generates M fan-out txs (mixed N), submits them through the real
+//! RPC batch endpoint into the real reth pool, drives the
+//! build-execute-commit loop at a fixed cadence, and reports sustained
+//! outputs/s, the per-stage split, log bytes/output and recovery time.
 
 use alloy_primitives::Address;
+use clap::{Parser, Subcommand};
 use jsonrpsee::core::client::ClientT;
 use jsonrpsee::http_client::HttpClientBuilder;
 use jsonrpsee::rpc_params;
@@ -28,12 +20,93 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-fn arg<T: std::str::FromStr>(args: &[String], name: &str, default: T) -> T {
-    args.iter()
-        .position(|a| a == name)
-        .and_then(|i| args.get(i + 1))
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+#[derive(Parser)]
+#[command(
+    name = "lean-lane-node",
+    version,
+    about = "Lean payment-lane execution node"
+)]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Run the node.
+    Run(RunArgs),
+    /// Self-contained throughput + recovery bench on a temp datadir.
+    Bench(BenchArgs),
+}
+
+#[derive(clap::Args)]
+struct RunArgs {
+    /// Data directory (block log + state snapshots).
+    #[arg(long, default_value = "lean-lane-data")]
+    datadir: std::path::PathBuf,
+    /// RPC listen port.
+    #[arg(long, default_value_t = 8560)]
+    port: u16,
+    /// RPC listen address.
+    #[arg(long, default_value = "127.0.0.1")]
+    bind: std::net::IpAddr,
+    /// Lane chain id (signing domain + genesis commitment).
+    #[arg(long, default_value_t = 1338)]
+    chain_id: u64,
+    /// Gas budget per self-driven block (ignored with --shim).
+    #[arg(long, default_value_t = 150_000_000)]
+    budget_gas: u64,
+    /// Self-driven block interval in ms (ignored with --shim).
+    #[arg(long, default_value_t = 250)]
+    block_ms: u64,
+    /// Blocks between state snapshots; 0 = never (recovery replays the log).
+    #[arg(long, default_value_t = 1024)]
+    snapshot_every: u64,
+    /// Receipts kept in memory for eth_getTransactionReceipt; 0 keeps none.
+    #[arg(long, default_value_t = 200_000)]
+    receipt_ring: usize,
+    /// Comma-separated peer lean-node RPC urls (backfill + announce targets).
+    #[arg(long, value_delimiter = ',')]
+    peers: Vec<String>,
+    /// One 0x-address per line, each funded with --fund-balance. Applied only
+    /// to a fresh datadir (recovered state wins).
+    #[arg(long)]
+    fund_file: Option<std::path::PathBuf>,
+    /// Genesis balance per funded account, in wei.
+    #[arg(long, default_value_t = 1_000_000_000_000_000)]
+    fund_balance: u128,
+    /// CL-driven mode: only arc_newBlock advances the chain.
+    #[arg(long)]
+    shim: bool,
+    /// Do not fsync the block log after each append (a crash may lose the
+    /// log tail; peers backfill it).
+    #[arg(long)]
+    no_fsync: bool,
+    /// Periodic `lean_stats` line + per-call anchor/stage/locate lines.
+    #[arg(long, env = "LEAN_STATS", value_parser = clap::builder::BoolishValueParser::new())]
+    stats: bool,
+    /// Wait for our own CL's anchor before pulling an announced head+1 (ms).
+    #[arg(long, default_value_t = 250, env = "LEAN_ANNOUNCE_GRACE_MS")]
+    announce_grace_ms: u64,
+    /// Wait for a not-yet-arrived stage before an anchor pulls from a peer (ms).
+    #[arg(long, default_value_t = 60, env = "LEAN_ANCHOR_GRACE_MS")]
+    anchor_grace_ms: u64,
+}
+
+#[derive(clap::Args)]
+struct BenchArgs {
+    #[arg(long, default_value_t = 20_000)]
+    txs: usize,
+    #[arg(long, default_value = "1,10,100")]
+    mix: String,
+    #[arg(long, default_value_t = 250)]
+    block_ms: u64,
+    #[arg(long, default_value_t = 150_000_000)]
+    budget_gas: u64,
+    #[arg(long, default_value_t = 256)]
+    snapshot_every: u64,
+    #[arg(long)]
+    datadir: Option<std::path::PathBuf>,
 }
 
 fn now_ms() -> u64 {
@@ -52,60 +125,64 @@ fn sk(i: u64) -> SecretKey {
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    match args.first().map(String::as_str) {
-        Some("run") => run(&args).await,
-        Some("bench") => bench(&args).await,
-        _ => {
-            eprintln!("usage: lean-lane-node run|bench [flags]  (see src/main.rs header)");
-            Ok(())
-        }
+    match Cli::parse().cmd {
+        Cmd::Run(a) => run(a).await,
+        Cmd::Bench(a) => bench(a).await,
     }
 }
 
-async fn run(args: &[String]) -> eyre::Result<()> {
-    let peers: Vec<String> = arg(args, "--peers", String::new())
-        .split(',')
-        .filter(|s| !s.is_empty())
-        .map(|s| s.trim().to_string())
-        .collect();
+async fn run(args: RunArgs) -> eyre::Result<()> {
+    for gone in [
+        "LEAN_FSYNC",
+        "LEAN_STAGE_RACE_MS",
+        "LEAN_PARALLEL_RECOVERY",
+        "ARC_LEAN_SHIM",
+    ] {
+        if std::env::var_os(gone).is_some() {
+            eprintln!("warning: {gone} is no longer read (see `lean-lane-node run --help`)");
+        }
+    }
     let cfg = Config {
-        datadir: arg(args, "--datadir", "lean-lane-data".to_string()).into(),
-        chain_id: arg(args, "--chain-id", 1338),
-        budget_gas: arg(args, "--budget-gas", 150_000_000),
-        snapshot_every: arg(args, "--snapshot-every", 1024),
-        receipt_ring: arg(args, "--receipt-ring", 200_000),
-        peers,
+        datadir: args.datadir,
+        chain_id: args.chain_id,
+        budget_gas: args.budget_gas,
+        snapshot_every: args.snapshot_every,
+        receipt_ring: args.receipt_ring,
+        peers: args
+            .peers
+            .iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        fsync: !args.no_fsync,
+        stats: args.stats,
+        announce_grace_ms: args.announce_grace_ms,
+        anchor_grace_ms: args.anchor_grace_ms,
         ..Default::default()
     };
-    let block_ms: u64 = arg(args, "--block-ms", 250);
-    let port: u16 = arg(args, "--port", 8560);
-    // --fund-file F: one 0x-address per line, each seeded with --fund-balance
-    // (gwei units, default ~1e15 = 1M native). The Arc integration generates
-    // this from the payment genesis alloc; the spammer smoke uses its mnemonic
-    // accounts. Only applied to a FRESH datadir (recovered state wins).
-    let fund_file: String = arg(args, "--fund-file", String::new());
-    let fund_balance: u64 = arg(args, "--fund-balance", 1_000_000_000_000_000);
-    if !lean_lane_node::chain::fsync_enabled() {
+    let block_ms = args.block_ms;
+    let port = args.port;
+    let fund_balance = args.fund_balance;
+    if !cfg.fsync {
         println!(
-            "LEAN_FSYNC=0: the block-log append does NOT fsync (a crash may lose the log tail; \
+            "--no-fsync: the block-log append does NOT fsync (a crash may lose the log tail; \
              peers backfill it and the CL certificate binds the bytes, so no fork)"
         );
     }
-    // Pin the monotonic origin for every `t_in=` field BEFORE the open, so
-    // the per-call lines are stamped against process start rather than
-    // against whenever the first RPC happened to arrive.
     lean_lane_node::node::node_start();
     let (node, rec) = LaneNode::open(cfg)?;
     let node = Arc::new(node);
     node.spawn_sync();
-    // LEAN_STATS=1: one `lean_stats ...` line every 10 s (see stats_line).
+    // --stats: one `lean_stats ...` line every 10 s (see stats_line).
     node.spawn_stats();
     println!(
         "recovered: snapshot@{} + {} blocks / {} txs replayed in {:?}",
         rec.snapshot_number, rec.replayed_blocks, rec.replayed_txs, rec.elapsed
     );
-    if !fund_file.is_empty() && rec.replayed_blocks == 0 && rec.snapshot_number == 0 {
+    if let Some(fund_file) = args
+        .fund_file
+        .filter(|_| rec.replayed_blocks == 0 && rec.snapshot_number == 0)
+    {
         let mut n = 0usize;
         for line in std::fs::read_to_string(&fund_file)?.lines() {
             let line = line.trim();
@@ -119,7 +196,7 @@ async fn run(args: &[String]) -> eyre::Result<()> {
                 a,
                 Acct {
                     nonce: 0,
-                    balance: fund_balance as u128,
+                    balance: fund_balance,
                 },
             )
             .await;
@@ -132,15 +209,13 @@ async fn run(args: &[String]) -> eyre::Result<()> {
             .lock()
             .await
             .write_snapshot(&node.cfg.datadir, c, num, t)?;
-        println!("funded {n} accounts @ {fund_balance} gwei-units from {fund_file}");
+        println!(
+            "funded {n} accounts @ {fund_balance} wei from {}",
+            fund_file.display()
+        );
     }
-    let shim = args.iter().any(|a| a == "--shim")
-        || std::env::var("ARC_LEAN_SHIM").is_ok_and(|v| v == "1");
-    let bind: String = arg(args, "--bind", "127.0.0.1".to_string());
-    let bind_ip: std::net::IpAddr = bind
-        .parse()
-        .map_err(|e| eyre::eyre!("--bind {bind}: {e}"))?;
-    let (addr, _handle) = rpc::serve(node.clone(), (bind_ip, port).into()).await?;
+    let shim = args.shim;
+    let (addr, _handle) = rpc::serve(node.clone(), (args.bind, port).into()).await?;
     println!("rpc: http://{addr}  (eth_sendRawTransaction / arc_sendRawTxBatch / txpool_status / arc_getHead / arc_buildBlock / arc_newBlock / arc_getBlockBytes)");
     if shim {
         println!("SHIM MODE: the CL drives block production (arc_newBlock advances the chain; no self-driving loop)");
@@ -160,18 +235,17 @@ async fn run(args: &[String]) -> eyre::Result<()> {
     Ok(())
 }
 
-async fn bench(args: &[String]) -> eyre::Result<()> {
-    let m: usize = arg(args, "--txs", 20_000);
-    let mix: String = arg(args, "--mix", "1,10,100".to_string());
-    let block_ms: u64 = arg(args, "--block-ms", 250);
-    let dir = tempdir_like(arg(args, "--datadir", String::new()));
+async fn bench(args: BenchArgs) -> eyre::Result<()> {
+    let m = args.txs;
+    let block_ms = args.block_ms;
+    let dir = tempdir_like(args.datadir);
     let cfg = Config {
         datadir: dir.clone(),
-        budget_gas: arg(args, "--budget-gas", 150_000_000),
-        snapshot_every: arg(args, "--snapshot-every", 256),
+        budget_gas: args.budget_gas,
+        snapshot_every: args.snapshot_every,
         ..Default::default()
     };
-    let mix: Vec<usize> = mix.split(',').filter_map(|s| s.parse().ok()).collect();
+    let mix: Vec<usize> = args.mix.split(',').filter_map(|s| s.parse().ok()).collect();
     let (node, _) = LaneNode::open(cfg)?;
     let node = Arc::new(node);
 
@@ -339,9 +413,9 @@ async fn bench(args: &[String]) -> eyre::Result<()> {
     Ok(())
 }
 
-fn tempdir_like(explicit: String) -> std::path::PathBuf {
-    if !explicit.is_empty() {
-        return explicit.into();
+fn tempdir_like(explicit: Option<std::path::PathBuf>) -> std::path::PathBuf {
+    if let Some(p) = explicit {
+        return p;
     }
     let p = std::env::temp_dir().join(format!("lean-lane-bench-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&p);

@@ -14,7 +14,7 @@
 //! `sync.rs::three_node_kill_restart_converges_via_backfill`.
 
 use alloy_primitives::{Address, B256};
-use lean_lane_node::node::{announce_grace_ms, Config, LaneNode, NewBlockOutcome};
+use lean_lane_node::node::{Config, LaneNode, NewBlockOutcome};
 use lean_lane_node::rpc;
 use lean_lane_node::state::Acct;
 use lean_native::envelope::{current_lane_domain, LeanSigned};
@@ -106,10 +106,7 @@ async fn wait_head(n: &LaneNode, want: u64, secs: u64) -> bool {
 
 #[test]
 fn the_grace_window_defaults_to_250ms() {
-    if std::env::var("LEAN_ANNOUNCE_GRACE_MS").is_ok() {
-        return; // an operator override is in force; nothing to assert
-    }
-    assert_eq!(announce_grace_ms(), 250);
+    assert_eq!(Config::default().announce_grace_ms, 250);
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -271,42 +271,11 @@ impl LeanBlock {
 /// What one `append` cost, split at the syscall that dominates it: the
 /// buffered `write_all` versus the `fsync`. The anchor timing line reports
 /// them as separate fields because only one of them is optional
-/// (`LEAN_FSYNC=0`) and only one of them is page-cache-pressure sensitive.
+/// (`--no-fsync`) and only one of them is page-cache-pressure sensitive.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AppendTiming {
     pub write_ns: u64,
     pub fsync_ns: u64,
-}
-
-/// `LEAN_FSYNC=0` -> the append hot path does NOT fsync (read once).
-///
-/// Durability consequence: on a crash/power loss the last block(s) written
-/// since the kernel last flushed may be missing from the log. That is a
-/// LIVENESS cost only, never a safety one: the log is append-only and
-/// torn-tail-truncating, the commitment chain is recomputed from content on
-/// replay, the backfill re-pulls everything above the head, and the CL
-/// certificate binds the block bytes — so a node that comes back short of its
-/// own tip re-fetches exactly the bytes the network already agreed on and
-/// cannot fork. Default (unset or anything but "0"): fsync per append.
-///
-/// The one thing that is NOT symmetric, and the reason `LaneNode::open` has a
-/// repair branch: the state snapshot IS fsync'd (tmp + `sync_all` + rename,
-/// `FlatState::write_snapshot`) on every path, `LEAN_FSYNC=0` included. So a
-/// crash can leave a durable snapshot at height N with the log intact only to
-/// L < N. Resuming from that snapshot would put the head above a hole the
-/// backfill never repairs — it only ever pulls `head + 1` upward — leaving
-/// those heights unservable forever and turning a re-feed of one of them into
-/// a hard `arc_newBlock` error. `open` therefore starts from the newest
-/// snapshot at or below L instead (see `load_newest_snapshot_upto`) and
-/// replays the log from there, so state and log always end at the same block
-/// and the backfill repairs the difference. Rolling only the HEAD back to L
-/// would not do: the state would still be N's, and re-applying L+1..=N against
-/// it is not a no-op (a tx that was invalid for balance at its own height can
-/// become valid against later state), which the content-only commitment chain
-/// would never catch.
-pub fn fsync_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("LEAN_FSYNC").as_deref() != Ok("0"))
 }
 
 /// Append-only block log with fsync-per-append, torn-tail recovery, and an
@@ -315,10 +284,12 @@ pub struct BlockLog {
     file: std::fs::File,
     pub bytes_written: u64,
     index: std::collections::HashMap<u64, (u64, u32)>,
+    /// fsync after every append (see `append`).
+    fsync: bool,
 }
 
 impl BlockLog {
-    pub fn open(path: &Path) -> std::io::Result<Self> {
+    pub fn open(path: &Path, fsync: bool) -> std::io::Result<Self> {
         let file = std::fs::OpenOptions::new()
             .create(true)
             .read(true)
@@ -329,9 +300,24 @@ impl BlockLog {
             file,
             bytes_written,
             index: Default::default(),
+            fsync,
         })
     }
 
+    /// Append one record. With `fsync` off the append does NOT reach the disk
+    /// before returning, so a crash can lose the last block(s). That is a
+    /// LIVENESS cost only, never a safety one: the log is append-only and
+    /// torn-tail-truncating, the commitment chain is recomputed from content
+    /// on replay, the backfill re-pulls everything above the head, and the CL
+    /// certificate binds the block bytes.
+    ///
+    /// The one asymmetry: state snapshots ARE fsync'd whatever this is set to,
+    /// so a crash can leave a durable snapshot at height N with the log intact
+    /// only to L < N. `LaneNode::open` therefore restarts from the newest
+    /// snapshot at or below L and replays from there, so state and log always
+    /// end at the same block (rolling back only the head would not do: the
+    /// state would still be N's, and re-applying L+1..=N against it is not a
+    /// no-op).
     pub fn append(&mut self, block: &LeanBlock) -> std::io::Result<AppendTiming> {
         let offset = self.bytes_written;
         let payload = block.payload();
@@ -346,7 +332,7 @@ impl BlockLog {
         self.file.write_all(&rec)?;
         let write_ns = t_write.elapsed().as_nanos() as u64;
         let t_fsync = std::time::Instant::now();
-        if fsync_enabled() {
+        if self.fsync {
             self.file.sync_data()?;
         }
         let fsync_ns = t_fsync.elapsed().as_nanos() as u64;

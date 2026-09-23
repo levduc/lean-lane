@@ -57,6 +57,23 @@ pub struct Config {
     pub receipt_ring: usize,
     /// Other lean nodes' RPC urls (backfill source + push-on-append targets).
     pub peers: Vec<String>,
+    /// fsync the block log after every append (`--no-fsync` turns it off).
+    /// Off, a crash can lose the log tail: a liveness cost only — peers
+    /// backfill it and the CL certificate binds the bytes (see
+    /// `chain::BlockLog::append` and the snapshot-ahead repair in `open`).
+    pub fsync: bool,
+    /// Periodic `lean_stats` line plus per-call anchor/stage/locate lines.
+    pub stats: bool,
+    /// How long an announcement for head+1 that we do NOT hold waits for our
+    /// own CL to anchor it before arming the backfill. It only matters on a
+    /// node whose CL is parked or dead; on a healthy validator the anchor
+    /// wins and the grace saves a full-block pull per announcing peer. 0
+    /// pulls immediately.
+    pub announce_grace_ms: u64,
+    /// How long an `arc_newBlock{commitment}` that holds none of the block
+    /// waits for an `arc_stageBlock` that has not ARRIVED yet (see
+    /// `await_anchor_grace`). 0 disables it.
+    pub anchor_grace_ms: u64,
 }
 
 impl Config {
@@ -78,6 +95,10 @@ impl Default for Config {
             beneficiary: Address::with_last_byte(0xbe),
             receipt_ring: 200_000,
             peers: Vec::new(),
+            fsync: true,
+            stats: false,
+            announce_grace_ms: 250,
+            anchor_grace_ms: 60,
         }
     }
 }
@@ -122,7 +143,7 @@ pub struct Stats {
     /// block was promoted locally instead of pulled from a peer.
     pub anchor_grace_hits: AtomicU64,
     /// Anchors that sat out the whole cold grace and still found nothing —
-    /// `LEAN_ANCHOR_GRACE_MS` added to a peer pull (or a SYNCING) that was
+    /// `anchor_grace_ms` added to a peer pull (or a SYNCING) that was
     /// going to happen anyway. Read as a ratio against `anchor_grace_hits`:
     /// that is what says whether the grace is paying for itself.
     pub anchor_grace_misses: AtomicU64,
@@ -135,71 +156,10 @@ pub struct Stats {
     pub append_ns_last: AtomicU64,
 }
 
-/// `LEAN_ANNOUNCE_GRACE_MS` (default 250, read once). How long an announcement
-/// for head+1 that we do NOT already hold waits for our own CL to anchor that
-/// height before arming the backfill. It exists only for the node whose CL is
-/// parked or dead: on a healthy validator the anchor always wins this race, so
-/// the grace costs nothing and saves a 2.5 MB pull per announcing peer per
-/// height. `0` disables it (pull immediately, the pre-2026-09-15 behaviour).
-pub fn announce_grace_ms() -> u64 {
-    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *MS.get_or_init(|| {
-        std::env::var("LEAN_ANNOUNCE_GRACE_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(250)
-    })
-}
-
-/// `LEAN_STAGE_RACE_MS` (default 40, read once). How long an `arc_newBlock`
-/// that holds none of the block waits for an `arc_stageBlock` which has
-/// ARRIVED but not yet registered its commitment (see `await_stage_race`).
-/// Only ever waited when `stage_pending > 0`. `0` disables the grace and
-/// leaves only the in-flight-claim wait (the pre-2026-09-15 behaviour).
-///
-/// 40 ms is sized off the fleet: the CL issues the anchor ~15 ms after the
-/// stage, and at 2.2 MB the stage needs ~15-20 ms of JSON parse + base64
-/// decode + wire hash before it can name itself. The alternative on a miss is
-/// a 200-250 ms peer round trip, so the grace is cheap even when it expires.
-pub fn stage_race_ms() -> u64 {
-    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *MS.get_or_init(|| {
-        std::env::var("LEAN_STAGE_RACE_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(40)
-    })
-}
-
-/// `LEAN_ANCHOR_GRACE_MS` (default 60, read once). How long an
-/// `arc_newBlock{commitment}` that holds none of the block waits for an
-/// `arc_stageBlock` which has NOT EVEN ARRIVED yet (see `await_anchor_grace`).
-/// `0` disables it and leaves only the two warmer graces — the in-flight claim
-/// wait and `LEAN_STAGE_RACE_MS` — which is the pre-2026-09-15 behaviour.
-///
-/// WHY a third, colder grace (measured on the 4-validator fleet, 450 M budget,
-/// 2.5 MB / 863-tx blocks): anchor paths staged 514, **peer 515**, index 286,
-/// with `stage_race_waits=2`. So the in-flight wait almost never engaged —
-/// when the anchor landed, the stage for that block had not reached the node
-/// at all: nothing staged, nothing claimed, `stage_pending` zero. The CL
-/// spawns the stage fire-and-forget and that task must base64+JSON-encode a
-/// 2.5 MB body before it hits the wire, while the anchor is a tiny awaited
-/// request issued ~15 ms later; over a LAN the small request wins the race.
-/// Loopback never showed it because encode + localhost are both fast.
-///
-/// 60 ms is sized off that gap (encode + send of 2.5 MB, minus the ~15 ms head
-/// start the anchor gives away). The alternative on a miss is a 200-250 ms
-/// peer round trip on the consensus critical path, so the grace stays cheap
-/// even when it expires.
-pub fn anchor_grace_ms() -> u64 {
-    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *MS.get_or_init(|| {
-        std::env::var("LEAN_ANCHOR_GRACE_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(60)
-    })
-}
+/// How long an anchor that holds none of the block waits for an
+/// `arc_stageBlock` which has ARRIVED but not yet registered its commitment
+/// (see `await_stage_race`). Only waited while `stage_pending > 0`.
+const STAGE_RACE_GRACE: std::time::Duration = std::time::Duration::from_millis(40);
 
 /// The node's start instant, pinned the first time anything asks for it (the
 /// binary touches it in `main` before the RPC server binds, so `t_in` really
@@ -216,12 +176,6 @@ pub fn node_start() -> Instant {
 /// no in-call duration can show it.
 pub fn since_start_ms(t: Instant) -> f64 {
     t.saturating_duration_since(node_start()).as_secs_f64() * 1_000.0
-}
-
-/// `LEAN_STATS=1` (read once). Gates every per-call timing line.
-pub fn stats_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("LEAN_STATS").as_deref() == Ok("1"))
 }
 
 #[inline]
@@ -290,8 +244,8 @@ pub struct AnchorTimer {
     /// The peer `arc_getBlockBytes{commitment}` round trip (`path=peer`).
     pub peer_ns: AtomicU64,
     /// Every wait this anchor spent on a stage of the SAME block: the
-    /// in-flight claim's watch channel, the `LEAN_STAGE_RACE_MS` grace, and
-    /// the cold `LEAN_ANCHOR_GRACE_MS` grace. They are one number because
+    /// in-flight claim's watch channel, the stage-race grace, and
+    /// the cold cold anchor grace. They are one number because
     /// they answer one question — how much of this height went on waiting for
     /// work already under way here rather than pulling it from a peer.
     pub wait_inflight_ns: AtomicU64,
@@ -320,8 +274,8 @@ impl AnchorTimer {
             self.path.store(p, Ordering::Relaxed);
         }
     }
-    fn emit(&self, t0: Instant) {
-        if !stats_enabled() {
+    fn emit(&self, t0: Instant, on: bool) {
+        if !on {
             return;
         }
         println!("{}", self.line(t0));
@@ -574,14 +528,14 @@ impl LaneNode {
                 Some((s, c, n, t)) => (s, c, n, t),
                 None => (FlatState::default(), genesis_commitment(cfg.chain_id), 0, 0),
             };
-        let mut log = BlockLog::open(&cfg.datadir.join("blocks.log"))?;
+        let mut log = BlockLog::open(&cfg.datadir.join("blocks.log"), cfg.fsync)?;
         let beneficiary = cfg.beneficiary;
         let snap = (snap_commitment, snap_number, snap_ts);
         let (mut head, mut replayed_blocks, mut replayed_txs, mut by_commitment) =
             replay_onto(&mut state, &mut log, snap, beneficiary)?;
 
-        // SNAPSHOT AHEAD OF THE LOG (only reachable under `LEAN_FSYNC=0`, which
-        // fsyncs the snapshot but not the append — see `chain::fsync_enabled`).
+        // SNAPSHOT AHEAD OF THE LOG (only reachable with `fsync` off, which
+        // fsyncs the snapshot but not the append — see `BlockLog::append`).
         // Resuming from a snapshot the log cannot reach leaves a permanent hole
         // below the head: the backfill only ever pulls `head + 1` upward, so
         // those heights stay unservable and a re-feed of one of them is a hard
@@ -1259,7 +1213,7 @@ impl LaneNode {
             self.stats.exec_ns.fetch_add(stage_ns, Ordering::Relaxed);
             self.stats.stage_ns_last.store(stage_ns, Ordering::Relaxed);
         }
-        if stats_enabled() && matches!(outcome, StageOutcome::Staged(_)) {
+        if self.cfg.stats && matches!(outcome, StageOutcome::Staged(_)) {
             println!(
                 concat!(
                     "lean_stage n={} total_ms={:.2} decode_ms={:.2} ",
@@ -1498,7 +1452,7 @@ impl LaneNode {
         if matches!(r, Ok(NewBlockOutcome::Syncing { .. })) {
             tm.set_path(PATH_SYNCING);
         }
-        tm.emit(t0);
+        tm.emit(t0, self.cfg.stats);
         r
     }
 
@@ -1743,7 +1697,7 @@ impl LaneNode {
         if matches!(r, Ok(NewBlockOutcome::Syncing { .. })) {
             tm.set_path(PATH_SYNCING);
         }
-        tm.emit(t0);
+        tm.emit(t0, self.cfg.stats);
         r
     }
 
@@ -1761,7 +1715,7 @@ impl LaneNode {
     /// 2. The stage has ARRIVED but not yet named itself — it is in the RPC
     ///    layer parsing ~3 MB of JSON/base64, or hashing the wire, and does
     ///    not know its own commitment yet. `stage_pending` is non-zero exactly
-    ///    then. Wait on `stage_notify` up to `LEAN_STAGE_RACE_MS`, rechecking
+    ///    then. Wait on `stage_notify` up to `STAGE_RACE_GRACE`, rechecking
     ///    `inflight` each round. This window is real: the CL issues the anchor
     ///    ~15 ms after the stage, and the stage's pre-registration work is the
     ///    same order of magnitude.
@@ -1769,9 +1723,9 @@ impl LaneNode {
     /// The grace in (2) is gated on `stage_pending > 0`, so a node doing a
     /// genuine backfill — nobody staging — adds zero latency to its peer
     /// pulls. Worst case when a stage is pending but is for a DIFFERENT block:
-    /// `LEAN_STAGE_RACE_MS` on top of a path that already costs 200-250 ms.
+    /// `STAGE_RACE_GRACE` on top of a path that already costs 200-250 ms.
     async fn await_stage_race(&self, c: B256, tm: &AnchorTimer) -> bool {
-        let grace = std::time::Duration::from_millis(stage_race_ms());
+        let grace = STAGE_RACE_GRACE;
         let t_wait = Instant::now();
         let mut waited = false;
         loop {
@@ -1815,7 +1769,7 @@ impl LaneNode {
         waited
     }
 
-    /// THE COLD GRACE (`LEAN_ANCHOR_GRACE_MS`). `await_stage_race` covers a
+    /// THE COLD GRACE (`anchor_grace_ms`). `await_stage_race` covers a
     /// stage that is RUNNING or has ARRIVED; this covers the fleet's actual
     /// case, where the stage has done NEITHER when the anchor lands — nothing
     /// staged, nothing claimed, `stage_pending` zero — because the CL spawned
@@ -1833,14 +1787,14 @@ impl LaneNode {
     /// the grace on every one of them. Two cheap reads say so — a non-empty
     /// `sync_queue` (blocks waiting on a parent we lack) or a `sync_target`
     /// above our head (the backfill is armed) — and both skip the grace
-    /// entirely, exactly as `LEAN_STAGE_RACE_MS` is skipped when no stage is
+    /// entirely, exactly as `STAGE_RACE_GRACE` is skipped when no stage is
     /// pending. A node that is behind WITHOUT either flag set (its CL parked,
     /// or the first anchor after falling behind) still answers SYNCING/peer
-    /// as before, just up to `LEAN_ANCHOR_GRACE_MS` later — 60 ms on top of a
+    /// as before, just up to `anchor_grace_ms` later — 60 ms on top of a
     /// path that already costs 200-250 ms, and it re-converges by the same
     /// route it always did.
     async fn await_anchor_grace(&self, c: B256, tm: &AnchorTimer) -> bool {
-        let grace = std::time::Duration::from_millis(anchor_grace_ms());
+        let grace = std::time::Duration::from_millis(self.cfg.anchor_grace_ms);
         if grace.is_zero() {
             return false;
         }
@@ -2045,7 +1999,7 @@ impl LaneNode {
     /// Handle a peer's announcement: known -> ignore (the universal in-sync
     /// case, zero further traffic); ALREADY HELD (staged/in-flight) -> ignore,
     /// our own CL anchors it in milliseconds; head+1 and not held -> wait out
-    /// `LEAN_ANNOUNCE_GRACE_MS` for that anchor, then arm the backfill if it
+    /// `announce_grace_ms` for that anchor, then arm the backfill if it
     /// never came; further ahead -> arm the backfill at once (existing
     /// machinery — this is the genuine laggard).
     ///
@@ -2085,7 +2039,7 @@ impl LaneNode {
             // about to anchor it (the common case: the announcement simply
             // beat our own `arc_stageBlock`/`arc_newBlock`) or our CL is gone.
             // Give the anchor the grace window before spending a pull.
-            let grace = announce_grace_ms();
+            let grace = self.cfg.announce_grace_ms;
             if grace > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(grace)).await;
                 let head_n = self.head.lock().await.1;
@@ -2213,7 +2167,7 @@ impl LaneNode {
         }
     }
 
-    /// `locate_inner` + one `lean_locate` line per call under `LEAN_STATS=1`.
+    /// `locate_inner` + one `lean_locate` line per call under `--stats`.
     /// `caller` is the reason we are looking: `new_block` (the decide anchor),
     /// `get_bytes` (a peer or the CL's value-sync serving path), `announce`,
     /// `other` (tests/tools).
@@ -2224,7 +2178,7 @@ impl LaneNode {
     ) -> Result<Option<(Vec<u8>, &'static str)>, String> {
         let t0 = Instant::now();
         let r = self.locate_inner(c).await;
-        if stats_enabled() {
+        if self.cfg.stats {
             let hit = match &r {
                 Ok(Some((_, h))) => *h,
                 Ok(None) => "miss",
@@ -2270,7 +2224,7 @@ impl LaneNode {
     /// plus the last block's service times. Every field is a counter or a
     /// `len()` — nothing here walks the state, the log or the pool, so it is
     /// safe to call on a hot node. Emitted by `spawn_stats` under
-    /// `LEAN_STATS=1`; `grep lean_stats` in a node log gives the whole
+    /// `--stats`; `grep lean_stats` in a node log gives the whole
     /// growth-vs-time picture that a cadence drift needs.
     pub async fn stats_line(&self) -> String {
         let head = self.head.lock().await.1;
@@ -2311,12 +2265,12 @@ impl LaneNode {
         )
     }
 
-    /// `LEAN_STATS=1` -> print `stats_line()` every 10 s. Off by default (a
+    /// `--stats` -> print `stats_line()` every 10 s. Off by default (a
     /// fleet node's log stays exactly as it is unless the flag is set). The
     /// binary has no tracing subscriber — stdout IS its INFO channel, as for
     /// every other line it prints.
     pub fn spawn_stats(self: &std::sync::Arc<Self>) {
-        if !stats_enabled() {
+        if !self.cfg.stats {
             return;
         }
         let node = self.clone();
@@ -2352,46 +2306,11 @@ pub struct RecoveryReport {
 /// decode + one ecrecover per tx). Invalid bytes are skipped — a torn/bad tx
 /// in an appended block cannot occur (we wrote it), but total-STF posture is
 /// kept everywhere.
+///
+/// Decode + ecrecover in parallel on the rayon pool, keeping block order
+/// (indexed par_iter + collect preserves it; skipped entries collapse via
+/// flatten). Per-signature work stays off the tokio runtime threads.
 pub fn decode_block_txs(txs: &[Vec<u8>]) -> Vec<(Address, LeanTx, B256)> {
-    if parallel_recovery_enabled() {
-        decode_block_txs_parallel(txs)
-    } else {
-        decode_block_txs_serial(txs)
-    }
-}
-
-/// Rayon-parallel sender recovery, DEFAULT ON since 2026-08-26 (roadmap §8
-/// adoption rule satisfied: V3 differential + V4 replay invariance + V5 mixed
-/// convergence + V7 fleet mechanism run with zero burned rounds + 2 h mixed
-/// soak with zero divergence). Measured: 4.1x payments/s at a signature-heavy
-/// mix — serial recovery on the runtime threads was also starving admission.
-/// `LEAN_PARALLEL_RECOVERY=0` is the rollback for one release.
-fn parallel_recovery_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("LEAN_PARALLEL_RECOVERY").as_deref() != Ok("0"))
-}
-
-pub fn decode_block_txs_serial(txs: &[Vec<u8>]) -> Vec<(Address, LeanTx, B256)> {
-    let mut items = Vec::with_capacity(txs.len());
-    for bytes in txs {
-        let Ok(env) = ArcTxEnvelope::decode_2718(&mut bytes.as_slice()) else {
-            continue;
-        };
-        let Ok(signer) = env.recover_signer() else {
-            continue;
-        };
-        if let ArcTxEnvelope::Lean(lean) = env {
-            let hash = *lean.hash();
-            items.push((signer, lean.tx().clone(), hash));
-        }
-    }
-    items
-}
-
-/// Identical semantics to the serial path — same skips, same order (rayon's
-/// indexed par_iter + collect preserves input order; skipped entries collapse
-/// via flatten) — only the per-tx decode + ecrecover run on the thread pool.
-pub fn decode_block_txs_parallel(txs: &[Vec<u8>]) -> Vec<(Address, LeanTx, B256)> {
     use rayon::prelude::*;
     txs.par_iter()
         .map(|bytes| {

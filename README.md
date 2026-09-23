@@ -40,7 +40,7 @@ Builds the node and the spammer, boots three nodes on loopback, drives them with
 a stand-in consensus layer (round-robin `arc_buildBlock` → `arc_newBlock`),
 feeds real signed fan-out transactions, and asserts all three converge on one
 commitment at the expected height with non-empty blocks. Then replays the chain
-into a fresh node with parallel signature recovery and asserts the same head.
+into a fresh node and asserts the same head.
 
 Last run on this repo: `40 heights · 9856 transactions · 98560 payments · avg
 N=10.0 · 3/3 nodes at one commitment`.
@@ -66,15 +66,28 @@ rustc than the pin — keep the lock).
   --fund-file ~/lean-fund.txt --fund-balance 10000000000000000000
 ```
 
+Every setting is a flag (`lean-lane-node run --help`); three of them also
+read an environment variable as a fallback, shown in the table.
+
 | flag | default | meaning |
 |---|---|---|
+| `--datadir` | `lean-lane-data` | block log + state snapshots |
+| `--port` / `--bind` | 8560 / 127.0.0.1 | JSON-RPC listen address |
+| `--chain-id` | 1338 | lane chain id: signing domain and genesis commitment |
 | `--shim` | off | the consensus layer drives block production; without it the node self-drives every `--block-ms` (standalone benchmarks only) |
-| `--peers` | none | other lean nodes — gossip on append, and the backfill source when this node is behind |
-| `--fund-file` / `--fund-balance` | none / 1e15 | addresses funded at genesis; must be exactly the accounts the spammer signs with (derivation `m/44'/60'/1'/0/i` — note the `1'`) |
-| `--budget-gas` | 150,000,000 | self-drive block budget (the shim passes its own per call) |
+| `--block-ms` / `--budget-gas` | 250 / 150,000,000 | self-drive cadence and block budget (the shim passes its own budget per call) |
+| `--peers` | none | comma-separated lean-node RPC urls: announce targets on append, and the backfill source when this node is behind |
+| `--fund-file` / `--fund-balance` | none / 1e15 wei | addresses funded at genesis (fresh datadir only); must be exactly the accounts the spammer signs with (derivation `m/44'/60'/1'/0/i` — note the `1'`) |
 | `--snapshot-every` | 1024 | blocks between state snapshots (restart = snapshot + replay); `0` never snapshots, so a restart replays the whole log from genesis |
 | `--receipt-ring` | 200,000 | most-recent receipts kept in memory for `eth_getTransactionReceipt`; `0` keeps none |
-| `--chain-id` | 1338 | |
+| `--no-fsync` | off (fsync every append) | skip the per-append fsync of the block log (see below) |
+| `--stats` (env `LEAN_STATS=1`) | off | one `lean_stats` line every 10 s plus per-call anchor/stage/locate timing lines |
+| `--announce-grace-ms` (env `LEAN_ANNOUNCE_GRACE_MS`) | 250 | how long an announcement for head+1 that this node does not hold waits for its own CL's anchor before the backfill pulls it; `0` pulls at once |
+| `--anchor-grace-ms` (env `LEAN_ANCHOR_GRACE_MS`) | 60 | how long an `arc_newBlock{commitment}` that holds none of the block waits for a stage that has not arrived yet before pulling from a peer; `0` disables |
+
+The old `LEAN_FSYNC`, `LEAN_STAGE_RACE_MS`, `LEAN_PARALLEL_RECOVERY` and
+`ARC_LEAN_SHIM` variables are gone (the node warns if one is set). Signature
+recovery is always rayon-parallel.
 
 Genesis is a pure function of chain id + fund file, so every node in a fleet
 must be started with the same fund file.
@@ -86,28 +99,24 @@ them. One receipt is 96 B plus 64 B per non-zero output — ~160 B at N=1 but
 **~1.3 GB** at N=100. A validator under a fan-out load that nobody queries
 receipts from should set it well below the default (or to `0`).
 
-`LEAN_PARALLEL_RECOVERY=0` turns off rayon-parallel signature recovery
-(default on; `=0` is the measured-slower serial path).
+`--no-fsync` drops the per-append fsync on the block log. The log tail can
+then be lost in a crash — safe, because the head is re-derived from the log on
+open and the backfill re-pulls whatever is missing above it. Note the
+asymmetry: state snapshots are fsync'd either way, so a crash can leave a
+snapshot *ahead* of the log; `open` detects that, warns (`lean_recovery
+WARNING ...`), and restarts from the newest snapshot the log can be continued
+from rather than resuming above a hole it could never fill.
 
-`LEAN_FSYNC=0` drops the per-append fsync on the block log (default: fsync
-every block). The log tail can then be lost in a crash — safe, because the
-head is re-derived from the log on open and the backfill re-pulls whatever is
-missing above it. Note the asymmetry: state snapshots are fsync'd whatever
-this is set to, so a crash can leave a snapshot *ahead* of the log; `open`
-detects that, warns (`lean_recovery WARNING ...`), and restarts from the
-newest snapshot the log can be continued from rather than resuming above a
-hole it could never fill.
-
-`LEAN_STATS=1` prints one line every 10 s on stdout:
+`--stats` prints one line every 10 s on stdout:
 
 ```
 lean_stats head=812 accounts=44913 staged=1 sync_queue=0 by_commitment=812 pool=1974 build_ms_last=12.9 stage_ms_last=21.6 append_ms_last=9.8 rss_mb=1842
 ```
 
 Everything in it is either a counter or a `len()` (it never walks the state,
-the log or the pool), and it is off by default. `head`/`accounts`/`rss_mb`
-answer "what grew"; `*_ms_last` are the last block's build / stage / append
-service times, which is what a drifting cadence needs to attribute.
+the log or the pool). `head`/`accounts`/`rss_mb` answer "what grew";
+`*_ms_last` are the last block's build / stage / append service times, which
+is what a drifting cadence needs to attribute.
 
 ## Load
 

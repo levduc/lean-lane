@@ -187,7 +187,7 @@ async fn total_stf_noop_never_halts() {
     assert_eq!(state.digest(), before, "no-op leaves state untouched");
 }
 
-/// I2: `LEAN_FSYNC=0` fsyncs the SNAPSHOT (tmp + sync_all + rename) but not the
+/// I2: `fsync: false` fsyncs the SNAPSHOT (tmp + sync_all + rename) but not the
 /// log append, so a crash can leave a durable snapshot at a height the log
 /// never reached. Resuming from that snapshot would put the head above a hole
 /// the backfill never repairs (it only pulls `head + 1` upward), leaving those

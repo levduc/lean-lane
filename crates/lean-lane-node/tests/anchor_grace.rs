@@ -1,4 +1,4 @@
-//! THE COLD GRACE (`LEAN_ANCHOR_GRACE_MS`, 2026-09-15).
+//! THE COLD GRACE (`Config::anchor_grace_ms`, 2026-09-15).
 //!
 //! `stage_race.rs` gates the two WARM windows: a stage that is running and has
 //! named itself in `inflight`, and a stage that has arrived at the RPC layer
@@ -17,7 +17,7 @@
 //! big request, real link — the small one lands first.
 //!
 //! So: when the anchor holds none of the block and no stage is even pending,
-//! wait up to `LEAN_ANCHOR_GRACE_MS` for one to show up.
+//! wait up to `anchor_grace_ms` for one to show up.
 
 use alloy_primitives::{Address, B256};
 use lean_lane_node::chain::LeanBlock;
@@ -103,7 +103,8 @@ async fn log_len(n: &LaneNode) -> u64 {
 ///
 /// Without the cold grace this is `path=peer` — and on a node with no peers
 /// (this one) that degrades to SYNCING, which is what the companion test in
-/// `anchor_grace_off.rs` asserts with `LEAN_ANCHOR_GRACE_MS=0`.
+/// `with_the_grace_disabled_the_anchor_takes_the_peer_path` asserts with
+/// `anchor_grace_ms: 0`.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_anchor_that_beats_its_stage_still_takes_the_staged_path() {
     let dir = tempfile::tempdir().unwrap();
@@ -178,7 +179,7 @@ async fn a_commitment_nobody_ever_stages_falls_through_after_the_grace() {
 /// THE LAGGARD. A node that is behind gets anchors for commitments no stage of
 /// its own will ever produce. It must not pay the grace on every one of them,
 /// so an armed backfill (`sync_target` above our head) skips it outright — the
-/// same shape as `LEAN_STAGE_RACE_MS` being skipped when no stage is pending.
+/// same shape as the stage-race grace being skipped when no stage is pending.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_node_that_is_behind_does_not_pay_the_grace() {
     let dir = tempfile::tempdir().unwrap();
@@ -210,4 +211,48 @@ async fn the_stats_line_carries_the_grace_counters() {
     for key in ["anchor_grace_hits=", "anchor_grace_misses="] {
         assert!(line.contains(key), "lean_stats is missing `{key}`: {line}");
     }
+}
+
+/// The exact scenario above — anchor 20 ms ahead of its stage — with the
+/// grace switched off. The anchor must NOT wait: it takes the peer path, which
+/// on a peerless node is SYNCING, and the stage that follows still stages
+/// cleanly.
+#[tokio::test(flavor = "multi_thread")]
+async fn with_the_grace_disabled_the_anchor_takes_the_peer_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let n = Arc::new(
+        LaneNode::open(Config {
+            datadir: dir.path().to_path_buf(),
+            anchor_grace_ms: 0,
+            ..Default::default()
+        })
+        .unwrap()
+        .0,
+    );
+    let (c, wire) = wire_head_plus_one(&n, 900, 8).await;
+
+    let t = std::time::Instant::now();
+    let r = n.shim_new_by_commitment(c).await.unwrap();
+    assert!(
+        matches!(r, NewBlockOutcome::Syncing { head: 0 }),
+        "got {r:?}"
+    );
+    assert!(
+        t.elapsed() < Duration::from_millis(40),
+        "the grace was supposed to be off: {:?}",
+        t.elapsed()
+    );
+    assert_eq!(n.stats.anchor_grace_hits.load(Ordering::Relaxed), 0);
+    assert_eq!(n.stats.anchor_grace_misses.load(Ordering::Relaxed), 0);
+
+    // the stage that lost the race is unaffected
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(matches!(n.stage_block(&wire).await.unwrap(), StageOutcome::Staged(x) if x == c));
+    // ...and a retried anchor still promotes it, as it always did
+    assert_eq!(
+        n.shim_new_by_commitment(c).await.unwrap(),
+        NewBlockOutcome::Valid(c)
+    );
+    assert_eq!(n.head.lock().await.1, 1);
+    assert!(n.inflight.lock().await.is_empty());
 }

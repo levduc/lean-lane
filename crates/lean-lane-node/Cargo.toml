@@ -30,6 +30,7 @@ base64 = "0.22"
 eyre.workspace = true
 secp256k1 = { workspace = true, features = ["std", "recovery", "global-context", "rand"] }
 rayon.workspace = true
+clap = { workspace = true, features = ["derive", "env"] }
 
 [dev-dependencies]
 tempfile = "3"

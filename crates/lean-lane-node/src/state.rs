@@ -80,7 +80,7 @@ impl FlatState {
     /// As `load_newest_snapshot`, but never above block `ceiling`.
     ///
     /// Snapshots are fsync'd (tmp + `sync_all` + rename) while the block log
-    /// under `LEAN_FSYNC=0` is not, so a crash can leave a snapshot NEWER than
+    /// with `--no-fsync` is not, so a crash can leave a snapshot NEWER than
     /// the last intact log record. Recovering from it would strand the node
     /// above a permanent hole in its own log; `LaneNode::open` instead asks for
     /// the newest snapshot the log can actually continue from. Snapshots are

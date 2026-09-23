@@ -227,10 +227,10 @@ async fn anchor_waits_for_a_stage_that_has_not_registered_yet() {
 }
 
 /// THIS grace is gated on `stage_pending`: with no stage in flight a
-/// by-commitment anchor must not sit out `LEAN_STAGE_RACE_MS`, or every
+/// by-commitment anchor must not sit out the stage-race grace, or every
 /// genuine backfill would pay it on top of its pull.
 ///
-/// The anchor does still wait here — for `LEAN_ANCHOR_GRACE_MS`, the COLD
+/// The anchor does still wait here — for `anchor_grace_ms`, the COLD
 /// grace added later for the case where the stage has not even arrived (see
 /// `anchor_grace.rs`). What this test gates is that `stage_race_waits` stays
 /// at zero: the two graces are separate windows with separate counters, and
@@ -315,7 +315,7 @@ async fn a_failed_stage_leaves_no_claim() {
     assert!(n.inflight.lock().await.is_empty());
     assert!(n.staged.lock().await.is_empty());
 
-    // (the anchor still sits out the COLD `LEAN_ANCHOR_GRACE_MS` here — no
+    // (the anchor still sits out the COLD `anchor_grace_ms` here — no
     // stage is coming, but it cannot know that; see `anchor_grace.rs`)
     let t = std::time::Instant::now();
     let r = n.shim_new_by_commitment(orphan.commitment).await.unwrap();
