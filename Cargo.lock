@@ -2924,8 +2924,6 @@ dependencies = [
  "alloy-eips",
  "alloy-primitives",
  "alloy-rlp",
- "rand 0.8.6",
- "rayon",
  "reth-primitives-traits",
  "reth-transaction-pool",
  "secp256k1 0.30.0",

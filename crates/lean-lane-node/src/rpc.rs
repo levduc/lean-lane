@@ -1,6 +1,7 @@
-//! Minimal lane RPC: eth_sendRawTransaction (0x50 only), the binary batch
-//! endpoint arc_sendRawTxBatch, txpool_status, arc_getHead, and a
-//! recent-window eth_getTransactionReceipt served from the derivation ring.
+//! Lane RPC: the consensus shim (arc_getHead, arc_buildBlock, arc_stageBlock,
+//! arc_newBlock, arc_getBlockBytes, arc_announceBlock) plus admission
+//! (eth_sendRawTransaction, 0x50 only; the binary batch arc_sendRawTxBatch),
+//! txpool_status and eth_getTransactionCount.
 //!
 //! arc_sendRawTxBatch: ONE base64 string of length-framed canonical txs
 //! (`[u32 LE len][tx bytes]`*). One JSON string per thousands of txs — no
@@ -224,30 +225,6 @@ pub fn module(node: Arc<LaneNode>) -> RpcModule<Arc<LaneNode>> {
     })
     .unwrap();
 
-    m.register_async_method("eth_getTransactionReceipt", |params, node, _| async move {
-        let hash: String = params.one()?;
-        let hash: B256 = hash
-            .trim_start_matches("0x")
-            .parse()
-            .map_err(|_| err("bad hash"))?;
-        let r = node.receipt(hash).await;
-        Ok::<_, ErrorObjectOwned>(r.map(|r| {
-            json!({
-                "transactionHash": format!("{}", r.tx_hash),
-                "blockNumber": r.block_number,
-                "transactionIndex": r.index,
-                "from": format!("{}", r.sender),
-                "status": if r.applied { "0x1" } else { "0x0" },
-                "logs": r.logs.iter().map(|l| json!({
-                    "from": format!("{}", l.from),
-                    "to": format!("{}", l.to),
-                    "amountWei": l.amount.to_string(),
-                })).collect::<Vec<_>>(),
-            })
-        }))
-    })
-    .unwrap();
-
     m
 }
 
@@ -294,14 +271,4 @@ pub async fn serve(
         "rpc: could not bind {addr} after {BIND_ATTEMPTS} attempts: {:#}",
         last.expect("no bind without an error")
     ))
-}
-
-/// Client-side helper: frame + base64 a batch of canonical txs.
-pub fn encode_batch(txs: &[Vec<u8>]) -> String {
-    let mut blob = Vec::with_capacity(txs.iter().map(|t| 4 + t.len()).sum());
-    for t in txs {
-        blob.extend_from_slice(&(t.len() as u32).to_le_bytes());
-        blob.extend_from_slice(t);
-    }
-    base64::engine::general_purpose::STANDARD.encode(blob)
 }

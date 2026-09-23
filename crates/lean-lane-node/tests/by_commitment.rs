@@ -263,7 +263,7 @@ async fn staging_a_self_built_block_again_is_a_no_op() {
 #[tokio::test(flavor = "multi_thread")]
 async fn self_staged_build_matches_the_direct_path_byte_for_byte() {
     // Differential: a chain anchored through the build-self-stage promote path
-    // must produce the same head, state digest, receipts and LOG BYTES as the
+    // must produce the same head, state digest and LOG BYTES as the
     // same blocks fed through the full `arc_newBlock{bytes}` path.
     use std::sync::atomic::Ordering;
     let dp = tempfile::tempdir().unwrap(); // proposer (build -> by-commitment)
@@ -304,9 +304,17 @@ async fn self_staged_build_matches_the_direct_path_byte_for_byte() {
         0,
         "the follower used the full path"
     );
-    let rp: Vec<_> = p.receipts.lock().await.iter().cloned().collect();
-    let rd: Vec<_> = d.receipts.lock().await.iter().cloned().collect();
-    assert_eq!(rp, rd, "receipts diverged");
+    assert_eq!(
+        (
+            p.metrics.noops.load(Ordering::Relaxed),
+            p.metrics.outputs.load(Ordering::Relaxed)
+        ),
+        (
+            d.metrics.noops.load(Ordering::Relaxed),
+            d.metrics.outputs.load(Ordering::Relaxed)
+        ),
+        "no-op/output counts diverged"
+    );
     assert_eq!(
         std::fs::read(dp.path().join("blocks.log")).unwrap(),
         std::fs::read(dd.path().join("blocks.log")).unwrap(),

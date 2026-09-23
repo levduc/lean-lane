@@ -2,6 +2,8 @@
 //! snapshot+tail recovery must reproduce exactly the state of the intact
 //! prefix.
 
+mod common;
+
 use alloy_primitives::Address;
 use lean_lane_node::node::{Config, LaneNode, NewBlockOutcome};
 use lean_lane_node::state::Acct;
@@ -52,7 +54,7 @@ async fn drive(node: &LaneNode, count: u64, per_block: u64) {
         .await;
         node.submit_raw(signed.raw()).await.unwrap();
         if (i + 1) % per_block == 0 {
-            node.produce_block(1_000 + i).await.unwrap().unwrap();
+            common::produce(node, 1_000 + i, 150_000_000).await.unwrap();
         }
     }
 }
@@ -157,7 +159,7 @@ async fn total_stf_noop_never_halts() {
     )
     .await;
     node.submit_raw(s1.raw()).await.unwrap();
-    node.produce_block(1_000).await.unwrap().unwrap();
+    common::produce(&node, 1_000, 150_000_000).await.unwrap();
 
     // Same sender, nonce 0 again — stale by now; force it around the pool by
     // injecting directly into a block via the log-replay path semantics:
@@ -178,12 +180,10 @@ async fn total_stf_noop_never_halts() {
     let out = lean_lane_node::exec::apply_block(
         &mut state,
         &[(sender, stale_signed.tx().clone(), *stale_signed.hash())],
-        99,
         Address::with_last_byte(0xbe),
     );
     assert_eq!(out.applied, 0);
     assert_eq!(out.noops, 1);
-    assert!(!out.receipts[0].applied);
     assert_eq!(state.digest(), before, "no-op leaves state untouched");
 }
 
@@ -201,10 +201,11 @@ async fn total_stf_noop_never_halts() {
 async fn a_snapshot_ahead_of_the_log_falls_back_instead_of_leaving_a_hole() {
     let dir = tempfile::tempdir().unwrap();
     let log_path = dir.path().join("blocks.log");
-    let node = make_node(dir.path(), 2).await; // snapshot every 2 blocks
-                                               // Every sender is seeded BEFORE the first block: `seed_account` is a test
-                                               // hook, not a logged event, so an account created after a snapshot cannot
-                                               // be reproduced by replaying the log and the digests would not compare.
+    // snapshot every 2 blocks. Every sender is seeded BEFORE the first block:
+    // `seed_account` is a test hook, not a logged event, so an account created
+    // after a snapshot cannot be reproduced by replaying the log and the
+    // digests would not compare.
+    let node = make_node(dir.path(), 2).await;
     let domain = current_lane_domain();
     let txs: Vec<_> = (0..12u64)
         .map(|i| {
@@ -230,7 +231,9 @@ async fn a_snapshot_ahead_of_the_log_falls_back_instead_of_leaving_a_hole() {
     for (i, t) in txs.iter().enumerate() {
         node.submit_raw(t.raw()).await.unwrap();
         if (i + 1) % 3 == 0 {
-            node.produce_block(1_000 + i as u64).await.unwrap().unwrap();
+            common::produce(&node, 1_000 + i as u64, 150_000_000)
+                .await
+                .unwrap();
             produced += 1;
         }
         if produced == 3 && (i + 1) % 3 == 0 {
@@ -245,7 +248,7 @@ async fn a_snapshot_ahead_of_the_log_falls_back_instead_of_leaving_a_hole() {
     for t in txs.iter().skip(9) {
         node.submit_raw(t.raw()).await.unwrap();
     }
-    node.produce_block(2_000).await.unwrap().unwrap(); // block 4 -> snapshot-4.bin
+    common::produce(&node, 2_000, 150_000_000).await.unwrap(); // block 4 -> snapshot-4.bin
     assert_eq!(node.head.lock().await.1, 4);
     drop(node);
     assert!(dir.path().join("snapshot-4.bin").exists());
@@ -287,7 +290,7 @@ async fn a_snapshot_ahead_of_the_log_falls_back_instead_of_leaving_a_hole() {
     for t in txs.iter().skip(9) {
         n2.submit_raw(t.raw()).await.unwrap();
     }
-    n2.produce_block(3_000).await.unwrap().unwrap();
+    common::produce(&n2, 3_000, 150_000_000).await.unwrap();
     assert_eq!(n2.head.lock().await.1, 4);
     assert!(
         n2.log.lock().await.read_block(4).unwrap().is_some(),
@@ -300,7 +303,7 @@ async fn a_snapshot_ahead_of_the_log_falls_back_instead_of_leaving_a_hole() {
 /// node panicked with a divide-by-zero on the FIRST block it committed. Zero
 /// now means never, so recovery replays the whole log from genesis.
 ///
-/// Both `% 0` sites are driven here: `commit_block` (the by-bytes / self-drive
+/// Both `% 0` sites are driven here: `commit_block` (the by-bytes
 /// path) and `promote_staged` (the vote-gap anchor).
 #[tokio::test(flavor = "multi_thread")]
 async fn snapshot_every_zero_never_snapshots_and_never_panics() {

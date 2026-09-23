@@ -62,7 +62,7 @@ peers_for(){ local self=$1 out=""; for p in "${PORTS[@]}"; do
     [ "$p" = "$self" ] || out="${out}http://127.0.0.1:$p,"; done; echo "${out%,}"; }
 for p in "${PORTS[@]}"; do
   setsid "$BIN" run --datadir "$RUN/n$p" --port "$p" --bind 127.0.0.1 --chain-id $CHAIN \
-    --shim --peers "$(peers_for "$p")" --fund-file "$FUND" \
+    --peers "$(peers_for "$p")" --fund-file "$FUND" \
     --fund-balance 10000000000000000000 > "$RUN/n$p.log" 2>&1 &
   disown
 done
@@ -147,7 +147,7 @@ fi
 RP=8574
 say "V4: replaying $HEIGHTS blocks into a fresh node on :$RP"
 setsid "$BIN" run --datadir "$RUN/replay" --port $RP --bind 127.0.0.1 \
-  --chain-id $CHAIN --shim --fund-file "$FUND" \
+  --chain-id $CHAIN --fund-file "$FUND" \
   --fund-balance 10000000000000000000 > "$RUN/replay.log" 2>&1 &
 disown
 ok=0; for _ in $(seq 1 30); do

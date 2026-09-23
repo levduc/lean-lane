@@ -61,7 +61,7 @@ rustc than the pin — keep the lock).
 ./scripts/gen-lean-fund.sh 800 ~/lean-fund.txt      # genesis-funded accounts (needs `cast`)
 
 ./target/release/lean-lane-node run \
-  --datadir ~/lean-lane-data/val1 --port 8560 --bind 0.0.0.0 --chain-id 1338 --shim \
+  --datadir ~/lean-lane-data/val1 --port 8560 --bind 0.0.0.0 --chain-id 1338 \
   --peers http://<peer2>:8560,http://<peer3>:8560 \
   --fund-file ~/lean-fund.txt --fund-balance 10000000000000000000
 ```
@@ -74,30 +74,24 @@ read an environment variable as a fallback, shown in the table.
 | `--datadir` | `lean-lane-data` | block log + state snapshots |
 | `--port` / `--bind` | 8560 / 127.0.0.1 | JSON-RPC listen address |
 | `--chain-id` | 1338 | lane chain id: signing domain and genesis commitment |
-| `--shim` | off | the consensus layer drives block production; without it the node self-drives every `--block-ms` (standalone benchmarks only) |
-| `--block-ms` / `--budget-gas` | 250 / 150,000,000 | self-drive cadence and block budget (the shim passes its own budget per call) |
 | `--peers` | none | comma-separated lean-node RPC urls: announce targets on append, and the backfill source when this node is behind |
 | `--fund-file` / `--fund-balance` | none / 1e15 wei | addresses funded at genesis (fresh datadir only); must be exactly the accounts the spammer signs with (derivation `m/44'/60'/1'/0/i` — note the `1'`) |
 | `--snapshot-every` | 1024 | blocks between state snapshots (restart = snapshot + replay); `0` never snapshots, so a restart replays the whole log from genesis |
-| `--receipt-ring` | 200,000 | most-recent receipts kept in memory for `eth_getTransactionReceipt`; `0` keeps none |
 | `--no-fsync` | off (fsync every append) | skip the per-append fsync of the block log (see below) |
 | `--stats` (env `LEAN_STATS=1`) | off | one `lean_stats` line (counters and sizes) at info every 10 s |
 | `--announce-grace-ms` (env `LEAN_ANNOUNCE_GRACE_MS`) | 250 | how long an announcement for head+1 that this node does not hold waits for its own CL's anchor before the backfill pulls it; `0` pulls at once |
 | `--anchor-grace-ms` (env `LEAN_ANCHOR_GRACE_MS`) | 60 | how long an `arc_newBlock{commitment}` that holds none of the block waits for a stage that has not arrived yet before pulling from a peer; `0` disables |
 
-The old `LEAN_FSYNC`, `LEAN_STAGE_RACE_MS`, `LEAN_PARALLEL_RECOVERY` and
-`ARC_LEAN_SHIM` variables are gone (the node warns if one is set). Signature
-recovery is always rayon-parallel.
+The consensus layer always drives the chain (`arc_buildBlock` /
+`arc_newBlock`); there is no self-driving mode, so `--shim` is accepted and
+ignored, and `--block-ms`, `--budget-gas`, `--receipt-ring` and the `bench`
+subcommand are gone, as is `eth_getTransactionReceipt`. The old `LEAN_FSYNC`,
+`LEAN_STAGE_RACE_MS`, `LEAN_PARALLEL_RECOVERY` and `ARC_LEAN_SHIM` variables
+are gone too (the node warns if one is set). Signature recovery is always
+rayon-parallel.
 
 Genesis is a pure function of chain id + fund file, so every node in a fleet
 must be started with the same fund file.
-
-`--receipt-ring` is pure RSS, and the price scales with fan-out: receipts are
-derived, never persisted, and nothing but `eth_getTransactionReceipt` reads
-them. One receipt is 96 B plus 64 B per non-zero output — ~160 B at N=1 but
-~6.4 KB at N=100, so the 200,000 default costs ~32 MB on single payments and
-**~1.3 GB** at N=100. A validator under a fan-out load that nobody queries
-receipts from should set it well below the default (or to `0`).
 
 `--no-fsync` drops the per-append fsync on the block log. The log tail can
 then be lost in a crash — safe, because the head is re-derived from the log on
@@ -136,8 +130,7 @@ Fan-out drains sender balances one way; refund by regenerating genesis.
 ## Bench the execution engine alone
 
 ```bash
-./target/release/lean-lane-node bench --txs 200000 --mix 1,10,100
-python3 scripts/lean-replay-bench.py   # import rate from a recorded log
+python3 scripts/lean-replay-bench.py SRC_RPC TGT_RPC   # import rate from a live chain
 ```
 
 ## Docs

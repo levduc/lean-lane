@@ -1,6 +1,8 @@
 //! Live-regression gate: fund-file boot + nonce-0 submit must land in the
 //! PENDING subpool (not queued) and get packed by arc_buildBlock.
 
+mod common;
+
 use alloy_primitives::Address;
 use lean_lane_node::node::{Config, LaneNode};
 use lean_lane_node::state::Acct;
@@ -125,7 +127,9 @@ async fn recovered_datadir_keeps_provider_and_state_in_lockstep() {
             );
             let s = LeanSigned::new(t);
             n.submit_raw(s.raw()).await.unwrap();
-            n.produce_block(1000 + nonce as u64).await.unwrap().unwrap();
+            common::produce(&n, 1000 + nonce as u64, 150_000_000)
+                .await
+                .unwrap();
         }
         assert_eq!(n.state.lock().await.get(&sender).nonce, 3);
     }
@@ -190,7 +194,6 @@ async fn streamed_nonces_promote_across_blocks() {
     let dir = tempfile::tempdir().unwrap();
     let (n, _) = LaneNode::open(Config {
         datadir: dir.path().into(),
-        budget_gas: 260_000, // fits ~10 single-output lean txs (26k gas each)
         ..Default::default()
     })
     .unwrap();
@@ -240,7 +243,8 @@ async fn streamed_nonces_promote_across_blocks() {
     let mut height = 0u64;
     while mined < 30 {
         height += 1;
-        let bn = n.produce_block(1000 + height).await.unwrap();
+        // ~10 single-output lean txs per block (26k gas each)
+        let bn = common::produce(&n, 1000 + height, 260_000).await;
         assert!(
             bn.is_some(),
             "block must not be empty while txs remain (mined={mined})"

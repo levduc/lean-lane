@@ -7,7 +7,7 @@
 //! (contract listed in LEAN-NATIVE.md; not implemented here).
 
 use crate::chain::{genesis_commitment, BlockLog, LeanBlock};
-use crate::exec::{apply_block, LeanReceipt};
+use crate::exec::apply_block;
 use crate::metrics::{rss_mb, AnchorPath, Metrics, PathCell};
 use crate::provider::LeanProvider;
 use crate::state::{Acct, FlatState};
@@ -25,7 +25,6 @@ use reth_transaction_pool::{
     CoinbaseTipOrdering, Pool, PoolConfig, PoolTransaction, SubPoolLimit, TransactionOrigin,
     TransactionPool, TransactionPoolExt,
 };
-use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -41,21 +40,12 @@ pub type LanePool = Pool<
 pub struct Config {
     pub datadir: PathBuf,
     pub chain_id: u64,
-    pub budget_gas: u64,
     /// Blocks between full state snapshots. **0 means NEVER snapshot** — the
     /// node then recovers by replaying the whole log from genesis, which is
     /// what a short-lived test or a throwaway datadir wants. Any other value
     /// is a modulus (see `snapshot_due`).
     pub snapshot_every: u64,
     pub beneficiary: Address,
-    /// How many of the most recent receipts to keep in memory for
-    /// `eth_getTransactionReceipt`. Nothing else reads them and they are never
-    /// persisted (`exec::LeanReceipt` is derived, not stored), so this is pure
-    /// RSS with a fan-out-dependent price: a receipt is 96 B plus 64 B per
-    /// non-zero output, i.e. ~160 B at N=1 but ~6.4 KB at N=100 — 32 MB and
-    /// ~1.3 GB respectively at the 200k default. Tune it to the fan-out the
-    /// node actually carries (`--receipt-ring`); 0 keeps none at all.
-    pub receipt_ring: usize,
     /// Other lean nodes' RPC urls (backfill source + push-on-append targets).
     pub peers: Vec<String>,
     /// fsync the block log after every append (`--no-fsync` turns it off).
@@ -91,10 +81,8 @@ impl Default for Config {
         Self {
             datadir: PathBuf::from("lean-lane-data"),
             chain_id: 1338,
-            budget_gas: 150_000_000,
             snapshot_every: 1024,
             beneficiary: Address::with_last_byte(0xbe),
-            receipt_ring: 200_000,
             peers: Vec::new(),
             fsync: true,
             stats: false,
@@ -127,8 +115,8 @@ enum Link {
 ///   1. `commit_gate` -> anything. `commit_block` and `promote_staged` hold
 ///      the gate across the whole append (the linkage decision, the state
 ///      write, the log append, the head write and the bookkeeping sweeps) and
-///      take `head`, `state`, `log`, `receipts`, `by_commitment`, `staged`
-///      and `inflight` under it — one at a time.
+///      take `head`, `state`, `log`, `by_commitment`, `staged` and
+///      `inflight` under it — one at a time.
 ///   2. `head` -> `state`, nested in the two staging paths (`stage_claimed`
 ///      and `shim_build`) so that the head a staged entry names as its parent
 ///      and the state it executes on are read ATOMICALLY. That is the same
@@ -170,7 +158,6 @@ pub struct LaneNode {
     /// in exactly the racing case it exists to arbitrate. Staging, admission
     /// and the serving path never take it.
     commit_gate: Mutex<()>,
-    pub receipts: Mutex<VecDeque<LeanReceipt>>,
     pub metrics: Metrics,
     /// Blocks that arrived ahead of our head, keyed by PARENT commitment
     /// (bounded; drained as soon as their parent lands).
@@ -264,7 +251,7 @@ pub struct StagedBlock {
     /// post-state of every touched account (delta to write on promote)
     post_touched: Vec<(Address, crate::state::Acct)>,
     changed: Vec<reth_execution_types::ChangedAccount>,
-    receipts: Vec<LeanReceipt>,
+    txs: usize,
     evict: Vec<B256>,
     noops: usize,
     outputs: usize,
@@ -301,7 +288,7 @@ fn replay_onto(
         }
         let items = decode_block_txs(&block.txs);
         txs += items.len() as u64;
-        apply_block(state, &items, block.number, beneficiary);
+        apply_block(state, &items, beneficiary);
         head = (block.commitment, block.number, block.timestamp_ms);
         blocks += 1;
     })?;
@@ -432,7 +419,6 @@ impl LaneNode {
                 log: Mutex::new(log),
                 head: Mutex::new(head),
                 commit_gate: Mutex::new(()),
-                receipts: Mutex::new(VecDeque::new()),
                 metrics: Metrics::default(),
                 sync_queue: Mutex::new(Default::default()),
                 sync_notify: tokio::sync::Notify::new(),
@@ -446,31 +432,6 @@ impl LaneNode {
             },
             recovery,
         ))
-    }
-
-    /// Push a block's receipts into the ring, evicting the oldest past
-    /// `cfg.receipt_ring`.
-    ///
-    /// `>=`, not `==`: a ring sized 0 means keep none, and the old `==` test
-    /// grew UNBOUNDED there (len 0 pops nothing, pushes one, and never matches
-    /// 0 again). A shrunk ring also has to drain down to its new size rather
-    /// than sit above it forever.
-    fn keep_receipts(
-        &self,
-        ring: &mut VecDeque<LeanReceipt>,
-        receipts: impl IntoIterator<Item = LeanReceipt>,
-    ) {
-        let cap = self.cfg.receipt_ring;
-        if cap == 0 {
-            ring.clear();
-            return;
-        }
-        for r in receipts {
-            while ring.len() >= cap {
-                ring.pop_front();
-            }
-            ring.push_back(r);
-        }
     }
 
     /// Bench/genesis hook: seed an account into state + the validator's view.
@@ -509,33 +470,6 @@ impl LaneNode {
             Err(_) => &self.metrics.rejected,
         });
         res
-    }
-
-    /// Pull best txs from the pool under the gas budget (no state change).
-    async fn pick_txs(&self) -> (Vec<(Address, LeanTx, B256)>, Vec<Vec<u8>>, Vec<B256>) {
-        let mut gas = 0u64;
-        let mut items = Vec::new();
-        let mut raw = Vec::new();
-        let mut hashes = Vec::new();
-        for tx in self.pool.best_transactions() {
-            let g = tx.transaction.gas_limit();
-            if gas + g > self.cfg.budget_gas {
-                break;
-            }
-            gas += g;
-            let pooled: &ArcPooledTx = &tx.transaction;
-            let signer = pooled.0.transaction.signer();
-            let hash = *PoolTransaction::hash(pooled);
-            match pooled.0.transaction.inner() {
-                ArcTxEnvelope::Lean(lean) => {
-                    raw.push(lean.raw().to_vec());
-                    items.push((signer, lean.tx().clone(), hash));
-                    hashes.push(hash);
-                }
-                ArcTxEnvelope::Eth(_) => unreachable!("lane admits 0x50 only"),
-            }
-        }
-        (items, raw, hashes)
     }
 
     /// The last-moment linkage decision, taken under `commit_gate` and
@@ -599,7 +533,7 @@ impl LaneNode {
             return Ok(());
         }
         let mut state = self.state.lock().await;
-        let outcome = apply_block(&mut state, &items, block.number, self.cfg.beneficiary);
+        let outcome = apply_block(&mut state, &items, self.cfg.beneficiary);
         let mut touched: Vec<Address> = items.iter().map(|(s, _, _)| *s).collect();
         for (_, tx, _) in &items {
             touched.extend(tx.outputs.iter().map(|o| o.to));
@@ -649,10 +583,6 @@ impl LaneNode {
         // re-base sender nonces/balances -> promotes now-connectable queued
         // txs to pending, discards stale ones (reth's canonical-update analog)
         self.pool.update_accounts(changed);
-        {
-            let mut ring = self.receipts.lock().await;
-            self.keep_receipts(&mut ring, outcome.receipts);
-        }
         // head advanced: keep entries that are still AHEAD of the new head
         // (losing candidates for this height are dropped when the height is
         // passed; bytes for the current height stay servable by commitment)
@@ -672,22 +602,6 @@ impl LaneNode {
         Metrics::add(&m.noops, outcome.noops as u64);
         Metrics::add(&m.outputs, outcome.outputs as u64);
         Ok(())
-    }
-
-    /// One SELF-DRIVING tick (standalone mode): build on head and commit.
-    /// In shim mode this is never called — only `shim_new` advances the chain.
-    pub async fn produce_block(&self, timestamp_ms: u64) -> eyre::Result<Option<u64>> {
-        let (items, raw, hashes) = self.pick_txs().await;
-        if items.is_empty() {
-            return Ok(None);
-        }
-        let (parent, number, _) = *self.head.lock().await;
-        let block = LeanBlock::new(parent, number + 1, timestamp_ms, raw);
-        let bn = block.number;
-        let cm = block.commitment;
-        self.commit_block(block, items, hashes).await?;
-        self.announce_to_peers(cm, bn);
-        Ok(Some(bn))
     }
 
     /// Assemble the memory-only staged entry for `block` from a POST-execution
@@ -750,7 +664,7 @@ impl LaneNode {
             wire,
             post_touched,
             changed,
-            receipts: outcome.receipts,
+            txs: items.len(),
             evict,
             noops: outcome.noops,
             outputs: outcome.outputs,
@@ -859,7 +773,7 @@ impl LaneNode {
             }
         };
         if let Some(mut staged) = on_head {
-            let outcome = apply_block(&mut staged, &items, number, self.cfg.beneficiary);
+            let outcome = apply_block(&mut staged, &items, self.cfg.beneficiary);
             if !self.already_staged(commitment, head_c).await {
                 let entry =
                     self.staged_entry(block, wire.clone(), head_c, &items, &staged, outcome);
@@ -1036,12 +950,7 @@ impl LaneNode {
             }
             (head_c, self.state.lock().await.clone())
         };
-        let outcome = apply_block(
-            &mut staged_state,
-            &items,
-            block.number,
-            self.cfg.beneficiary,
-        );
+        let outcome = apply_block(&mut staged_state, &items, self.cfg.beneficiary);
         let commitment = block.commitment;
         let entry = self.staged_entry(
             block,
@@ -1066,13 +975,12 @@ impl LaneNode {
             block,
             post_touched,
             changed,
-            receipts,
+            txs,
             evict,
             noops,
             outputs,
             ..
         } = entry;
-        let n_items = receipts.len();
         // Same gate, same last-moment link check as `commit_block`: taking the
         // staged entry out of `staged` makes this promote unique among
         // promotes, but not among APPENDS — a by-bytes feed that arrives after
@@ -1111,10 +1019,6 @@ impl LaneNode {
         *self.head.lock().await = (block.commitment, block.number, block.timestamp_ms);
         self.pool.remove_transactions(evict);
         self.pool.update_accounts(changed);
-        {
-            let mut ring = self.receipts.lock().await;
-            self.keep_receipts(&mut ring, receipts);
-        }
         // head advanced: keep entries that are still AHEAD of the new head
         // (losing candidates for this height are dropped when the height is
         // passed; bytes for the current height stay servable by commitment)
@@ -1130,7 +1034,7 @@ impl LaneNode {
             .retain(|_, (p, _, _)| *p == new_head.0);
         let m = &self.metrics;
         Metrics::inc(&m.blocks);
-        Metrics::add(&m.txs, n_items as u64);
+        Metrics::add(&m.txs, txs as u64);
         Metrics::add(&m.noops, noops as u64);
         Metrics::add(&m.outputs, outputs as u64);
         Metrics::inc(&m.promoted);
@@ -1843,16 +1747,6 @@ impl LaneNode {
     /// block with that commitment.
     pub async fn block_wire_bytes_by_commitment(&self, c: B256) -> Result<Option<Vec<u8>>, String> {
         Ok(self.locate(c).await?.map(|(w, _)| w))
-    }
-
-    pub async fn receipt(&self, hash: B256) -> Option<LeanReceipt> {
-        self.receipts
-            .lock()
-            .await
-            .iter()
-            .rev()
-            .find(|r| r.tx_hash == hash)
-            .cloned()
     }
 
     /// One-line periodic snapshot: what can grow without bound, plus the

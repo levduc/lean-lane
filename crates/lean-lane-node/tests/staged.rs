@@ -1,7 +1,7 @@
 //! Shim v1.3 gates — deferred anchor execution.
 //!
 //! DIFFERENTIAL (consensus-critical): for randomized blocks, stage+promote
-//! must produce byte-identical post-state, head, receipts, and LOG-FILE BYTES
+//! must produce byte-identical post-state, head, and LOG-FILE BYTES
 //! vs the direct arc_newBlock path. A divergence here forks the lane.
 
 use alloy_primitives::Address;
@@ -138,9 +138,17 @@ async fn differential_stage_promote_vs_direct() {
             s.state.lock().await.digest(),
             "state diverged at {height}"
         );
-        let rd: Vec<_> = d.receipts.lock().await.iter().cloned().collect();
-        let rs: Vec<_> = s.receipts.lock().await.iter().cloned().collect();
-        assert_eq!(rd, rs, "receipts diverged at {height}");
+        assert_eq!(
+            (
+                d.metrics.noops.load(Ordering::Relaxed),
+                d.metrics.outputs.load(Ordering::Relaxed)
+            ),
+            (
+                s.metrics.noops.load(Ordering::Relaxed),
+                s.metrics.outputs.load(Ordering::Relaxed)
+            ),
+            "no-op/output counts diverged at {height}"
+        );
     }
     // every anchored block on S must have taken the fast path
     assert_eq!(
@@ -318,9 +326,17 @@ async fn newblock_during_inflight_staging_promotes_and_matches_direct() {
         std::fs::read(ds.path().join("blocks.log")).unwrap(),
         "log files must be byte-identical under the race"
     );
-    let rd: Vec<_> = d.receipts.lock().await.iter().cloned().collect();
-    let rs: Vec<_> = s.receipts.lock().await.iter().cloned().collect();
-    assert_eq!(rd, rs, "receipts diverged under the race");
+    assert_eq!(
+        (
+            d.metrics.noops.load(Ordering::Relaxed),
+            d.metrics.outputs.load(Ordering::Relaxed)
+        ),
+        (
+            s.metrics.noops.load(Ordering::Relaxed),
+            s.metrics.outputs.load(Ordering::Relaxed)
+        ),
+        "no-op/output counts diverged under the race"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -425,10 +441,12 @@ async fn a_noops_recipients_are_never_created_by_promote() {
     );
 
     // the block really is "one applied, one no-op" — otherwise this gates nothing
-    let rd: Vec<_> = d.receipts.lock().await.iter().cloned().collect();
-    assert_eq!(rd.len(), 2);
-    assert!(rd[0].applied, "the funded tx must apply");
-    assert!(!rd[1].applied, "the bankrupt tx must be a no-op");
+    assert_eq!(d.metrics.txs.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        d.metrics.noops.load(Ordering::Relaxed),
+        1,
+        "the bankrupt tx must be a no-op, the funded one applied"
+    );
 
     let (digest_d, len_d) = {
         let g = d.state.lock().await;
@@ -458,8 +476,17 @@ async fn a_noops_recipients_are_never_created_by_promote() {
             "{name}: a no-op output must not be created"
         );
     }
-    let rs: Vec<_> = s.receipts.lock().await.iter().cloned().collect();
-    assert_eq!(rd, rs, "receipts diverged");
+    assert_eq!(
+        (
+            d.metrics.noops.load(Ordering::Relaxed),
+            d.metrics.outputs.load(Ordering::Relaxed)
+        ),
+        (
+            s.metrics.noops.load(Ordering::Relaxed),
+            s.metrics.outputs.load(Ordering::Relaxed)
+        ),
+        "no-op/output counts diverged"
+    );
     assert_eq!(
         std::fs::read(dd.path().join("blocks.log")).unwrap(),
         std::fs::read(ds.path().join("blocks.log")).unwrap(),

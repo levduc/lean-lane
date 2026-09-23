@@ -52,8 +52,7 @@ are JSON-RPC **errors** (protocol violations); lag is never an error, it is
 
 Also served, not part of the CL contract: `eth_sendRawTransaction`,
 `arc_sendRawTxBatch`, `txpool_status`, `eth_getTransactionCount`
-(**pool-inclusive**), a recent-window `eth_getTransactionReceipt`, and
-`arc_announceBlock` (node-to-node gossip).
+(**pool-inclusive**), and `arc_announceBlock` (node-to-node gossip).
 
 Total-STF semantics: an invalid transaction inside a block is a no-op, never a
 block rejection. A byzantine proposer can waste bytes; it cannot fork or halt the

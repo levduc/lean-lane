@@ -468,11 +468,12 @@ async fn wire_child(
 /// The state converges either way (total-STF), which is what makes this
 /// invisible to every other check the node runs.
 ///
-/// Staged deterministically: the committer of b1 is parked on `receipts` —
-/// the first lock `commit_block` takes AFTER the head write — so b1 is
-/// canonical and b2 is feedable by bytes while its drain has not started; then
-/// the `state` lock is taken, so the drain parks inside `commit_block(b2)`
-/// with the link check already passed, which is precisely the window.
+/// Staged deterministically: the committer of b1 is parked on `sync_queue` —
+/// the first lock its drain takes, after b1 is appended and the head written —
+/// so b1 is canonical and b2 is feedable by bytes while its drain has not
+/// started; then the `state` lock is taken, so the drain parks inside
+/// `commit_block(b2)` with the link check already passed, which is precisely
+/// the window.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_drain_racing_a_by_bytes_feed_appends_the_block_once() {
     let dir = tempfile::tempdir().unwrap();
@@ -487,8 +488,8 @@ async fn a_drain_racing_a_by_bytes_feed_appends_the_block_once() {
     assert!(matches!(q, NewBlockOutcome::Syncing { .. }), "got {q:?}");
     assert_eq!(n.sync_queue.lock().await.len(), 1);
 
-    // park the b1 commit immediately after its head write
-    let receipts_guard = n.receipts.lock().await;
+    // park the b1 feed at its drain, after the head write
+    let queue_guard = n.sync_queue.lock().await;
     let a = {
         let (n, w1) = (n.clone(), w1.clone());
         tokio::spawn(async move { n.shim_new(&w1).await })
@@ -504,10 +505,10 @@ async fn a_drain_racing_a_by_bytes_feed_appends_the_block_once() {
     // b1 canonical is what makes the drain race possible at all
     assert!(at_head, "b1 never became the head");
 
-    // take `state` BEFORE releasing `receipts`, so the drain cannot get past
+    // take `state` BEFORE releasing `sync_queue`, so the drain cannot get past
     // `commit_block`'s apply
     let state_guard = n.state.lock().await;
-    drop(receipts_guard);
+    drop(queue_guard);
 
     // the drain removes b2 from the queue as its first act: that is the signal
     // that it is committed to committing b2
@@ -574,28 +575,50 @@ async fn a_conflicting_block_at_a_known_height_is_still_an_error() {
 /// from, kept in the staged map and servable by commitment. The pairing is
 /// exactly what `promote_staged` trusts instead of re-executing.
 ///
-/// Driven deterministically: the stage is parked on the `staged` lock, which
+/// Driven deterministically. The stage is parked on the `staged` lock, which
 /// its already-staged probe takes and which sits precisely between the head
 /// read and the state clone. The commit that advances the head past it is a
-/// self-driven `produce_block`, NOT `shim_new` — `shim_new` takes the `staged`
-/// lock before it commits anything and would park alongside the stage, while
-/// `commit_block` takes it only in its retention sweep, after the head write.
+/// sync-queue DRAIN, because the drain reaches `commit_block` without taking
+/// `staged` first (it takes it only in the retention sweep, after the head
+/// write), whereas `shim_new` would park alongside the stage.
+///
+/// Set-up: head P at height 1, C (child of P) queued behind it, and the feed
+/// of P parked at its drain on `sync_queue`. The stage is of B, a DIFFERENT
+/// child of P; releasing the queue commits C under the parked stage.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_commit_between_the_head_read_and_the_state_clone_stages_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let n = node(dir.path());
-    // B: a child of genesis assembled off the head, never through the pool
-    let (cb, wb) = wire_head_plus_one(&n, 1_000, 4).await;
-    // A: a DIFFERENT child of genesis, driven out of the pool
-    let a_tx = funded_tx(&n, 2_000, 0, 4).await;
-    n.submit_raw(&a_tx).await.unwrap();
+    let (cp, wp) = wire_head_plus_one(&n, 1_000, 4).await;
+    let ts = n.head.lock().await.2;
+    let (cc, wc) = wire_child(&n, cp, 2, ts + 2_000, 2_000, 4).await;
+    let (cb, wb) = wire_child(&n, cp, 2, ts + 3_000, 3_000, 4).await;
+    assert_ne!(cb, cc);
 
-    // park whoever asks for `staged` next
+    // C does not connect yet: queued behind P
+    let q = n.shim_new(&wc).await.unwrap();
+    assert!(matches!(q, NewBlockOutcome::Syncing { .. }), "got {q:?}");
+
+    // feed P, parked at its drain once P is canonical and its claim released
+    let queue_guard = n.sync_queue.lock().await;
+    let feeder = {
+        let (n, wp) = (n.clone(), wp.clone());
+        tokio::spawn(async move { n.shim_new(&wp).await })
+    };
+    let mut parked = false;
+    for _ in 0..400 {
+        if n.head.lock().await.1 == 1 && !n.inflight.lock().await.contains_key(&cp) {
+            parked = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(parked, "P never became the head");
+
+    // park whoever asks for `staged` next, then stage B on head P
     let staged_guard = n.staged.lock().await;
-
     let staging = {
-        let n = n.clone();
-        let wb = wb.clone();
+        let (n, wb) = (n.clone(), wb.clone());
         tokio::spawn(async move { n.stage_block(&wb).await })
     };
     let mut claimed = false;
@@ -610,32 +633,30 @@ async fn a_commit_between_the_head_read_and_the_state_clone_stages_nothing() {
     // ...and is now past its head read, parked on `staged`
     tokio::time::sleep(Duration::from_millis(25)).await;
 
-    let committer = {
-        let n = n.clone();
-        tokio::spawn(async move { n.produce_block(9_000).await })
-    };
+    // release the drain: it commits C and moves the head under the stage
+    drop(queue_guard);
     let mut moved = false;
     for _ in 0..400 {
-        if n.head.lock().await.1 == 1 {
+        if n.head.lock().await.1 == 2 {
             moved = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    assert!(moved, "the commit never advanced the head");
+    assert!(moved, "the drain never advanced the head");
     drop(staged_guard);
 
-    assert_eq!(committer.await.unwrap().unwrap(), Some(1));
+    assert_eq!(feeder.await.unwrap().unwrap(), NewBlockOutcome::Valid(cp));
     // the head moved under the stage: it must refuse, not stage a post-state
     // of a parent it never re-checked
     assert_eq!(
         staging.await.unwrap().unwrap(),
-        StageOutcome::Syncing { head: 1 }
+        StageOutcome::Syncing { head: 2 }
     );
     assert!(
         !n.staged.lock().await.iter().any(|(c, _)| *c == cb),
         "staged an entry whose post-state is not its parent's",
     );
-    assert_eq!(n.head.lock().await.1, 1);
+    assert_eq!(n.head.lock().await.0, cc);
     assert!(n.inflight.lock().await.is_empty());
 }
