@@ -20,7 +20,7 @@
 //! 8B/output vs u128 wei.
 //!
 //! Block execution semantics (implemented by the node, `lean-lane-node`'s
-//! `exec::apply_block`). The state transition is TOTAL:
+//! `exec::execute`). The state transition is TOTAL:
 //! * Whole-tx atomic: any invalidity (nonce mismatch, output-sum overflow,
 //!   insufficient funds) makes the ENTIRE tx a no-op; state untouched. The
 //!   BLOCK stays valid — an invalid tx never rejects the block that carries

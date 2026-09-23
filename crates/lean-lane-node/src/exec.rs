@@ -13,6 +13,9 @@ use alloy_primitives::{Address, B256};
 use lean_native::{lean_fee, LeanTx, AMOUNT_UNIT};
 use std::collections::HashMap;
 
+use crate::state::Acct;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BlockOutcome {
     pub applied: usize,
     pub noops: usize,
@@ -20,24 +23,59 @@ pub struct BlockOutcome {
     pub fees_to_beneficiary: u128,
 }
 
-/// Apply a block of recovered lean txs to `state`. `items` are in block order.
-pub fn apply_block(
-    state: &mut FlatState,
+/// What executing one block does to the state, computed WITHOUT mutating it:
+/// the post-value of every account the block writes, plus what the node needs
+/// to finish the append (pool evictions, counters).
+///
+/// The write set is exactly the total STF's: every sender (a no-op's too — its
+/// entry is created at the value it already had), every recipient of an
+/// APPLIED tx, and the beneficiary. The outputs of a no-op tx are never
+/// written. `FlatState::digest` covers the account count, so this set must be
+/// the same on every path that executes a block — and it is, because `execute`
+/// is the only code that computes it.
+#[derive(Clone, Debug, Default)]
+pub struct Delta {
+    /// (address, post-state), sorted by address.
+    pub writes: Vec<(Address, Acct)>,
+    /// hashes of every tx in the block (applied or no-op): pool evictions
+    pub evict: Vec<B256>,
+    pub outcome: BlockOutcome,
+}
+
+impl Delta {
+    /// Write the delta into `state`.
+    pub fn apply_to(&self, state: &mut FlatState) {
+        for (a, acct) in &self.writes {
+            state.accounts.insert(*a, *acct);
+        }
+    }
+
+    /// Number of txs in the block (applied + no-op).
+    pub fn txs(&self) -> usize {
+        self.outcome.applied + self.outcome.noops
+    }
+}
+
+/// THE state transition function: execute a block of recovered lean txs
+/// (`items`, in block order) against `state` and return the delta. Pure —
+/// `state` is only read, so a staging can execute against the committed
+/// state without copying it.
+pub fn execute(
+    state: &FlatState,
     items: &[(Address, LeanTx, B256)],
     beneficiary: Address,
-) -> BlockOutcome {
-    // Debit view: block-start balances, own debits accumulate, incoming
-    // same-block credits invisible (deterministic-parallel rule).
-    let mut debit_view: HashMap<Address, crate::state::Acct> = HashMap::new();
+) -> Delta {
+    // Post view: block-start values, own debits accumulate, incoming
+    // same-block credits invisible to the debit checks (deterministic-parallel
+    // rule) — they are only merged in after the debit phase.
+    let mut post: HashMap<Address, Acct> = HashMap::new();
     let mut credits: HashMap<Address, u128> = HashMap::new();
     let mut fees = 0u128;
     let mut applied = 0usize;
     let mut outputs = 0usize;
 
     for (sender, tx, _) in items {
-        let entry = debit_view
-            .entry(*sender)
-            .or_insert_with(|| state.get(sender));
+        let entry = post.entry(*sender).or_insert_with(|| state.get(sender));
         let fee = lean_fee(tx.outputs.len());
         let mut total = fee;
         let mut ok = tx.nonce as u64 == entry.nonce;
@@ -65,26 +103,41 @@ pub fn apply_block(
         applied += 1;
     }
 
-    for (addr, acct) in debit_view {
-        state.accounts.insert(addr, acct);
-    }
     for (addr, wei) in credits {
-        state.credit(addr, wei);
+        post.entry(addr).or_insert_with(|| state.get(&addr)).balance += wei;
     }
-    state.credit(beneficiary, fees);
+    post.entry(beneficiary)
+        .or_insert_with(|| state.get(&beneficiary))
+        .balance += fees;
 
-    BlockOutcome {
-        applied,
-        noops: items.len() - applied,
-        outputs,
-        fees_to_beneficiary: fees,
+    let mut writes: Vec<(Address, Acct)> = post.into_iter().collect();
+    writes.sort_unstable_by_key(|(a, _)| *a);
+    Delta {
+        writes,
+        evict: items.iter().map(|(_, _, h)| *h).collect(),
+        outcome: BlockOutcome {
+            applied,
+            noops: items.len() - applied,
+            outputs,
+            fees_to_beneficiary: fees,
+        },
     }
+}
+
+/// `execute` + write the delta into `state` (replay and tests).
+pub fn apply_block(
+    state: &mut FlatState,
+    items: &[(Address, LeanTx, B256)],
+    beneficiary: Address,
+) -> BlockOutcome {
+    let delta = execute(state, items, beneficiary);
+    delta.apply_to(state);
+    delta.outcome
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::Acct;
     use lean_native::{lane_domain, Output};
     use secp256k1::SecretKey;
 
@@ -188,5 +241,21 @@ mod tests {
             }
         );
         assert_eq!(state.get(&Address::with_last_byte(9)).balance, 0);
+    }
+
+    #[test]
+    fn execute_is_pure_and_writes_only_the_stf_write_set() {
+        let ben = Address::with_last_byte(0xbe);
+        let ok = item(5, 0, vec![to(1, 10)]);
+        let bankrupt = item(6, 0, vec![to(2, 10)]); // unfunded: a no-op
+        let state = funded(&[(ok.0, 10 * AMOUNT_UNIT + lean_fee(1))]);
+        let before = state.digest();
+        let d = execute(&state, &[ok.clone(), bankrupt.clone()], ben);
+        assert_eq!(state.digest(), before, "execute must not mutate");
+        let written: Vec<Address> = d.writes.iter().map(|(a, _)| *a).collect();
+        let mut want = vec![ok.0, bankrupt.0, Address::with_last_byte(1), ben];
+        want.sort_unstable();
+        assert_eq!(written, want, "a no-op's recipient is never written");
+        assert_eq!((d.txs(), d.evict.len()), (2, 2));
     }
 }
