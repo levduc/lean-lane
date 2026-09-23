@@ -82,7 +82,7 @@ struct RunArgs {
     /// log tail; peers backfill it).
     #[arg(long)]
     no_fsync: bool,
-    /// Periodic `lean_stats` line + per-call anchor/stage/locate lines.
+    /// Log a `lean_stats` line (counters and sizes) at info every 10 s.
     #[arg(long, env = "LEAN_STATS", value_parser = clap::builder::BoolishValueParser::new())]
     stats: bool,
     /// Wait for our own CL's anchor before pulling an announced head+1 (ms).
@@ -125,6 +125,14 @@ fn sk(i: u64) -> SecretKey {
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
+    // RUST_LOG overrides; default: info for this node, warn for dependencies.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn,lean_lane_node=info")),
+        )
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
+        .init();
     match Cli::parse().cmd {
         Cmd::Run(a) => run(a).await,
         Cmd::Bench(a) => bench(a).await,
@@ -139,7 +147,7 @@ async fn run(args: RunArgs) -> eyre::Result<()> {
         "ARC_LEAN_SHIM",
     ] {
         if std::env::var_os(gone).is_some() {
-            eprintln!("warning: {gone} is no longer read (see `lean-lane-node run --help`)");
+            tracing::warn!("{gone} is no longer read (see `lean-lane-node run --help`)");
         }
     }
     let cfg = Config {
@@ -164,20 +172,22 @@ async fn run(args: RunArgs) -> eyre::Result<()> {
     let port = args.port;
     let fund_balance = args.fund_balance;
     if !cfg.fsync {
-        println!(
+        tracing::info!(
             "--no-fsync: the block-log append does NOT fsync (a crash may lose the log tail; \
              peers backfill it and the CL certificate binds the bytes, so no fork)"
         );
     }
-    lean_lane_node::node::node_start();
     let (node, rec) = LaneNode::open(cfg)?;
     let node = Arc::new(node);
     node.spawn_sync();
     // --stats: one `lean_stats ...` line every 10 s (see stats_line).
     node.spawn_stats();
-    println!(
+    tracing::info!(
         "recovered: snapshot@{} + {} blocks / {} txs replayed in {:?}",
-        rec.snapshot_number, rec.replayed_blocks, rec.replayed_txs, rec.elapsed
+        rec.snapshot_number,
+        rec.replayed_blocks,
+        rec.replayed_txs,
+        rec.elapsed
     );
     if let Some(fund_file) = args
         .fund_file
@@ -209,16 +219,16 @@ async fn run(args: RunArgs) -> eyre::Result<()> {
             .lock()
             .await
             .write_snapshot(&node.cfg.datadir, c, num, t)?;
-        println!(
+        tracing::info!(
             "funded {n} accounts @ {fund_balance} wei from {}",
             fund_file.display()
         );
     }
     let shim = args.shim;
     let (addr, _handle) = rpc::serve(node.clone(), (args.bind, port).into()).await?;
-    println!("rpc: http://{addr}  (eth_sendRawTransaction / arc_sendRawTxBatch / txpool_status / arc_getHead / arc_buildBlock / arc_newBlock / arc_getBlockBytes)");
+    tracing::info!("rpc: http://{addr}  (eth_sendRawTransaction / arc_sendRawTxBatch / txpool_status / arc_getHead / arc_buildBlock / arc_newBlock / arc_getBlockBytes)");
     if shim {
-        println!("SHIM MODE: the CL drives block production (arc_newBlock advances the chain; no self-driving loop)");
+        tracing::info!("SHIM MODE: the CL drives block production (arc_newBlock advances the chain; no self-driving loop)");
     } else {
         let driver = node.clone();
         tokio::spawn(async move {
@@ -226,7 +236,7 @@ async fn run(args: RunArgs) -> eyre::Result<()> {
             loop {
                 tick.tick().await;
                 if let Err(e) = driver.produce_block(now_ms()).await {
-                    eprintln!("produce_block: {e:#}");
+                    tracing::error!("produce_block: {e:#}");
                 }
             }
         });
@@ -342,13 +352,12 @@ async fn bench(args: BenchArgs) -> eyre::Result<()> {
     handle.stop().ok();
 
     // -- report ---------------------------------------------------------------
-    let s = &node.stats;
+    let s = &node.metrics;
     let outputs = s.outputs.load(Ordering::Relaxed).max(1);
     let txs = s.txs.load(Ordering::Relaxed).max(1);
     let blocks = s.blocks.load(Ordering::Relaxed).max(1);
     let admitted = s.admitted.load(Ordering::Relaxed).max(1);
     let log_bytes = node.log.lock().await.bytes_written;
-    let per_out = |ns: u64| ns as f64 / 1000.0 / outputs as f64;
     let (w0, w1) = *window.lock().unwrap();
     let active_s = match (w0, w1) {
         // first->last block, plus one cadence for the first block's fill
@@ -371,12 +380,6 @@ async fn bench(args: BenchArgs) -> eyre::Result<()> {
         submit_elapsed,
         admitted as f64 / submit_elapsed.as_secs_f64() / 1000.0
     );
-    println!("per-output µs: admission {:.2} (per tx {:.2})  build {:.3}  execute {:.3}  append+fsync {:.3}",
-        s.admit_ns.load(Ordering::Relaxed) as f64 / 1000.0 / outputs as f64,
-        s.admit_ns.load(Ordering::Relaxed) as f64 / 1000.0 / admitted as f64,
-        per_out(s.build_ns.load(Ordering::Relaxed)),
-        per_out(s.exec_ns.load(Ordering::Relaxed)),
-        per_out(s.append_ns.load(Ordering::Relaxed)));
     println!(
         "log: {} bytes total = {:.1} B/output  ({:.1} B/tx)",
         log_bytes,

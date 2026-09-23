@@ -122,29 +122,15 @@ pub fn module(node: Arc<LaneNode>) -> RpcModule<Arc<LaneNode>> {
         commitment: Option<B256>,
     }
     m.register_async_method("arc_newBlock", |params, node, _| async move {
-        // FIRST statement in the handler. `pre_ms` in the `lean_anchor` line
-        // is everything from here to path dispatch: param parse, the base64
-        // decode of a ~3.4 MB body, and whatever the tokio executor made this
-        // task wait for before it ran.
-        //
-        // NOT `rpc_queue_ms`: jsonrpsee hands the handler no request-receive
-        // timestamp (the third closure argument is `Extensions`, and the
-        // server inserts nothing time-related), so socket-read -> handler-entry
-        // is not observable from inside a method. This instant is the earliest
-        // point the node can name.
-        let t_entry = std::time::Instant::now();
         let p: NewBlockParams = params.parse()?;
         let outcome = match (p.block_bytes, p.commitment) {
             (Some(b64), _) => {
                 let bytes = base64::engine::general_purpose::STANDARD
                     .decode(&b64)
                     .map_err(|e| err(e.to_string()))?;
-                node.shim_new_at(&bytes, t_entry).await.map_err(err)?
+                node.shim_new(&bytes).await.map_err(err)?
             }
-            (None, Some(c)) => node
-                .shim_new_by_commitment_at(c, t_entry)
-                .await
-                .map_err(err)?,
+            (None, Some(c)) => node.shim_new_by_commitment(c).await.map_err(err)?,
             (None, None) => return Err(err("arc_newBlock: need blockBytes or commitment")),
         };
         match outcome {
@@ -168,7 +154,6 @@ pub fn module(node: Arc<LaneNode>) -> RpcModule<Arc<LaneNode>> {
         // FIRST statement in the handler — see `StagePending`. Everything
         // below it (param parse, base64 decode of ~3 MB) is the window in
         // which the node knows a stage is coming but not yet which block.
-        let t_entry = std::time::Instant::now();
         let _pending = StagePending::new(&node);
         let p: NewBlockParams = params.parse()?;
         let block_bytes = p
@@ -177,7 +162,7 @@ pub fn module(node: Arc<LaneNode>) -> RpcModule<Arc<LaneNode>> {
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(&block_bytes)
             .map_err(|e| err(e.to_string()))?;
-        match node.stage_block_at(&bytes, t_entry).await.map_err(err)? {
+        match node.stage_block(&bytes).await.map_err(err)? {
             crate::node::StageOutcome::Staged(commitment) => Ok::<_, ErrorObjectOwned>(
                 json!({ "status": "STAGED", "commitment": format!("{commitment}") }),
             ),
@@ -204,10 +189,7 @@ pub fn module(node: Arc<LaneNode>) -> RpcModule<Arc<LaneNode>> {
     m.register_async_method("arc_getBlockBytes", |params, node, _| async move {
         let p: GetBlockParams = params.parse()?;
         let wire = match (p.commitment, p.number) {
-            (Some(c), _) => node
-                .block_wire_bytes_by_commitment_for(c, "get_bytes")
-                .await
-                .map_err(err)?,
+            (Some(c), _) => node.block_wire_bytes_by_commitment(c).await.map_err(err)?,
             (None, Some(n)) => node.block_wire_bytes(n).await.map_err(err)?,
             (None, None) => return Err(err("arc_getBlockBytes: need number or commitment")),
         };
@@ -292,14 +274,16 @@ pub async fn serve(
             Ok(server) => {
                 let bound = server.local_addr()?;
                 if attempt > 1 {
-                    eprintln!("rpc: bound {bound} after {attempt} attempts");
+                    tracing::info!("rpc: bound {bound} after {attempt} attempts");
                 }
                 let handle = server.start(module(node));
                 return Ok((bound, handle));
             }
             Err(e) => {
                 if attempt % 20 == 1 {
-                    eprintln!("rpc: bind {addr} failed ({e}); retrying (attempt {attempt}/{BIND_ATTEMPTS})");
+                    tracing::warn!(
+                        "rpc: bind {addr} failed ({e}); retrying (attempt {attempt}/{BIND_ATTEMPTS})"
+                    );
                 }
                 last = Some(e);
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;

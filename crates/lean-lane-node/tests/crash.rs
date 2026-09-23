@@ -342,7 +342,7 @@ async fn snapshot_every_zero_never_snapshots_and_never_panics() {
             NewBlockOutcome::Valid(c)
         );
         assert_eq!(
-            node.stats
+            node.metrics
                 .promoted
                 .load(std::sync::atomic::Ordering::Relaxed),
             1

@@ -137,9 +137,9 @@ async fn announcing_a_block_we_have_staged_pulls_nothing() {
         "a held block must not wait out the grace"
     );
 
-    assert_eq!(n.stats.announce_skipped_staged.load(Ordering::Relaxed), 1);
-    assert_eq!(n.stats.backfill_pulls.load(Ordering::Relaxed), 0);
-    assert_eq!(n.stats.block_pulls.load(Ordering::Relaxed), 0);
+    assert_eq!(n.metrics.announce_skipped_staged.load(Ordering::Relaxed), 1);
+    assert_eq!(n.metrics.backfill_pulls.load(Ordering::Relaxed), 0);
+    assert_eq!(n.metrics.block_pulls.load(Ordering::Relaxed), 0);
     assert_eq!(
         n.head.lock().await.1,
         head_n,
@@ -152,7 +152,7 @@ async fn announcing_a_block_we_have_staged_pulls_nothing() {
         0,
         "no HTTP request may be made"
     );
-    assert_eq!(n.stats.backfill_pulls.load(Ordering::Relaxed), 0);
+    assert_eq!(n.metrics.backfill_pulls.load(Ordering::Relaxed), 0);
 
     // and the anchor still lands, from the staged copy
     assert_eq!(
@@ -160,7 +160,7 @@ async fn announcing_a_block_we_have_staged_pulls_nothing() {
         NewBlockOutcome::Valid(c)
     );
     assert_eq!(n.head.lock().await.1, head_n + 1);
-    assert_eq!(n.stats.promoted.load(Ordering::Relaxed), 1);
+    assert_eq!(n.metrics.promoted.load(Ordering::Relaxed), 1);
     let _ = wire;
 }
 
@@ -184,14 +184,14 @@ async fn announcing_a_different_candidate_at_a_staged_height_pulls_nothing() {
     assert_ne!(other, c);
     n.on_announce(other, head_n + 1).await;
 
-    assert_eq!(n.stats.announce_skipped_staged.load(Ordering::Relaxed), 1);
+    assert_eq!(n.metrics.announce_skipped_staged.load(Ordering::Relaxed), 1);
     tokio::time::sleep(Duration::from_millis(600)).await;
     assert_eq!(
         hits.load(Ordering::Relaxed),
         0,
         "no HTTP request may be made"
     );
-    assert_eq!(n.stats.backfill_pulls.load(Ordering::Relaxed), 0);
+    assert_eq!(n.metrics.backfill_pulls.load(Ordering::Relaxed), 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -217,11 +217,11 @@ async fn announcing_head_plus_two_with_nothing_staged_still_pulls() {
     assert!(wait_head(&b, 2, 15).await, "a laggard must still backfill");
     assert_eq!(b.head.lock().await.0, c2);
     assert!(
-        b.stats.backfill_pulls.load(Ordering::Relaxed) >= 2,
+        b.metrics.backfill_pulls.load(Ordering::Relaxed) >= 2,
         "both gap blocks are pulled: {}",
-        b.stats.backfill_pulls.load(Ordering::Relaxed)
+        b.metrics.backfill_pulls.load(Ordering::Relaxed)
     );
-    assert_eq!(b.stats.announce_skipped_staged.load(Ordering::Relaxed), 0);
+    assert_eq!(b.metrics.announce_skipped_staged.load(Ordering::Relaxed), 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -246,7 +246,7 @@ async fn announcing_head_plus_one_with_a_parked_cl_pulls_after_the_grace() {
         "a parked-CL node must still heal via the backfill"
     );
     assert_eq!(b.head.lock().await.0, c1);
-    assert!(b.stats.backfill_pulls.load(Ordering::Relaxed) >= 1);
+    assert!(b.metrics.backfill_pulls.load(Ordering::Relaxed) >= 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -276,7 +276,7 @@ async fn concurrent_feeds_of_the_same_block_append_it_once() {
     assert_eq!(r2.unwrap().unwrap(), NewBlockOutcome::Valid(c));
     assert_eq!(*n.head.lock().await, (c, 1, ts + 1000));
     assert_eq!(
-        n.stats.blocks.load(Ordering::Relaxed),
+        n.metrics.blocks.load(Ordering::Relaxed),
         1,
         "exactly one commit"
     );
@@ -335,12 +335,12 @@ async fn the_anchor_waits_out_an_in_flight_commit_of_the_same_block() {
     );
     assert_eq!(n.head.lock().await.0, c);
     assert_eq!(
-        n.stats.blocks.load(Ordering::Relaxed),
+        n.metrics.blocks.load(Ordering::Relaxed),
         1,
         "exactly one commit"
     );
     assert_eq!(
-        n.stats.block_pulls.load(Ordering::Relaxed),
+        n.metrics.block_pulls.load(Ordering::Relaxed),
         0,
         "and no peer fetch"
     );

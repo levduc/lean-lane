@@ -81,7 +81,7 @@ read an environment variable as a fallback, shown in the table.
 | `--snapshot-every` | 1024 | blocks between state snapshots (restart = snapshot + replay); `0` never snapshots, so a restart replays the whole log from genesis |
 | `--receipt-ring` | 200,000 | most-recent receipts kept in memory for `eth_getTransactionReceipt`; `0` keeps none |
 | `--no-fsync` | off (fsync every append) | skip the per-append fsync of the block log (see below) |
-| `--stats` (env `LEAN_STATS=1`) | off | one `lean_stats` line every 10 s plus per-call anchor/stage/locate timing lines |
+| `--stats` (env `LEAN_STATS=1`) | off | one `lean_stats` line (counters and sizes) at info every 10 s |
 | `--announce-grace-ms` (env `LEAN_ANNOUNCE_GRACE_MS`) | 250 | how long an announcement for head+1 that this node does not hold waits for its own CL's anchor before the backfill pulls it; `0` pulls at once |
 | `--anchor-grace-ms` (env `LEAN_ANCHOR_GRACE_MS`) | 60 | how long an `arc_newBlock{commitment}` that holds none of the block waits for a stage that has not arrived yet before pulling from a peer; `0` disables |
 
@@ -107,16 +107,20 @@ snapshot *ahead* of the log; `open` detects that, warns (`lean_recovery
 WARNING ...`), and restarts from the newest snapshot the log can be continued
 from rather than resuming above a hole it could never fill.
 
-`--stats` prints one line every 10 s on stdout:
+Logging goes through `tracing` to stdout; `RUST_LOG` sets the filter
+(default `warn,lean_lane_node=info`). `--stats` logs one line at info every
+10 s:
 
 ```
-lean_stats head=812 accounts=44913 staged=1 sync_queue=0 by_commitment=812 pool=1974 build_ms_last=12.9 stage_ms_last=21.6 append_ms_last=9.8 rss_mb=1842
+lean_stats head=812 accounts=44913 staged=1 sync_queue=0 by_commitment=812 pending=1974 queued=0 rss_mb=1842 blocks=812 txs=... outputs=... noops=0 promoted=790 admitted=... rejected=0 anchor_index=12 anchor_staged=790 anchor_queued=0 anchor_peer=10 anchor_syncing=0 anchor_bytes=0 stage_race_waits=3 anchor_grace_hits=40 anchor_grace_misses=2 block_pulls=10 backfill_pulls=0 announces_rx=2436 announces_known=1600 announce_skipped_staged=836
 ```
 
-Everything in it is either a counter or a `len()` (it never walks the state,
-the log or the pool). `head`/`accounts`/`rss_mb` answer "what grew";
-`*_ms_last` are the last block's build / stage / append service times, which
-is what a drifting cadence needs to attribute.
+Everything in it is a counter or a `len()` (it never walks the state, the log
+or the pool). `anchor_*` count `arc_newBlock` calls by the route they took
+(`staged` is the healthy validator's path; `peer` means the block was pulled
+back over HTTP); `anchor_grace_hits/misses` say whether the cold anchor grace
+pays for itself. Per-call timing (`lean_anchor`, `lean_stage`, `lean_locate`,
+`lean_build`) is emitted as debug events: `RUST_LOG=lean_lane_node=debug`.
 
 ## Load
 

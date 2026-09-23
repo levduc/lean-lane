@@ -256,7 +256,7 @@ async fn in_sync_peers_exchange_announcements_only() {
     // let the fire-and-forget announcements land
     let t0 = Instant::now();
     while b
-        .stats
+        .metrics
         .announces_rx
         .load(std::sync::atomic::Ordering::Relaxed)
         < 100
@@ -268,15 +268,15 @@ async fn in_sync_peers_exchange_announcements_only() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let rx = b
-        .stats
+        .metrics
         .announces_rx
         .load(std::sync::atomic::Ordering::Relaxed);
     let known = b
-        .stats
+        .metrics
         .announces_known
         .load(std::sync::atomic::Ordering::Relaxed);
     let pulls = b
-        .stats
+        .metrics
         .block_pulls
         .load(std::sync::atomic::Ordering::Relaxed);
     assert_eq!(

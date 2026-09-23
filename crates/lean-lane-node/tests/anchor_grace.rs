@@ -133,11 +133,11 @@ async fn an_anchor_that_beats_its_stage_still_takes_the_staged_path() {
     assert_eq!(r, NewBlockOutcome::Valid(c), "must not SYNC past its stage");
 
     assert!(
-        n.stats.anchor_grace_hits.load(Ordering::Relaxed) >= 1,
+        n.metrics.anchor_grace_hits.load(Ordering::Relaxed) >= 1,
         "the cold grace is what saved it"
     );
     assert_eq!(
-        n.stats.block_pulls.load(Ordering::Relaxed),
+        n.metrics.block_pulls.load(Ordering::Relaxed),
         0,
         "no peer fetch"
     );
@@ -171,8 +171,8 @@ async fn a_commitment_nobody_ever_stages_falls_through_after_the_grace() {
         t.elapsed()
     );
     assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
-    assert_eq!(n.stats.anchor_grace_hits.load(Ordering::Relaxed), 0);
-    assert_eq!(n.stats.anchor_grace_misses.load(Ordering::Relaxed), 1);
+    assert_eq!(n.metrics.anchor_grace_hits.load(Ordering::Relaxed), 0);
+    assert_eq!(n.metrics.anchor_grace_misses.load(Ordering::Relaxed), 1);
     assert_eq!(n.head.lock().await.1, 0);
 }
 
@@ -197,20 +197,8 @@ async fn a_node_that_is_behind_does_not_pay_the_grace() {
         "took {:?}",
         t.elapsed()
     );
-    assert_eq!(n.stats.anchor_grace_hits.load(Ordering::Relaxed), 0);
-    assert_eq!(n.stats.anchor_grace_misses.load(Ordering::Relaxed), 0);
-}
-
-/// The counters the fleet reads must be in the periodic line, or the grace is
-/// unfalsifiable in production.
-#[tokio::test(flavor = "multi_thread")]
-async fn the_stats_line_carries_the_grace_counters() {
-    let dir = tempfile::tempdir().unwrap();
-    let n = node(dir.path());
-    let line = n.stats_line().await;
-    for key in ["anchor_grace_hits=", "anchor_grace_misses="] {
-        assert!(line.contains(key), "lean_stats is missing `{key}`: {line}");
-    }
+    assert_eq!(n.metrics.anchor_grace_hits.load(Ordering::Relaxed), 0);
+    assert_eq!(n.metrics.anchor_grace_misses.load(Ordering::Relaxed), 0);
 }
 
 /// The exact scenario above — anchor 20 ms ahead of its stage — with the
@@ -242,8 +230,8 @@ async fn with_the_grace_disabled_the_anchor_takes_the_peer_path() {
         "the grace was supposed to be off: {:?}",
         t.elapsed()
     );
-    assert_eq!(n.stats.anchor_grace_hits.load(Ordering::Relaxed), 0);
-    assert_eq!(n.stats.anchor_grace_misses.load(Ordering::Relaxed), 0);
+    assert_eq!(n.metrics.anchor_grace_hits.load(Ordering::Relaxed), 0);
+    assert_eq!(n.metrics.anchor_grace_misses.load(Ordering::Relaxed), 0);
 
     // the stage that lost the race is unaffected
     tokio::time::sleep(Duration::from_millis(20)).await;

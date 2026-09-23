@@ -1,4 +1,5 @@
 use alloy_primitives::{Address, B256};
+use lean_lane_node::metrics::AnchorPath;
 use lean_lane_node::node::{Config, LaneNode, NewBlockOutcome, StageOutcome};
 use lean_lane_node::state::Acct;
 use lean_native::envelope::{current_lane_domain, LeanSigned};
@@ -207,12 +208,17 @@ async fn a_built_block_anchors_from_its_own_staged_copy() {
         assert_eq!(n.head.lock().await.0, c);
     }
     assert_eq!(
-        n.stats.promoted.load(Ordering::Relaxed),
+        n.metrics.promoted.load(Ordering::Relaxed),
         3,
         "every self-built block must anchor through promote_staged (path=staged)"
     );
     assert_eq!(
-        n.stats.block_pulls.load(Ordering::Relaxed),
+        n.metrics.anchors(AnchorPath::Staged),
+        3,
+        "and be counted as such"
+    );
+    assert_eq!(
+        n.metrics.block_pulls.load(Ordering::Relaxed),
         0,
         "the proposer must never fetch its own block from a peer"
     );
@@ -250,8 +256,8 @@ async fn staging_a_self_built_block_again_is_a_no_op() {
         NewBlockOutcome::Valid(c)
     );
     assert_eq!(n.head.lock().await.0, c);
-    assert_eq!(n.stats.promoted.load(Ordering::Relaxed), 1);
-    assert_eq!(n.stats.block_pulls.load(Ordering::Relaxed), 0);
+    assert_eq!(n.metrics.promoted.load(Ordering::Relaxed), 1);
+    assert_eq!(n.metrics.block_pulls.load(Ordering::Relaxed), 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -289,12 +295,12 @@ async fn self_staged_build_matches_the_direct_path_byte_for_byte() {
         );
     }
     assert_eq!(
-        p.stats.promoted.load(Ordering::Relaxed),
+        p.metrics.promoted.load(Ordering::Relaxed),
         6,
         "all six via promote_staged"
     );
     assert_eq!(
-        d.stats.promoted.load(Ordering::Relaxed),
+        d.metrics.promoted.load(Ordering::Relaxed),
         0,
         "the follower used the full path"
     );

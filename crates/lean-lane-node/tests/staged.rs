@@ -144,7 +144,7 @@ async fn differential_stage_promote_vs_direct() {
     }
     // every anchored block on S must have taken the fast path
     assert_eq!(
-        s.stats.promoted.load(Ordering::Relaxed),
+        s.metrics.promoted.load(Ordering::Relaxed),
         30,
         "all 30 must promote"
     );
@@ -184,7 +184,7 @@ async fn stale_staged_entry_never_promotes() {
             .any(|(c, _)| *c == x.commitment),
         "a losing same-height candidate must stay staged after an unrelated head move"
     );
-    assert_eq!(n.stats.promoted.load(Ordering::Relaxed), 0);
+    assert_eq!(n.metrics.promoted.load(Ordering::Relaxed), 0);
     // feeding X now: height 1 is KNOWN with a different block -> the loud
     // conflicting error (v1.1 contract), never a stale promote
     let e = n.shim_new(&x.to_wire_bytes()).await.unwrap_err();
@@ -309,7 +309,7 @@ async fn newblock_during_inflight_staging_promotes_and_matches_direct() {
         );
     }
     assert_eq!(
-        s.stats.promoted.load(Ordering::Relaxed),
+        s.metrics.promoted.load(Ordering::Relaxed),
         8,
         "every raced anchor must promote (await-in-flight or staged-map hit)"
     );
@@ -352,7 +352,7 @@ async fn dead_inflight_staging_never_wedges_newblock() {
     );
     assert_eq!(n.head.lock().await.1, 1);
     assert_eq!(
-        n.stats.promoted.load(Ordering::Relaxed),
+        n.metrics.promoted.load(Ordering::Relaxed),
         0,
         "must have used the full path"
     );
@@ -419,7 +419,7 @@ async fn a_noops_recipients_are_never_created_by_promote() {
         NewBlockOutcome::Valid(_)
     ));
     assert_eq!(
-        s.stats.promoted.load(Ordering::Relaxed),
+        s.metrics.promoted.load(Ordering::Relaxed),
         1,
         "the anchor must have promoted"
     );

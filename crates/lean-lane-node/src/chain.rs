@@ -268,16 +268,6 @@ impl LeanBlock {
     }
 }
 
-/// What one `append` cost, split at the syscall that dominates it: the
-/// buffered `write_all` versus the `fsync`. The anchor timing line reports
-/// them as separate fields because only one of them is optional
-/// (`--no-fsync`) and only one of them is page-cache-pressure sensitive.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct AppendTiming {
-    pub write_ns: u64,
-    pub fsync_ns: u64,
-}
-
 /// Append-only block log with fsync-per-append, torn-tail recovery, and an
 /// in-memory `number -> (offset, payload_len)` index for sync serving.
 pub struct BlockLog {
@@ -318,7 +308,7 @@ impl BlockLog {
     /// end at the same block (rolling back only the head would not do: the
     /// state would still be N's, and re-applying L+1..=N against it is not a
     /// no-op).
-    pub fn append(&mut self, block: &LeanBlock) -> std::io::Result<AppendTiming> {
+    pub fn append(&mut self, block: &LeanBlock) -> std::io::Result<()> {
         let offset = self.bytes_written;
         let payload = block.payload();
         self.index
@@ -328,16 +318,12 @@ impl BlockLog {
         rec.extend_from_slice(&len);
         rec.extend_from_slice(&payload);
         rec.extend_from_slice(&len);
-        let t_write = std::time::Instant::now();
         self.file.write_all(&rec)?;
-        let write_ns = t_write.elapsed().as_nanos() as u64;
-        let t_fsync = std::time::Instant::now();
         if self.fsync {
             self.file.sync_data()?;
         }
-        let fsync_ns = t_fsync.elapsed().as_nanos() as u64;
         self.bytes_written += rec.len() as u64;
-        Ok(AppendTiming { write_ns, fsync_ns })
+        Ok(())
     }
 
     /// Replay all intact records in order, invoking `f` for every one;

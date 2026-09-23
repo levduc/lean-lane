@@ -158,7 +158,7 @@ async fn concurrent_stage_and_anchor_take_the_staged_path() {
     assert!(matches!(staging.await.unwrap().unwrap(), StageOutcome::Staged(x) if x == c));
 
     // no peer was asked (the node has none, so a pull would have SYNCED)
-    assert_eq!(n.stats.block_pulls.load(Ordering::Relaxed), 0);
+    assert_eq!(n.metrics.block_pulls.load(Ordering::Relaxed), 0);
     assert_eq!(n.head.lock().await.1, 1);
     assert_eq!(log_len(&n).await, 1, "appended exactly once");
     // and no claim survives the round
@@ -213,11 +213,11 @@ async fn anchor_waits_for_a_stage_that_has_not_registered_yet() {
     assert!(matches!(staging.await.unwrap().unwrap(), StageOutcome::Staged(x) if x == c));
 
     assert!(
-        n.stats.stage_race_waits.load(Ordering::Relaxed) >= 1,
+        n.metrics.stage_race_waits.load(Ordering::Relaxed) >= 1,
         "the wait is counted"
     );
     assert_eq!(
-        n.stats.block_pulls.load(Ordering::Relaxed),
+        n.metrics.block_pulls.load(Ordering::Relaxed),
         0,
         "no peer fetch"
     );
@@ -244,7 +244,7 @@ async fn no_stage_pending_means_no_stage_race_wait() {
         .await
         .unwrap();
     assert!(matches!(r, NewBlockOutcome::Syncing { head: 0 }));
-    assert_eq!(n.stats.stage_race_waits.load(Ordering::Relaxed), 0);
+    assert_eq!(n.metrics.stage_race_waits.load(Ordering::Relaxed), 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -384,7 +384,6 @@ async fn a_stale_release_cannot_hand_a_second_committer_the_same_block() {
     let dir = tempfile::tempdir().unwrap();
     let n = node(dir.path());
     let (c, wire) = wire_head_plus_one(&n, 300, 8).await;
-    let lock_ns = std::sync::atomic::AtomicU64::new(0);
 
     // hold the state lock: whoever reaches `commit_block` parks there
     let state_guard = n.state.lock().await;
@@ -405,7 +404,7 @@ async fn a_stale_release_cannot_hand_a_second_committer_the_same_block() {
 
     // the stalled stage it took the claim from finishes NOW and releases
     assert!(
-        !n.release_claim(c, u64::MAX, &lock_ns).await,
+        !n.release_claim(c, u64::MAX).await,
         "a claim we do not own must not be released"
     );
     assert!(
