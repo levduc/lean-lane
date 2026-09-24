@@ -1,14 +1,10 @@
 //! THE COLD GRACE (`Config::anchor_grace_ms`, 2026-09-15).
 //!
-//! `stage_race.rs` gates the two WARM windows: a stage that is running and has
-//! named itself in `inflight`, and a stage that has arrived at the RPC layer
-//! but has not named itself yet (`stage_pending`). On the 4-validator fleet
-//! (450 M budget, 2.5 MB / 863-tx blocks) neither of them fired: anchor paths
-//! staged 514, **peer 515**, index 286, with `stage_race_waits=2`. When the
-//! anchor landed, the stage for that block had not reached the node AT ALL —
-//! nothing staged, nothing claimed, `stage_pending` zero — so the node pulled
-//! 2.5 MB from a peer, 200-250 ms on the consensus critical path, for a block
-//! that was about to arrive anyway.
+//! On the 4-validator fleet (450 M budget, 2.5 MB / 863-tx blocks) the anchor
+//! usually landed before the stage for that block had reached the node at all
+//! (anchor paths staged 514, **peer 515**), so the node pulled 2.5 MB from a
+//! peer, 200-250 ms on the consensus critical path, for a block that was about
+//! to arrive anyway.
 //!
 //! Why the anchor wins that race on a LAN and never on loopback: the CL spawns
 //! `arc_stageBlock` fire-and-forget, and the spawned task must base64+JSON
@@ -16,7 +12,7 @@
 //! {commitment}` is a tiny awaited request issued ~15 ms later. Small request,
 //! big request, real link — the small one lands first.
 //!
-//! So: when the anchor holds none of the block and no stage is even pending,
+//! So: when the anchor holds none of the block and no stage of it is running,
 //! wait up to `anchor_grace_ms` for one to show up.
 
 use alloy_primitives::{Address, B256};
@@ -96,9 +92,8 @@ async fn log_len(n: &LaneNode) -> u64 {
 // ---------------------------------------------------------------------------
 
 /// The anchor is issued 20 ms BEFORE the stage of the same bytes — the fleet's
-/// order, not loopback's. Nothing is staged, nothing is claimed and nothing is
-/// pending when it arrives, so both warm graces decline to wait; only the cold
-/// grace keeps it here. It must then take the STAGED path and append the block
+/// order, not loopback's. Nothing is staged or in progress when it arrives;
+/// only the grace keeps it here. It must then take the STAGED path and append the block
 /// exactly once.
 ///
 /// Without the cold grace this is `path=peer` — and on a node with no peers
@@ -111,10 +106,9 @@ async fn an_anchor_that_beats_its_stage_still_takes_the_staged_path() {
     let n = node(dir.path());
     let (c, wire) = wire_head_plus_one(&n, 1, 24).await;
 
-    // nothing anywhere: this is the cold window, not `stage_race.rs`'s
-    assert!(n.inflight.lock().await.is_empty());
+    // nothing anywhere: this is the cold window
+    assert!(!n.is_in_progress(c));
     assert!(n.staged.lock().await.is_empty());
-    assert_eq!(n.stage_pending.load(Ordering::Relaxed), 0);
 
     let anchoring = {
         let n = n.clone();
@@ -143,7 +137,6 @@ async fn an_anchor_that_beats_its_stage_still_takes_the_staged_path() {
     );
     assert_eq!(n.head.lock().await.1, 1);
     assert_eq!(log_len(&n).await, 1, "appended exactly once");
-    assert!(n.inflight.lock().await.is_empty());
 }
 
 /// A stage that NEVER comes: the anchor sits out the whole grace and then
@@ -178,8 +171,7 @@ async fn a_commitment_nobody_ever_stages_falls_through_after_the_grace() {
 
 /// THE LAGGARD. A node that is behind gets anchors for commitments no stage of
 /// its own will ever produce. It must not pay the grace on every one of them,
-/// so an armed backfill (`sync_target` above our head) skips it outright — the
-/// same shape as the stage-race grace being skipped when no stage is pending.
+/// so an armed backfill (`sync_target` above our head) skips it outright.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_node_that_is_behind_does_not_pay_the_grace() {
     let dir = tempfile::tempdir().unwrap();
@@ -242,5 +234,4 @@ async fn with_the_grace_disabled_the_anchor_takes_the_peer_path() {
         NewBlockOutcome::Valid(c)
     );
     assert_eq!(n.head.lock().await.1, 1);
-    assert!(n.inflight.lock().await.is_empty());
 }

@@ -8,11 +8,8 @@
 //! consensus critical path, for a block that was landing in this process's own
 //! memory milliseconds later.
 //!
-//! Two windows have to be closed, and both are gated here:
-//!   1. the stage is RUNNING and has registered its commitment in `inflight`;
-//!   2. the stage has ARRIVED at the RPC layer but has not named itself yet
-//!      (JSON parse + base64 decode of ~3 MB, then the wire hash) — covered by
-//!      `stage_pending` + `stage_notify`.
+//! The anchor waits for its own stage instead of pulling (`await_arrival`):
+//! a stage that is running, and one that has not arrived yet (the grace).
 
 use alloy_primitives::{Address, B256};
 use lean_lane_node::chain::LeanBlock;
@@ -95,7 +92,7 @@ async fn log_len(n: &LaneNode) -> u64 {
 // ---------------------------------------------------------------------------
 
 /// `commitment_of_wire` must agree with a full decode for every shape of
-/// block, or `stage_block` would claim `inflight` under a key the anchor never
+/// block, or `stage_block` would mark in progress a key the anchor never
 /// asks for — a silent, permanent regression to the peer-pull path.
 #[tokio::test(flavor = "multi_thread")]
 async fn commitment_of_wire_matches_a_full_decode() {
@@ -130,9 +127,9 @@ async fn commitment_of_wire_rejects_malformed_bytes() {
         LeanBlock::commitment_of_wire(&trailing).is_err(),
         "trailing"
     );
-    // and a bad body must never leave a claim behind
+    // and a bad body must never leave an in-progress mark behind
     assert!(n.stage_block(&trailing).await.is_err());
-    assert!(n.inflight.lock().await.is_empty());
+    assert!(!n.is_in_progress(LeanBlock::commitment_of_wire(&wire).unwrap().commitment));
 }
 
 // ---------------------------------------------------------------------------
@@ -161,8 +158,7 @@ async fn concurrent_stage_and_anchor_take_the_staged_path() {
     assert_eq!(n.metrics.block_pulls.load(Ordering::Relaxed), 0);
     assert_eq!(n.head.lock().await.1, 1);
     assert_eq!(log_len(&n).await, 1, "appended exactly once");
-    // and no claim survives the round
-    assert!(n.inflight.lock().await.is_empty());
+    assert!(!n.is_in_progress(c));
 }
 
 // ---------------------------------------------------------------------------
@@ -170,20 +166,14 @@ async fn concurrent_stage_and_anchor_take_the_staged_path() {
 // ---------------------------------------------------------------------------
 
 /// THE REGRESSION GATE. The anchor arrives while the stage is still in the RPC
-/// layer — parsed nothing, claimed nothing. Before the fix this fell straight
-/// through to the peer pull (`wait_inflight_ms=0.00`, `path=peer`, 200-250 ms);
-/// now it waits on `stage_pending` and promotes the staged entry.
-///
-/// The RPC layer's `StagePending` guard is simulated here with the same two
-/// atomics it touches, so the test does not need a server socket.
+/// layer — parsed nothing, marked nothing. Before the fix this fell straight
+/// through to the peer pull (`path=peer`, 200-250 ms); now the arrival wait
+/// holds it and it promotes the staged entry.
 #[tokio::test(flavor = "multi_thread")]
 async fn anchor_waits_for_a_stage_that_has_not_registered_yet() {
     let dir = tempfile::tempdir().unwrap();
     let n = node(dir.path());
     let (c, wire) = wire_head_plus_one(&n, 1, 24).await;
-
-    // the RPC handler has the request but has not decoded it yet
-    n.stage_pending.fetch_add(1, Ordering::Relaxed);
 
     let staging = {
         let n = n.clone();
@@ -192,10 +182,7 @@ async fn anchor_waits_for_a_stage_that_has_not_registered_yet() {
             // ... spent parsing ~3 MB of JSON + base64, well past the ~15 ms
             // the CL waits before firing the anchor
             tokio::time::sleep(Duration::from_millis(20)).await;
-            let r = n.stage_block(&wire).await;
-            n.stage_pending.fetch_sub(1, Ordering::Relaxed);
-            n.stage_notify.notify_waiters();
-            r
+            n.stage_block(&wire).await
         })
     };
 
@@ -213,7 +200,7 @@ async fn anchor_waits_for_a_stage_that_has_not_registered_yet() {
     assert!(matches!(staging.await.unwrap().unwrap(), StageOutcome::Staged(x) if x == c));
 
     assert!(
-        n.metrics.stage_race_waits.load(Ordering::Relaxed) >= 1,
+        n.metrics.anchor_grace_hits.load(Ordering::Relaxed) >= 1,
         "the wait is counted"
     );
     assert_eq!(
@@ -223,28 +210,6 @@ async fn anchor_waits_for_a_stage_that_has_not_registered_yet() {
     );
     assert_eq!(n.head.lock().await.1, 1);
     assert_eq!(log_len(&n).await, 1, "appended exactly once");
-    assert!(n.inflight.lock().await.is_empty());
-}
-
-/// THIS grace is gated on `stage_pending`: with no stage in flight a
-/// by-commitment anchor must not sit out the stage-race grace, or every
-/// genuine backfill would pay it on top of its pull.
-///
-/// The anchor does still wait here — for `anchor_grace_ms`, the COLD
-/// grace added later for the case where the stage has not even arrived (see
-/// `anchor_grace.rs`). What this test gates is that `stage_race_waits` stays
-/// at zero: the two graces are separate windows with separate counters, and
-/// the warm one must not fire on an empty node.
-#[tokio::test(flavor = "multi_thread")]
-async fn no_stage_pending_means_no_stage_race_wait() {
-    let dir = tempfile::tempdir().unwrap();
-    let n = node(dir.path());
-    let r = n
-        .shim_new_by_commitment(B256::repeat_byte(0xab))
-        .await
-        .unwrap();
-    assert!(matches!(r, NewBlockOutcome::Syncing { head: 0 }));
-    assert_eq!(n.metrics.stage_race_waits.load(Ordering::Relaxed), 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -263,16 +228,12 @@ async fn anchor_for_a_failing_stage_returns_without_hanging() {
     let orphan = LeanBlock::new(B256::repeat_byte(0x7e), 1, 1_000, vec![tx]);
     let (c, wire) = (orphan.commitment, orphan.to_wire_bytes());
 
-    n.stage_pending.fetch_add(1, Ordering::Relaxed);
     let staging = {
         let n = n.clone();
         let wire = wire.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(10)).await;
-            let r = n.stage_block(&wire).await;
-            n.stage_pending.fetch_sub(1, Ordering::Relaxed);
-            n.stage_notify.notify_waiters();
-            r
+            n.stage_block(&wire).await
         })
     };
 
@@ -294,9 +255,7 @@ async fn anchor_for_a_failing_stage_returns_without_hanging() {
         staging.await.unwrap().unwrap(),
         StageOutcome::Syncing { head: 0 }
     ));
-    // the failed stage released its claim (a leak would park the NEXT anchor
-    // for the full 2 s guard)
-    assert!(n.inflight.lock().await.is_empty());
+    assert!(!n.is_in_progress(c));
     assert_eq!(n.head.lock().await.1, 0);
 }
 
@@ -312,7 +271,7 @@ async fn a_failed_stage_leaves_no_claim() {
         n.stage_block(&orphan.to_wire_bytes()).await.unwrap(),
         StageOutcome::Syncing { head: 0 }
     ));
-    assert!(n.inflight.lock().await.is_empty());
+    assert!(!n.is_in_progress(orphan.commitment));
     assert!(n.staged.lock().await.is_empty());
 
     // (the anchor still sits out the COLD `anchor_grace_ms` here — no
@@ -337,7 +296,6 @@ async fn duplicate_stage_is_still_a_noop() {
     assert_eq!(n.stage_block(&wire).await.unwrap(), StageOutcome::Staged(c));
     assert_eq!(n.stage_block(&wire).await.unwrap(), StageOutcome::Staged(c));
     assert_eq!(n.staged.lock().await.len(), 1);
-    assert!(n.inflight.lock().await.is_empty());
     assert_eq!(
         n.shim_new_by_commitment(c).await.unwrap(),
         NewBlockOutcome::Valid(c)
@@ -365,75 +323,6 @@ fn records_on_disk(dir: &std::path::Path) -> usize {
         at = end;
     }
     n
-}
-
-/// THE I3 GATE. Claims used to be keyed on the commitment alone, with an
-/// unconditional release. A stage that stalled past the 2 s guard and had its
-/// claim taken over by a committer would, on finishing, delete THE COMMITTER'S
-/// claim — and a third feed of the same bytes arriving in that window sees no
-/// claim, still passes the parent-link check (the head has not moved, the
-/// committer is still inside `commit_block`) and appends the same block a
-/// second time. The state converges (total-STF), but the log diverges
-/// byte-for-byte from every other validator's, which is exactly the invariant
-/// the by-commitment serving path rests on.
-///
-/// Here the committer is parked on the `state` lock — a slow commit — with its
-/// claim live, and the stalled stage's release is replayed against it.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_stale_release_cannot_hand_a_second_committer_the_same_block() {
-    let dir = tempfile::tempdir().unwrap();
-    let n = node(dir.path());
-    let (c, wire) = wire_head_plus_one(&n, 300, 8).await;
-
-    // hold the state lock: whoever reaches `commit_block` parks there
-    let state_guard = n.state.lock().await;
-    let committer = {
-        let n = n.clone();
-        let wire = wire.clone();
-        tokio::spawn(async move { n.shim_new(&wire).await })
-    };
-    let mut held = false;
-    for _ in 0..400 {
-        if n.inflight.lock().await.contains_key(&c) {
-            held = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    assert!(held, "the committer must hold the claim before we race it");
-
-    // the stalled stage it took the claim from finishes NOW and releases
-    assert!(
-        !n.release_claim(c, u64::MAX).await,
-        "a claim we do not own must not be released"
-    );
-    assert!(
-        n.inflight.lock().await.contains_key(&c),
-        "the committer still holds its claim"
-    );
-
-    // a third feed of the same bytes, while the commit is still in flight
-    let third = {
-        let n = n.clone();
-        let wire = wire.clone();
-        tokio::spawn(async move { n.shim_new(&wire).await })
-    };
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    drop(state_guard);
-
-    assert_eq!(committer.await.unwrap().unwrap(), NewBlockOutcome::Valid(c));
-    // the third feed either acknowledges the block or SYNCs — never appends it
-    let r3 = third.await.unwrap().unwrap();
-    let ok = matches!(r3, NewBlockOutcome::Valid(x) if x == c)
-        || matches!(r3, NewBlockOutcome::Syncing { .. });
-    assert!(ok, "got {r3:?}");
-    assert_eq!(n.head.lock().await.1, 1);
-    assert_eq!(
-        records_on_disk(dir.path()),
-        1,
-        "the block is on disk exactly once"
-    );
-    assert!(n.inflight.lock().await.is_empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -538,7 +427,6 @@ async fn a_drain_racing_a_by_bytes_feed_appends_the_block_once() {
     assert_eq!(n.head.lock().await.1, 2);
     assert_eq!(records_on_disk(dir.path()), 2, "b1 and b2, once each");
     assert_eq!(log_len(&n).await, 2);
-    assert!(n.inflight.lock().await.is_empty());
 }
 
 /// The idempotent no-op above must stay narrow: same NUMBER is not enough,
@@ -607,7 +495,7 @@ async fn a_commit_between_the_head_read_and_the_state_clone_stages_nothing() {
     };
     let mut parked = false;
     for _ in 0..400 {
-        if n.head.lock().await.1 == 1 && !n.inflight.lock().await.contains_key(&cp) {
+        if n.head.lock().await.1 == 1 && !n.is_in_progress(cp) {
             parked = true;
             break;
         }
@@ -623,7 +511,7 @@ async fn a_commit_between_the_head_read_and_the_state_clone_stages_nothing() {
     };
     let mut claimed = false;
     for _ in 0..400 {
-        if n.inflight.lock().await.contains_key(&cb) {
+        if n.is_in_progress(cb) {
             claimed = true;
             break;
         }
@@ -658,5 +546,4 @@ async fn a_commit_between_the_head_read_and_the_state_clone_stages_nothing() {
         "staged an entry whose post-state is not its parent's",
     );
     assert_eq!(n.head.lock().await.0, cc);
-    assert!(n.inflight.lock().await.is_empty());
 }

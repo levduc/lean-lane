@@ -61,7 +61,7 @@ impl LaneNode {
         // from content alone and is returned either way.
         //
         // The head is re-read and the state lock taken in ONE critical section
-        // (same lock order and for the same reason as `stage_claimed`): `head`
+        // (same lock order and for the same reason as `stage_inner`): `head`
         // was read at the top of this function, before the pool pick, so a
         // block landing in between would otherwise make the delta a post-state
         // of a DIFFERENT parent than the `staged_parent` recorded with it.

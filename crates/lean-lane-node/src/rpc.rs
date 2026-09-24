@@ -23,38 +23,6 @@ fn err(msg: impl Into<String>) -> ErrorObjectOwned {
     ErrorObjectOwned::owned(-32000, msg.into(), None::<()>)
 }
 
-/// Raises `node.stage_pending` for the lifetime of one `arc_stageBlock` call.
-///
-/// It exists to cover the window between "a stage request arrived" and "the
-/// stage registered its commitment in `inflight`" — JSON parse plus the base64
-/// decode of a ~3 MB body, before the node can possibly know which commitment
-/// it is about to work on. An `arc_newBlock` landing in that window used to
-/// see nothing anywhere and pay a 200-250 ms peer pull; it now waits (see
-/// `LaneNode::await_stage_race`).
-///
-/// A guard rather than a pair of statements so that the handler's `?` exits
-/// and a panic both lower the count — a leak here would make every later
-/// anchor burn the grace window for nothing.
-struct StagePending(Arc<LaneNode>);
-
-impl StagePending {
-    fn new(node: &Arc<LaneNode>) -> Self {
-        node.stage_pending
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Self(node.clone())
-    }
-}
-
-impl Drop for StagePending {
-    fn drop(&mut self) {
-        self.0
-            .stage_pending
-            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        // a waiter polling the grace window should re-check `inflight` now
-        self.0.stage_notify.notify_waiters();
-    }
-}
-
 pub fn module(node: Arc<LaneNode>) -> RpcModule<Arc<LaneNode>> {
     let mut m = RpcModule::new(node);
 
@@ -152,10 +120,6 @@ pub fn module(node: Arc<LaneNode>) -> RpcModule<Arc<LaneNode>> {
         commitment: Option<B256>,
     }
     m.register_async_method("arc_stageBlock", |params, node, _| async move {
-        // FIRST statement in the handler — see `StagePending`. Everything
-        // below it (param parse, base64 decode of ~3 MB) is the window in
-        // which the node knows a stage is coming but not yet which block.
-        let _pending = StagePending::new(&node);
         let p: NewBlockParams = params.parse()?;
         let block_bytes = p
             .block_bytes

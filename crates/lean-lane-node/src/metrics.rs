@@ -95,12 +95,10 @@ pub struct Metrics {
     pub block_pulls: AtomicU64,
     /// Block-byte pulls made by the backfill loop alone.
     pub backfill_pulls: AtomicU64,
-    /// Anchors that waited on a concurrent stage of the same block instead of
-    /// pulling it from a peer.
-    pub stage_race_waits: AtomicU64,
-    /// Anchors whose cold grace saw the stage appear (promoted locally).
+    /// `arc_newBlock{commitment}` calls that found nothing locally, waited
+    /// (`await_arrival`) and saw the block arrive: resolved without a peer.
     pub anchor_grace_hits: AtomicU64,
-    /// Anchors that sat out the whole cold grace and found nothing.
+    /// Calls that waited and found nothing: they went on to the peer pull.
     pub anchor_grace_misses: AtomicU64,
     /// `arc_newBlock` calls per route, indexed by `AnchorPath as usize`.
     anchor_paths: [AtomicU64; 7],
@@ -140,7 +138,7 @@ impl Metrics {
         .join(" ");
         format!(
             "blocks={} txs={} outputs={} noops={} promoted={} admitted={} rejected={} {paths} \
-             stage_race_waits={} anchor_grace_hits={} anchor_grace_misses={} block_pulls={} \
+             anchor_grace_hits={} anchor_grace_misses={} block_pulls={} \
              backfill_pulls={} announces_rx={} announces_known={} announce_skipped_staged={}",
             g(&self.blocks),
             g(&self.txs),
@@ -149,7 +147,6 @@ impl Metrics {
             g(&self.promoted),
             g(&self.admitted),
             g(&self.rejected),
-            g(&self.stage_race_waits),
             g(&self.anchor_grace_hits),
             g(&self.anchor_grace_misses),
             g(&self.block_pulls),

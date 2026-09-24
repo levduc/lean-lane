@@ -56,9 +56,11 @@ pub struct Config {
     /// wins and the grace saves a full-block pull per announcing peer. 0
     /// pulls immediately.
     pub announce_grace_ms: u64,
-    /// How long an `arc_newBlock{commitment}` that holds none of the block
-    /// waits for an `arc_stageBlock` that has not ARRIVED yet (see
-    /// `await_anchor_grace`). 0 disables it.
+    /// How long an `arc_newBlock{commitment}` that holds none of the block,
+    /// and sees no stage of it running, waits for one to arrive before it
+    /// pulls from a peer (see `await_arrival`). 0 disables the wait for a
+    /// stage that has not arrived; a stage already running is always waited
+    /// for.
     pub anchor_grace_ms: u64,
     /// How many peers one block pull (anchor fallback, backfill) asks
     /// CONCURRENTLY; the first valid answer wins (see `peers::pull_block`).
@@ -95,28 +97,17 @@ impl Default for Config {
     }
 }
 
-/// LOCK ORDER (the whole of it — audited 2026-09-15).
+/// LOCK ORDER. Every lock is taken alone (acquired, used, dropped) except:
 ///
-/// Almost every lock in this node is taken ALONE: acquired, used, dropped
-/// inside one statement or one short block, never while holding another. Two
-/// deliberate exceptions, and they agree:
+///   1. `commit_gate` -> anything: `commit_block` and `promote_staged` hold the
+///      gate across the whole append and take the other locks under it, one at
+///      a time.
+///   2. `head` -> `state`, nested in the two staging paths (`stage_inner`,
+///      `shim_build`) so the parent a staged entry names and the state it
+///      executes on are read atomically. (1) takes them in the same order.
 ///
-///   1. `commit_gate` -> anything. `commit_block` and `promote_staged` hold
-///      the gate across the whole append (the linkage decision, the state
-///      write, the log append, the head write and the bookkeeping sweeps) and
-///      take `head`, `state`, `log`, `by_commitment`, `staged` and
-///      `inflight` under it — one at a time.
-///   2. `head` -> `state`, nested in the two staging paths (`stage_claimed`
-///      and `shim_build`) so that the head a staged entry names as its parent
-///      and the state it executes on are read ATOMICALLY. That is the same
-///      order (1) uses sequentially — head first, via `link_to_head`, then
-///      state — so the two cannot deadlock against each other.
-///
-/// Nothing anywhere takes `state` before `head`. The serving path
-/// (`locate_by_commitment`, `get_block_bytes`, `stats_line`) and admission
-/// take single locks only, and no lock is held across an await other than a
-/// lock acquisition — the `head` guard in (2) spans exactly the `state`
-/// acquire.
+/// `in_progress` is a std mutex held for a map update only, never across an
+/// await.
 pub struct LaneNode {
     pub cfg: Config,
     pub pool: LanePool,
@@ -125,27 +116,14 @@ pub struct LaneNode {
     pub log: Mutex<BlockLog>,
     /// (head commitment, head number, head timestamp_ms)
     pub head: Mutex<(B256, u64, u64)>,
-    /// THE APPEND GATE. Held for the whole of a commit — from the linkage
-    /// decision, through the state apply and the log append, to the head
-    /// write — by `commit_block` and `promote_staged`, the only two functions
-    /// that append. It is what makes the head read that decides "does this
-    /// block connect?" and the head write that answers it for the next
-    /// committer ONE critical section.
-    ///
-    /// Claim discipline (`inflight`) narrows the double-append window but has
-    /// never closed it, because not every appender holds a claim: the
-    /// sync-queue drain commits with none, the staged promote hands its claim
-    /// back before promoting, and a claim waited out for 2 s can be stolen
-    /// from a holder that is merely slow rather than dead. Each of those ends
-    /// in two committers that both passed a parent-link check nobody re-took
-    /// at the moment of the append. The gate makes that check last-moment and
-    /// universal (`link_to_head`); the claim stays, as the thing that spares
-    /// the loser ~230 ms of execution it does not need.
-    ///
-    /// Costs nothing in steady state: commits are serial anyway (each builds
-    /// on the head the previous one wrote), so the gate is uncontended except
-    /// in exactly the racing case it exists to arbitrate. Staging, admission
-    /// and the serving path never take it.
+    /// THE APPEND GATE. Held for the whole of a commit, from the linkage
+    /// decision (`link_to_head`) through the state apply and the log append to
+    /// the head write, by `commit_block` and `promote_staged`, the only two
+    /// functions that append. Every appender goes through it, so each block is
+    /// appended exactly once whatever races feed it: a second feed of the same
+    /// bytes finds it `AlreadyCanonical` and appends nothing. Uncontended in
+    /// steady state (commits are serial anyway); staging, admission and the
+    /// serving path never take it.
     commit_gate: Mutex<()>,
     pub metrics: Metrics,
     /// Blocks that arrived ahead of our head, keyed by PARENT commitment
@@ -164,40 +142,16 @@ pub struct LaneNode {
     /// whole log at open, extended on every append. Complete from height 1,
     /// so a miss is proof the block is not canonical here.
     pub by_commitment: Mutex<std::collections::HashMap<B256, u64>>,
-    /// IN-FLIGHT work on a commitment: commitment -> `Claim`.
-    /// arc_newBlock awaits a matching in-flight staging (bounded guard)
-    /// instead of redoing the full execution — a <=35ms wait beats a ~230ms
-    /// redo (v1.3 lost ~half the anchor races at 2.6MB blocks) — and the
-    /// COMMIT of a block takes the same claim, which is what stops two feeds
-    /// of the same bytes from appending it twice.
-    ///
-    /// The `id` is what makes that exclusion sound. Keyed on the commitment
-    /// alone, a release is "whoever finishes first deletes the entry": a
-    /// stage that stalled past the 2 s guard and was taken over would, on
-    /// finishing, delete the CLAIM OF THE COMMITTER THAT TOOK IT OVER, and a
-    /// third feed arriving in that window would pass the parent-link check
-    /// (the head has not moved yet) and append the same block a second time.
-    /// Both the release and the takeover therefore compare ids: you may only
-    /// drop your own claim, and you may only steal a claim you have already
-    /// waited out (see `release_claim` and the claim rounds in
-    /// `shim_new_inner`).
-    pub inflight: Mutex<std::collections::HashMap<B256, Claim>>,
-    /// `arc_stageBlock` calls that have ARRIVED but not yet returned. Raised
-    /// by the RPC handler as its first statement — before the JSON parse and
-    /// the base64 decode of a ~3 MB body — so it covers the window in which
-    /// the node knows a stage is coming but cannot yet know WHICH commitment
-    /// (the commitment is a function of the bytes it is still decoding).
-    ///
-    /// Without it an anchor that arrives during that window sees an empty
-    /// `inflight`, concludes the block is nowhere, and pays a 200-250 ms peer
-    /// pull on the consensus critical path for a block that lands in memory
-    /// milliseconds later. With it the anchor waits (bounded) for the stage to
-    /// name itself. Zero when no stage is in flight, so the backfill's genuine
-    /// peer pulls are not slowed at all.
-    pub stage_pending: AtomicU64,
-    /// Fires when a stage registers in `inflight` or finishes; the anchor's
-    /// grace loop waits on it rather than spinning.
-    pub stage_notify: tokio::sync::Notify,
+    /// Commitments being worked on right now (a stage executing, or a
+    /// by-bytes commit), with a count per commitment. Not an exclusion: two
+    /// feeds of the same block may both execute and the gate keeps the append
+    /// single. It is what the arrival wait (`await_arrival`) watches, so an
+    /// anchor that lands while its block is being executed here waits for that
+    /// result instead of pulling the block from a peer.
+    in_progress: std::sync::Mutex<std::collections::HashMap<B256, u32>>,
+    /// Fires whenever a commitment enters or leaves `in_progress` and whenever
+    /// a staged entry is inserted; the arrival wait sleeps on it.
+    pub(crate) stage_notify: tokio::sync::Notify,
     /// Peer RPC clients (index-aligned with cfg.peers).
     peer_clients: Vec<jsonrpsee::http_client::HttpClient>,
 }
@@ -268,17 +222,6 @@ fn replay_onto(
         blocks += 1;
     })?;
     Ok((head, blocks, txs, by_commitment))
-}
-
-/// One holder's exclusive claim on a commitment: (staged_parent, claim id,
-/// completion signal). See `LaneNode::inflight`.
-pub type Claim = (B256, u64, tokio::sync::watch::Receiver<bool>);
-
-/// Process-unique claim id. Only equality matters (ownership), so a plain
-/// relaxed counter is enough — it never wraps in any realistic lifetime.
-fn next_claim_id() -> u64 {
-    static N: AtomicU64 = AtomicU64::new(1);
-    N.fetch_add(1, Ordering::Relaxed)
 }
 
 impl LaneNode {
@@ -360,8 +303,7 @@ impl LaneNode {
                 sync_target: AtomicU64::new(0),
                 staged: Mutex::new(Default::default()),
                 by_commitment: Mutex::new(by_commitment),
-                inflight: Mutex::new(Default::default()),
-                stage_pending: AtomicU64::new(0),
+                in_progress: Default::default(),
                 stage_notify: tokio::sync::Notify::new(),
                 peer_clients,
             },

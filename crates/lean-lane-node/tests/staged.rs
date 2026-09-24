@@ -281,7 +281,7 @@ async fn newblock_during_inflight_staging_promotes_and_matches_direct() {
         let stager = tokio::spawn(async move { s2.stage_block(&w2).await });
         let t0 = std::time::Instant::now();
         loop {
-            let registered = s.inflight.lock().await.contains_key(&block.commitment)
+            let registered = s.is_in_progress(block.commitment)
                 || s.staged
                     .lock()
                     .await
@@ -336,41 +336,6 @@ async fn newblock_during_inflight_staging_promotes_and_matches_direct() {
             s.metrics.outputs.load(Ordering::Relaxed)
         ),
         "no-op/output counts diverged under the race"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn dead_inflight_staging_never_wedges_newblock() {
-    // A staging that dies (sender dropped without signaling) must not wedge
-    // arc_newBlock: the guard falls through to the full path.
-    let dir = tempfile::tempdir().unwrap();
-    let n = open_node(dir.path()).await;
-    let genesis = n.head.lock().await.0;
-    let x = LeanBlock::new(genesis, 1, 555, vec![]);
-
-    // forge a dead in-flight entry for this commitment on this head
-    let (tx, rx) = tokio::sync::watch::channel(false);
-    drop(tx); // stager "panicked"
-              // (parent, claim id, signal) — the id is what release/takeover compare
-    n.inflight
-        .lock()
-        .await
-        .insert(x.commitment, (genesis, u64::MAX, rx));
-
-    let t0 = std::time::Instant::now();
-    assert!(matches!(
-        n.shim_new(&x.to_wire_bytes()).await.unwrap(),
-        NewBlockOutcome::Valid(_)
-    ));
-    assert!(
-        t0.elapsed() < Duration::from_secs(2),
-        "dead staging must not consume the full guard"
-    );
-    assert_eq!(n.head.lock().await.1, 1);
-    assert_eq!(
-        n.metrics.promoted.load(Ordering::Relaxed),
-        0,
-        "must have used the full path"
     );
 }
 

@@ -40,7 +40,7 @@ impl LaneNode {
 
     /// Do we already hold the announced block? Three ways, all hash lookups:
     /// the exact commitment is STAGED (we validated and executed it for
-    /// consensus in the vote gap), a staging/commit for it is IN FLIGHT, or —
+    /// consensus in the vote gap), a stage/commit of it is IN PROGRESS, or —
     /// for the head+1 case — we hold *some* staged candidate at that height
     /// (the announcer may be naming a different candidate for the height our
     /// CL is about to anchor; either way the anchor, not a pull, settles it).
@@ -55,11 +55,11 @@ impl LaneNode {
                 return true;
             }
         }
-        self.inflight.lock().await.contains_key(&commitment)
+        self.is_in_progress(commitment)
     }
 
     /// Handle a peer's announcement: known -> ignore (the universal in-sync
-    /// case, zero further traffic); ALREADY HELD (staged/in-flight) -> ignore,
+    /// case, zero further traffic); ALREADY HELD (staged/in progress) -> ignore,
     /// our own CL anchors it in milliseconds; head+1 and not held -> wait out
     /// `announce_grace_ms` for that anchor, then arm the backfill if it
     /// never came; further ahead -> arm the backfill at once (existing

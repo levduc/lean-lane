@@ -22,7 +22,7 @@ impl LaneNode {
     ///
     /// Three answers, and the middle one is the point: a block that is already
     /// ours at its own number is a NO-OP, not an append. That is what makes a
-    /// second committer of the same bytes (a stolen claim, a drain racing an
+    /// second committer of the same bytes (two feeds, a drain racing an
     /// anchor) harmless instead of a second record in `blocks.log` — the log
     /// diverges byte-for-byte from every other validator's while the state
     /// still converges, so nothing else in the node would ever notice.
@@ -82,8 +82,8 @@ impl LaneNode {
     ///
     /// Taking the staged entry out of `staged` makes this promote unique among
     /// promotes, but not among APPENDS — a by-bytes feed that arrives after the
-    /// entry is taken finds nothing staged, takes the free claim, and commits
-    /// the same block. The link check under the gate answers that race.
+    /// entry is taken finds nothing staged and commits the same block. The
+    /// link check under the gate answers that race.
     pub(super) async fn promote_staged(&self, entry: StagedBlock) -> eyre::Result<()> {
         let gate = self.commit_gate.lock().await;
         if self.link_to_head(&entry.block).await? == Link::AlreadyCanonical {
@@ -152,15 +152,11 @@ impl LaneNode {
         // head advanced: keep entries that are still AHEAD of the new head
         // (losing candidates for this height are dropped when the height is
         // passed; bytes for the current height stay servable by commitment)
-        let (new_head_c, new_head_n, _) = *self.head.lock().await;
+        let new_head_n = block.number;
         self.staged
             .lock()
             .await
             .retain(|(_, e)| e.block.number >= new_head_n);
-        self.inflight
-            .lock()
-            .await
-            .retain(|_, (p, _, _)| *p == new_head_c);
         let m = &self.metrics;
         Metrics::inc(&m.blocks);
         Metrics::add(&m.txs, delta.txs() as u64);

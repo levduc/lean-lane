@@ -1,12 +1,34 @@
-//! Vote-gap staging (`arc_stageBlock`), the staged map, claims and the two
-//! anchor graces that wait for a stage instead of pulling from a peer.
+//! Vote-gap staging (`arc_stageBlock`), the staged map, the in-progress set
+//! and the one arrival wait that lets an anchor wait for a local stage
+//! instead of pulling the block from a peer.
 
 use super::*;
 
-/// How long an anchor that holds none of the block waits for an
-/// `arc_stageBlock` which has ARRIVED but not yet registered its commitment
-/// (see `await_stage_race`). Only waited while `stage_pending > 0`.
-const STAGE_RACE_GRACE: std::time::Duration = std::time::Duration::from_millis(40);
+/// Upper bound on waiting for a stage or commit that is already RUNNING here.
+/// A stage takes ~20 ms at 2.5 MB; the cap only matters if one wedges.
+const IN_PROGRESS_CAP: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// One entry in `LaneNode::in_progress`, removed (and waiters woken) on drop,
+/// so every exit of the work it covers, `?` and panics included, clears it.
+pub(super) struct InProgress<'a> {
+    node: &'a LaneNode,
+    commitment: B256,
+}
+
+impl Drop for InProgress<'_> {
+    fn drop(&mut self) {
+        {
+            let mut m = self.node.in_progress_map();
+            if let Some(n) = m.get_mut(&self.commitment) {
+                *n -= 1;
+                if *n == 0 {
+                    m.remove(&self.commitment);
+                }
+            }
+        }
+        self.node.stage_notify.notify_waiters();
+    }
+}
 
 /// Where one `arc_stageBlock` spent its time (the `lean_stage` debug event).
 #[derive(Default)]
@@ -30,9 +52,7 @@ impl LaneNode {
         }
         q.push_back((commitment, entry));
         drop(q);
-        // wake an anchor sitting in `await_anchor_grace` for exactly this
-        // commitment: a staged entry carries no claim, so the staged map is
-        // the only evidence it will ever see.
+        // wake an anchor waiting in `await_arrival` for this commitment
         self.stage_notify.notify_waiters();
     }
 
@@ -47,88 +67,43 @@ impl LaneNode {
             .any(|(c, e)| *c == commitment && e.staged_parent == head_c)
     }
 
-    /// Drop OUR claim on `commitment` — and only ours. Returns whether the
-    /// entry was removed.
-    ///
-    /// The id check is the whole point: a holder that stalled past the 2 s
-    /// guard and was taken over must not delete the successor's claim when it
-    /// eventually finishes. An unchecked `remove` there re-opens the window in
-    /// which a third feed of the same bytes sees no claim, still passes the
-    /// parent-link check (the head has not moved — the taker-over is still
-    /// committing), and appends the same block a second time.
-    pub async fn release_claim(&self, commitment: B256, id: u64) -> bool {
-        use std::collections::hash_map::Entry;
-        let mut fl = self.inflight.lock().await;
-        match fl.entry(commitment) {
-            Entry::Occupied(o) if o.get().1 == id => {
-                o.remove();
-                true
-            }
-            _ => false,
+    fn in_progress_map(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<B256, u32>> {
+        self.in_progress.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Mark `commitment` as being worked on until the guard drops.
+    pub(super) fn begin_work(&self, commitment: B256) -> InProgress<'_> {
+        *self.in_progress_map().entry(commitment).or_insert(0) += 1;
+        self.stage_notify.notify_waiters();
+        InProgress {
+            node: self,
+            commitment,
         }
+    }
+
+    /// Is a stage or by-bytes commit of `commitment` running right now?
+    pub fn is_in_progress(&self, commitment: B256) -> bool {
+        self.in_progress_map().contains_key(&commitment)
     }
 
     /// Shim: `arc_stageBlock` — fully validate + EXECUTE against the current
     /// head state into a memory-only staged entry (vote-gap deferred anchor).
     /// Never appends, never queues (speculative). Bounded to 32 entries.
     ///
-    /// CLAIM ORDER (2026-09-15, the stage/anchor race). The CL fires
-    /// `arc_stageBlock` and then `arc_newBlock{commitment}` ~15 ms later,
-    /// while the stage is still running (~18 ms at 2.2 MB: decode 6 + recover
-    /// 5 + apply 7, plus the RPC layer's JSON parse and base64 decode of the
-    /// ~3 MB body, which is *outside* that 18 ms). Whatever the anchor cannot
-    /// see, it peer-pulls for 200-250 ms on the consensus critical path.
-    ///
-    /// So the commitment is published in `inflight` as the FIRST thing this
-    /// function does — computed by `commitment_of_wire`, which hashes the
-    /// borrowed wire bytes without materialising the tx list — and BEFORE the
-    /// head read and the already-staged probe, both of which take locks that
-    /// a concurrent commit can hold. A claim that turns out not to be ours is
-    /// withdrawn microseconds later; an anchor that misses the claim pays 200
-    /// ms. The claim is keyed on the block's DECLARED parent, which is what
-    /// the head must equal for the stage to proceed, so the retention sweeps
-    /// (`retain(|_, (p, _)| *p == new_head)`) see exactly what they saw before.
+    /// The CL fires `arc_stageBlock` and then `arc_newBlock{commitment}` for
+    /// the same block ~15 ms later, often while the stage is still running.
+    /// So the commitment goes into `in_progress` first thing, computed by
+    /// `commitment_of_wire` (hashes the borrowed wire, no tx list), and an
+    /// anchor that arrives meanwhile waits for the staged entry instead of
+    /// pulling the block from a peer.
     pub async fn stage_block(&self, bytes: &[u8]) -> Result<StageOutcome, String> {
         let t0 = Instant::now();
         let hdr = LeanBlock::commitment_of_wire(bytes)?;
-        let commitment_key = hdr.commitment;
         let number = hdr.number;
-
-        // --- publish the claim before anything slow ---
-        let (done_tx, done_rx) = tokio::sync::watch::channel(false);
-        let claim_id = next_claim_id();
-        let claimed = {
-            use std::collections::hash_map::Entry;
-            let mut fl = self.inflight.lock().await;
-            match fl.entry(commitment_key) {
-                // someone already owns this commitment (a duplicate stage, or
-                // a by-bytes commit): never clobber their signal
-                Entry::Occupied(_) => None,
-                Entry::Vacant(v) => {
-                    v.insert((hdr.parent, claim_id, done_rx));
-                    Some(claim_id)
-                }
-            }
+        let (outcome, t) = {
+            let _work = self.begin_work(hdr.commitment);
+            self.stage_inner(bytes, hdr, t0).await?
         };
-        if claimed.is_some() {
-            self.stage_notify.notify_waiters();
-        }
-
-        let r = self.stage_claimed(bytes, hdr, t0).await;
-
-        // --- release it in EVERY outcome: Staged, Syncing, and Err ---
-        // A stage that bails on the head check (or on a decode error) must not
-        // park the next anchor for the full 2 s guard. A panic drops `done_tx`
-        // instead, which closes the channel and wakes waiters the same way.
-        // `release_claim` is id-checked: a stage slow enough to have been taken
-        // over signals its waiters but leaves the new owner's claim alone.
-        if let Some(id) = claimed {
-            let _ = done_tx.send(true);
-            self.release_claim(commitment_key, id).await;
-        }
-        self.stage_notify.notify_waiters();
-
-        let (outcome, t) = r?;
         if matches!(outcome, StageOutcome::Staged(_)) {
             tracing::debug!(
                 n = number,
@@ -143,10 +118,8 @@ impl LaneNode {
         Ok(outcome)
     }
 
-    /// The body of `stage_block`, run with the commitment already claimed in
-    /// `inflight`. Split out so that EVERY exit — including `?` on a decode
-    /// error — passes through the caller's single release point.
-    async fn stage_claimed(
+    /// The body of `stage_block`, run with the commitment marked in progress.
+    async fn stage_inner(
         &self,
         bytes: &[u8],
         hdr: crate::chain::WireHeader,
@@ -172,7 +145,7 @@ impl LaneNode {
         }
         // the expensive half of the decode (tx bodies out of the wire). The
         // commitment is NOT recomputed: `hdr` is the header `commitment_of_wire`
-        // produced over THESE bytes at the top of `stage_block` — the trust
+        // produced over THESE bytes at the top of `stage_block`, the trust
         // boundary `from_wire_bytes_with_header` documents (it re-derives and
         // compares the three header fields always, the commitment in debug
         // builds, and takes `hdr.commitment` on faith in release).
@@ -218,148 +191,64 @@ impl LaneNode {
             delta,
         };
         t.apply_ms = since(t_apply);
-        // visible BEFORE the caller signals completion: a waiter woken by that
-        // signal must find the entry it was waiting for.
+        // visible BEFORE the in-progress mark drops: a waiter woken by that
+        // must find the entry it was waiting for.
         self.insert_staged(commitment, entry).await;
         Ok((StageOutcome::Staged(commitment), t))
     }
 
-    /// Wait out a concurrent `arc_stageBlock` (or by-bytes commit) of exactly
-    /// this commitment, so the anchor never peer-pulls a block that is being
-    /// executed in this process right now. Returns whether it waited at all;
-    /// the caller re-checks the index and `locate_wire`.
-    ///
-    /// Two windows, both covered:
-    ///
-    /// 1. The stage has NAMED itself — `inflight` holds `c`. Wait on its watch
-    ///    channel, generously bounded (2 s), exactly as the by-bytes claim
-    ///    path does. A dropped owner (panicked stager) closes the channel and
-    ///    we fall through, so a dead stage can never wedge an anchor.
-    /// 2. The stage has ARRIVED but not yet named itself — it is in the RPC
-    ///    layer parsing ~3 MB of JSON/base64, or hashing the wire, and does
-    ///    not know its own commitment yet. `stage_pending` is non-zero exactly
-    ///    then. Wait on `stage_notify` up to `STAGE_RACE_GRACE`, rechecking
-    ///    `inflight` each round. This window is real: the CL issues the anchor
-    ///    ~15 ms after the stage, and the stage's pre-registration work is the
-    ///    same order of magnitude.
-    ///
-    /// The grace in (2) is gated on `stage_pending > 0`, so a node doing a
-    /// genuine backfill — nobody staging — adds zero latency to its peer
-    /// pulls. Worst case when a stage is pending but is for a DIFFERENT block:
-    /// `STAGE_RACE_GRACE` on top of a path that already costs 200-250 ms.
-    pub(super) async fn await_stage_race(&self, c: B256) -> bool {
-        let grace = STAGE_RACE_GRACE;
-        let t_wait = Instant::now();
-        let mut waited = false;
-        loop {
-            let held = {
-                let fl = self.inflight.lock().await;
-                fl.get(&c).map(|(_, _, rx)| rx.clone())
-            };
-            if let Some(mut rx) = held {
-                waited = true;
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-                    while !*rx.borrow() {
-                        if rx.changed().await.is_err() {
-                            break; // owner dropped (failed/panicked): fall through
-                        }
-                    }
-                })
-                .await;
-                break;
-            }
-            if self.stage_pending.load(Ordering::Relaxed) == 0 {
-                break;
-            }
-            let left = grace.checked_sub(t_wait.elapsed()).unwrap_or_default();
-            if left.is_zero() {
-                break;
-            }
-            waited = true;
-            // Bounded poll rather than a bare `notified()`: a notification
-            // that fires between the `inflight` peek and this await would
-            // otherwise be lost, and the cost of missing one is a 200 ms pull.
-            let _ = tokio::time::timeout(
-                left.min(std::time::Duration::from_millis(2)),
-                self.stage_notify.notified(),
-            )
-            .await;
-        }
-        if waited {
-            Metrics::inc(&self.metrics.stage_race_waits);
-        }
-        waited
+    /// Is `c` resolvable here without a peer: canonical, or staged?
+    async fn held_locally(&self, c: B256) -> bool {
+        self.by_commitment.lock().await.contains_key(&c)
+            || self.staged.lock().await.iter().any(|(k, _)| *k == c)
     }
 
-    /// THE COLD GRACE (`anchor_grace_ms`). `await_stage_race` covers a
-    /// stage that is RUNNING or has ARRIVED; this covers the fleet's actual
-    /// case, where the stage has done NEITHER when the anchor lands — nothing
-    /// staged, nothing claimed, `stage_pending` zero — because the CL spawned
-    /// it fire-and-forget and it is still encoding 2.5 MB of base64 (see
-    /// `anchor_grace_ms`).
+    /// THE ARRIVAL WAIT. Called when `c` is neither canonical nor staged:
+    /// wait on `stage_notify` until it is, or until the deadline. Returns
+    /// `(found, waited)`.
     ///
-    /// Returns whether evidence of the stage appeared inside the window: a
-    /// claim on `c`, a staged entry for `c`, or simply a stage ARRIVING (then
-    /// `await_stage_race` takes over and waits it out properly). The caller
-    /// re-resolves locally on `true` and falls through to the peer pull on
-    /// `false`.
-    ///
-    /// THE LAGGARD. A node that is genuinely behind gets anchors for
-    /// commitments no stage of its own will ever produce, and it must not pay
-    /// the grace on every one of them. Two cheap reads say so — a non-empty
-    /// `sync_queue` (blocks waiting on a parent we lack) or a `sync_target`
-    /// above our head (the backfill is armed) — and both skip the grace
-    /// entirely, exactly as `STAGE_RACE_GRACE` is skipped when no stage is
-    /// pending. A node that is behind WITHOUT either flag set (its CL parked,
-    /// or the first anchor after falling behind) still answers SYNCING/peer
-    /// as before, just up to `anchor_grace_ms` later — 60 ms on top of a
-    /// path that already costs 200-250 ms, and it re-converges by the same
-    /// route it always did.
-    pub(super) async fn await_anchor_grace(&self, c: B256) -> bool {
-        let grace = std::time::Duration::from_millis(self.cfg.anchor_grace_ms);
-        if grace.is_zero() {
-            return false;
+    /// The deadline is `grace` from the call while nothing is working on `c`
+    /// (the fleet's case: the anchor is a tiny request, the stage a 2.5 MB
+    /// one the CL spawned first, and the small one lands first), and
+    /// `IN_PROGRESS_CAP` from the call while a stage or commit of `c` runs
+    /// here. Every change it can be waiting for (a mark entering or leaving
+    /// `in_progress`, a staged insert) fires `stage_notify`; the `Notified`
+    /// is enabled before the checks, so none is missed.
+    pub(super) async fn await_arrival(&self, c: B256, grace: std::time::Duration) -> (bool, bool) {
+        let start = Instant::now();
+        let mut waited = false;
+        loop {
+            let notified = self.stage_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.held_locally(c).await {
+                return (true, waited);
+            }
+            let window = if self.is_in_progress(c) {
+                IN_PROGRESS_CAP
+            } else {
+                grace
+            };
+            let Some(left) = window.checked_sub(start.elapsed()).filter(|d| !d.is_zero()) else {
+                return (false, waited);
+            };
+            waited = true;
+            let _ = tokio::time::timeout(left, notified).await;
         }
-        // behind the network: no stage of ours is coming for this commitment
+    }
+
+    /// The grace an anchor gives a stage that has not arrived:
+    /// `anchor_grace_ms`, or zero on a node that is behind the network (a
+    /// non-empty `sync_queue`, or a backfill target above the head). A
+    /// laggard gets anchors for blocks no stage of its own will produce and
+    /// must not pay the grace on each of them.
+    pub(super) async fn anchor_grace(&self) -> std::time::Duration {
         let head_n = self.head.lock().await.1;
         if self.sync_target.load(Ordering::Relaxed) > head_n
             || !self.sync_queue.lock().await.is_empty()
         {
-            return false;
+            return std::time::Duration::ZERO;
         }
-        let t_wait = Instant::now();
-        let hit = loop {
-            // A stage that has arrived at the RPC layer is enough: hand it to
-            // `await_stage_race`, whose job is precisely that window.
-            if self.stage_pending.load(Ordering::Relaxed) > 0 {
-                break true;
-            }
-            if self.inflight.lock().await.contains_key(&c) {
-                break true;
-            }
-            if self.staged.lock().await.iter().any(|(k, _)| *k == c) {
-                break true;
-            }
-            let left = grace.checked_sub(t_wait.elapsed()).unwrap_or_default();
-            if left.is_zero() {
-                break false;
-            }
-            // Bounded poll rather than a bare `notified()`: `stage_notify` is
-            // signalled on claim insert, on staged insert and when a pending
-            // stage returns, but one that fires between the checks above and
-            // this await would otherwise be lost — and missing one costs a
-            // 200 ms pull, which is the whole thing we are here to avoid.
-            let _ = tokio::time::timeout(
-                left.min(std::time::Duration::from_millis(2)),
-                self.stage_notify.notified(),
-            )
-            .await;
-        };
-        Metrics::inc(if hit {
-            &self.metrics.anchor_grace_hits
-        } else {
-            &self.metrics.anchor_grace_misses
-        });
-        hit
+        std::time::Duration::from_millis(self.cfg.anchor_grace_ms)
     }
 }

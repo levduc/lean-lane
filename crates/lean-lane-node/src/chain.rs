@@ -151,10 +151,10 @@ impl LeanBlock {
     /// re-serialisation of the block. That matters on the anchor race —
     /// `stage_block` must publish the commitment it is working on BEFORE it
     /// pays for the decode, or an `arc_newBlock` arriving 15 ms later misses
-    /// the in-flight claim and buys a 200 ms peer pull instead.
+    /// the in-progress mark and buys a 200 ms peer pull instead.
     ///
     /// Framing is validated exactly as `from_wire_bytes` validates it, so a
-    /// malformed body can never be registered as in-flight.
+    /// malformed body can never be marked in progress.
     pub fn commitment_of_wire(bytes: &[u8]) -> Result<WireHeader, String> {
         let (parent, number, timestamp_ms, _) = Self::scan_wire(bytes)?;
         let txs_hash = keccak256(&bytes[48..]);
@@ -192,7 +192,7 @@ impl LeanBlock {
     /// otherwise the block is appendable under a commitment that does not
     /// match its content, `from_payload` rejects that record on the next
     /// replay, and the log is silently truncated there. `pub(crate)` for that
-    /// reason; both callers (`from_wire_bytes` and `node::stage_claimed`) hash
+    /// reason; both callers (`from_wire_bytes` and `node::stage_inner`) hash
     /// and decode the one slice. Debug builds recompute and reject a mismatch,
     /// so a violating caller fails in tests rather than on the fleet.
     pub(crate) fn from_wire_bytes_with_header(bytes: &[u8], h: WireHeader) -> Result<Self, String> {

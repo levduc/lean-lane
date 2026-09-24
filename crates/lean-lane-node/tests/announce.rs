@@ -252,9 +252,9 @@ async fn announcing_head_plus_one_with_a_parked_cl_pulls_after_the_grace() {
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_feeds_of_the_same_block_append_it_once() {
     // The other half of the duplicate: a backfill pull and the CL's anchor
-    // feeding the SAME bytes at the same moment. The commit is an exclusive
-    // claim in `inflight`, so the loser waits for the winner's result and
-    // answers VALID — it never appends the block a second time.
+    // feeding the SAME bytes at the same moment. The commit gate makes the
+    // loser's append an idempotent no-op: it answers VALID and never appends
+    // the block a second time.
     let dir = tempfile::tempdir().unwrap();
     let n = open(dir.path(), vec![]);
     seed_and_submit(&n, 43, 0).await;
@@ -302,18 +302,18 @@ async fn the_anchor_waits_out_an_in_flight_commit_of_the_same_block() {
         .unwrap();
     n.staged.lock().await.clear();
 
-    // Park the commit INSIDE `commit_block`, after it has claimed the
-    // commitment, by holding the `state` lock it needs. That makes the race
+    // Park the commit INSIDE `commit_block`, after it has marked the
+    // commitment in progress, by holding the `state` lock it needs. That makes the race
     // deterministic instead of hoping to observe a sub-millisecond window.
     let state_guard = n.state.lock().await;
     let feeder = n.clone();
     let bytes = wire.clone();
     let commit = tokio::spawn(async move { feeder.shim_new(&bytes).await });
     let t0 = Instant::now();
-    while !n.inflight.lock().await.contains_key(&c) {
+    while !n.is_in_progress(c) {
         assert!(
             t0.elapsed() < Duration::from_secs(5),
-            "the commit must claim the commitment"
+            "the commit must mark the commitment in progress"
         );
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
