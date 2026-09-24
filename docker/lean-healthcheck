@@ -1,0 +1,9 @@
+#!/usr/local/bin/busybox sh
+# lean-healthcheck [port] — exit 0 iff the node answers arc_getHead on its RPC port.
+# The image's HEALTHCHECK runs this; compose files can reuse it:
+#   healthcheck: { test: ["CMD", "lean-healthcheck"] }
+PORT=${1:-${LEAN_RPC_PORT:-8560}}
+/usr/local/bin/busybox wget -q -T 3 -O - \
+  --header 'content-type: application/json' \
+  --post-data '{"jsonrpc":"2.0","id":1,"method":"arc_getHead","params":{}}' \
+  "http://127.0.0.1:$PORT" 2>/dev/null | /usr/local/bin/busybox grep -q '"commitment"'

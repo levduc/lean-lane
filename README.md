@@ -120,6 +120,54 @@ wait (for a stage running or about to arrive) pays for itself. Per-call timing
 (`lean_anchor`, `lean_stage`, `lean_locate`, `lean_build`) is emitted as debug
 events: `RUST_LOG=lean_lane_node=debug`.
 
+## Run with Docker
+
+```bash
+./scripts/build-image.sh          # -> lean-lane:<git-short-sha> and lean-lane:local
+./scripts/image-smoke.sh          # 3 containers + the image's spammer, ~1 min
+```
+
+This image is what quake deploys beside each validator's consensus and EVM
+containers (quake pulls only from `ghcr.io`, so it is published there with
+`./scripts/build-image.sh --push ghcr.io/<owner>/lean-lane`; without `--push`
+the script only prints the command).
+
+One image carries both binaries: `lean-lane-node` is the entrypoint and
+`spammer` is at `/usr/local/bin/spammer`. The runtime is distroless (`cc`),
+runs as the non-root user `nonroot` (uid 65532), and the default command is
+`run --datadir /data --bind 0.0.0.0 --port 8560`. Pass your own `run ...` to
+add flags (they replace the default command, so repeat `--datadir /data --bind
+0.0.0.0`):
+
+```bash
+docker network create lean
+docker run -d --name lean1 --network lean -p 8560:8560 \
+  -v lean1-data:/data -v ~/lean-fund.txt:/fund.txt:ro lean-lane:local \
+  run --datadir /data --bind 0.0.0.0 --port 8560 --chain-id 1338 \
+      --peers http://lean2:8560,http://lean3:8560 \
+      --fund-file /fund.txt --fund-balance 10000000000000000000
+
+# load from the same image, on the node's network:
+docker run --rm --network lean --entrypoint spammer lean-lane:local \
+  ws --targets ws://lean1:8560 -r 2000 -g 2 -a 200 -t 60 \
+  --chain-id 1338 --mix fanout=100 --fanout-outputs 10
+```
+
+- **Volume** `/data`: block log and snapshots. A named volume inherits the
+  image's `nonroot` ownership; a bind-mounted host directory must be writable
+  by uid 65532 (or run with `--user`). The fund file must be readable by it.
+- **Port** 8560 (JSON-RPC + WebSocket). `--bind 0.0.0.0` is required inside a
+  container; the node's own default is loopback.
+- **Health**: the image's `HEALTHCHECK` runs `lean-healthcheck`, which calls
+  `arc_getHead` on `127.0.0.1:8560` (argument or `LEAN_RPC_PORT` for another
+  port) and succeeds once it returns a commitment. The image has no curl or
+  shell of its own, so a compose file should reuse it:
+  `healthcheck: { test: ["CMD", "lean-healthcheck"], start_period: 60s }`
+  (restart replays the log tail from the last snapshot before serving).
+  Start a consensus container only after its lean node is healthy.
+- **Stop**: `STOPSIGNAL` is `SIGINT`, which the node handles, so `docker stop`
+  exits cleanly at once.
+
 ## Load
 
 ```bash
