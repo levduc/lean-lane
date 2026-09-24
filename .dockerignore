@@ -1,0 +1,7 @@
+# Only the workspace sources go into the build context.
+.git
+target
+target*/
+**/target/
+bench/runs/
+*.log
