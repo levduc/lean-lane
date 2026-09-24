@@ -3,13 +3,15 @@
 //! hashes — as a plain serial decode, on mixed-N blocks with invalid entries
 //! interleaved. A single divergence here is a chain split.
 
+mod common;
+
 use alloy_eips::{Decodable2718, Encodable2718};
 use alloy_primitives::{Address, B256};
+use common::sk;
 use lean_lane_node::node::decode_block_txs as decode_block_txs_parallel;
 use lean_native::envelope::{current_lane_domain, ArcTxEnvelope, LeanSigned};
 use lean_native::{LeanTx, Output};
 use reth_primitives_traits::SignerRecoverable;
-use secp256k1::SecretKey;
 
 /// The serial oracle: one tx at a time, same skips.
 fn decode_block_txs_serial(txs: &[Vec<u8>]) -> Vec<(Address, LeanTx, B256)> {
@@ -27,13 +29,6 @@ fn decode_block_txs_serial(txs: &[Vec<u8>]) -> Vec<(Address, LeanTx, B256)> {
         }
     }
     items
-}
-
-fn sk(i: u64) -> SecretKey {
-    let mut b = [0u8; 32];
-    b[..8].copy_from_slice(&(i + 1).to_be_bytes());
-    b[31] = 1;
-    SecretKey::from_slice(&b).unwrap()
 }
 
 fn signed_fanout(key: u64, nonce: u32, n: usize) -> Vec<u8> {

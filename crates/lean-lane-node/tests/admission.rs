@@ -5,8 +5,11 @@
 //! (Moved here from lean-native/src/pool.rs: LeanProvider lives in this crate,
 //! and keeping these out of lean-native leaves it provider-dependency-free.)
 
+mod common;
+
 use alloy_eips::Encodable2718;
 use alloy_primitives::Address;
+use common::sk;
 use lean_lane_node::pool::ArcPooledTx;
 use lean_lane_node::provider::LeanProvider;
 use lean_lane_node::state::Acct;
@@ -17,14 +20,6 @@ use reth_transaction_pool::validate::{EthTransactionValidator, EthTransactionVal
 use reth_transaction_pool::{
     CoinbaseTipOrdering, Pool, PoolTransaction, TransactionOrigin, TransactionPool,
 };
-use secp256k1::SecretKey;
-
-fn sk(i: u64) -> SecretKey {
-    let mut b = [0u8; 32];
-    b[..8].copy_from_slice(&(i + 1).to_be_bytes());
-    b[31] = 1;
-    SecretKey::from_slice(&b).unwrap()
-}
 
 fn lean_pooled(n: usize, key: u64, nonce: u32) -> ArcPooledTx {
     let outs = (0..n)
