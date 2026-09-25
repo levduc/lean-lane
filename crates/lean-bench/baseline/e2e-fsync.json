@@ -1,0 +1,43 @@
+{
+  "mode": "fsync",
+  "fanout": "10",
+  "budget_gas": 225000000,
+  "accounts": 100000,
+  "threads": 16,
+  "prefill_txs": 375000,
+  "prefill_s": 1.639242069,
+  "blocks": 117,
+  "seconds": 7.662701691,
+  "txs_per_block": 3169.0,
+  "payments_per_block": 31690.0,
+  "fullness": 0.9999955555555555,
+  "blocks_per_s": 15.268766124279495,
+  "tx_per_s": 48386.71984784172,
+  "payments_per_s": 483867.1984784172,
+  "build_ms": {
+    "mean": 12.812537111111103,
+    "p50": 12.808309,
+    "max": 15.730746
+  },
+  "stage_ms": {
+    "mean": 24.291761205128207,
+    "p50": 24.177443999999998,
+    "max": 27.393075999999997
+  },
+  "anchor_proposer_ms": {
+    "mean": 19.43175976923078,
+    "p50": 19.21966,
+    "max": 26.918904
+  },
+  "anchor_follower_ms": {
+    "mean": 8.825719794871791,
+    "p50": 8.754033,
+    "max": 9.87054
+  },
+  "append_ms": {
+    "mean": 1.8449442136752139,
+    "p50": 1.759404,
+    "max": 8.23381
+  },
+  "stopped_by": "pool drained"
+}
