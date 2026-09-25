@@ -303,3 +303,20 @@ concat; this writes each row once, in place. Gate correct. Base = A10.
 
 Preliminary K=3 p8: N=100 +5.4 % (0.8/0.9 %), 1e7 +4.4 % (1.2/0.7 %), mix +7.1 %
 (0.6/1.1 %), every candidate above every baseline.
+
+### A12 — in-place compaction of the recovered-items `Vec<Option<_>>` (`filter_map` instead of `flatten`) — REJECTED (neutral)
+
+Idea: std collects `into_iter().filter_map(|x| x)` in place but `flatten()` not
+(checked with a pointer-equality probe), so the per-block copy of the 17k-entry
+(2.6 MB at N=1) item list and its fresh pages go away. Expected < 1 % (a serial
+~0.5 ms of a 75 ms N=1 block). Base = A11, K=7.
+
+| mode | scenario | base median | spread | cand median | spread | delta |
+|---|---|--:|--:|--:|--:|--:|
+| p8 | s1e6-n1-g450m | 179,332 | 29.8 % | 201,954 | 25.3 % | +12.6 % (bimodal noise) |
+| p8 | s1e6-nmix-g450m | 4,542,055 | 11.1 % | 4,861,571 | 10.7 % | +7.0 % (noise) |
+| t16 | s1e6-n1-g450m | 189,445 | 0.5 % | 189,572 | 0.2 % | +0.1 % |
+| t16 | s1e6-nmix-g450m | 4,891,168 | 2.3 % | 4,895,471 | 0.8 % | +0.1 % |
+
+The p8 medians moved only because more candidate invocations landed in the host's fast
+N=1 mode; the stable t16 arm shows nothing. Reverted.
