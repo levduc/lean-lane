@@ -410,8 +410,19 @@ pub(crate) fn process_block<S: StateView + ?Sized>(
     ctx: &EngineCtx,
 ) -> Result<Processed, BlockError> {
     let (header, txs) = scan(wire)?;
-    let commitment = framing::commitment_of_wire(&header, wire);
-    let items = recover(decode(&txs, ctx), ctx);
+    // The commitment is one serial keccak over the whole block: overlap it
+    // with the (parallel) decode + recovery instead of running it first.
+    let (commitment, items) = if ctx.parallel_recovery {
+        rayon::join(
+            || framing::commitment_of_wire(&header, wire),
+            || recover(decode(&txs, ctx), ctx),
+        )
+    } else {
+        (
+            framing::commitment_of_wire(&header, wire),
+            recover(decode(&txs, ctx), ctx),
+        )
+    };
     let delta = execute(state, &items, ctx);
     Ok(Processed {
         header,

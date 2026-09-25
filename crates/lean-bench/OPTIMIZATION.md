@@ -47,3 +47,44 @@ both executors; mutation-checked (dropping the beneficiary's fee fails it).
 
 Phases (p8, ms/block) N=100/1e6: execute 33.05 → 4.49; N=1: 11.53 → 2.41. New N=100
 block: frame+dec 5.3 · recover 4.5 · execute 4.5 · apply 6.4 (20.3 ms).
+
+### A2 — fused decode+recover, signing hash straight from the entry's body bytes — REJECTED (neutral)
+
+Idea: one rayon pass per entry (parse → `keccak(domain ‖ body)` over the wire bytes,
+no re-encode, no preimage buffer, bypassing alloy's small-input keccak cache → ecrecover
+→ tx hash), new `lean_native::{signing_hash_of_body, recover_prehashed}`. Gate correct.
+Base = A1.
+
+| mode | scenario | base median | spread | cand median | spread | delta |
+|---|---|--:|--:|--:|--:|--:|
+| p8 (4-scenario run) | s1e6-n100-g450m | 4,218,702 | 2.0 % | 3,984,624 | 2.8 % | −5.5 % |
+| p8 (4-scenario run) | s1e6-nmix-g450m | 2,824,154 | 5.7 % | 2,753,092 | 6.3 % | −2.5 % |
+| p8 (4-scenario run) | s1e7-n100-g450m | 3,434,541 | 3.0 % | 3,439,441 | 0.5 % | +0.1 % |
+| t16 (4-scenario run) | s1e6-n100-g450m | 4,379,681 | 1.6 % | 4,125,172 | 1.5 % | −5.8 % |
+| p8 (re-run, 2 scenarios) | s1e6-n100-g450m | 4,134,335 | 1.7 % | 4,156,444 | 0.9 % | +0.5 % |
+| p8 (re-run, 2 scenarios) | s1e6-nmix-g450m | 2,979,389 | 1.3 % | 2,984,898 | 0.6 % | +0.2 % |
+
+The phase timings of single invocations were identical (process_block 14.4 ms both);
+the −5.5 % of the first run did not reproduce — a process-layout effect of the
+4-scenario invocation, which is a lesson for the protocol: the within-condition spread
+understates between-binary layout noise of a few %. A one-shot uncached keccak over a
+Vec preimage instead of the streaming sponge: −0.5 % (noise). The expected gain was
+~0.5 ms of 20.7 ms (the re-encode is 6 % of the *single-threaded* N=100 pipeline, /8
+on the pool) — below the noise floor. Reverted.
+
+### A3 — overlap the commitment keccak with decode + recovery (`rayon::join`) — ACCEPTED
+
+Idea: the commitment is one serial ~3.5 ms keccak over the whole 1.2 MB block, run
+before any parallel work. `process_block` now runs it on one pool thread while the
+others decode and recover. Serial mode unchanged. Base = A1.
+
+| mode | scenario | base median | spread | cand median | spread | delta |
+|---|---|--:|--:|--:|--:|--:|
+| p8 | s1e6-n1-g450m | 166,811 | 28.1 % | 169,869 | 27.9 % | +1.8 % (noise) |
+| p8 | s1e6-n100-g450m | 4,182,285 | 1.8 % | 4,804,667 | 1.2 % | **+14.9 %** |
+| p8 | s1e6-nmix-g450m | 2,829,926 | 5.9 % | 3,169,814 | 6.8 % | **+12.0 %** |
+| p8 | s1e7-n100-g450m | 3,436,363 | 1.1 % | 4,038,577 | 2.8 % | **+17.5 %** |
+| t16 | s1e6-n1-g450m | 174,140 | 0.7 % | 178,473 | 1.6 % | +2.5 % |
+| t16 | s1e6-n100-g450m | 4,377,791 | 0.9 % | 4,594,418 | 1.2 % | **+4.9 %** |
+| t16 | s1e6-nmix-g450m | 2,952,937 | 1.3 % | 3,328,469 | 0.8 % | **+12.7 %** |
+| t16 | s1e7-n100-g450m | 3,596,963 | 1.3 % | 3,949,884 | 1.3 % | **+9.8 %** |
