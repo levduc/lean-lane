@@ -44,7 +44,7 @@ use crate::types::{
 use alloy_primitives::{keccak256, Address, B256};
 use lean_native::{lean_fee, LeanTx, AMOUNT_UNIT, LEAN_TX_TYPE};
 use rayon::prelude::*;
-use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[inline]
 fn u32_at(b: &[u8], at: usize) -> u32 {
@@ -138,61 +138,252 @@ pub(crate) fn recover(decoded: Vec<Decoded>, ctx: &EngineCtx) -> Vec<RecoveredTx
     }
 }
 
+/// Sort key of an address: its 20 bytes as big-endian integers, so the
+/// derived (lexicographic-by-field) order IS the byte order of the address
+/// (SPEC §0) — cheaper to compare than a 20-byte memcmp.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct AKey(u64, u64, u32);
+
+impl AKey {
+    #[inline]
+    fn of(a: &Address) -> Self {
+        let b = &a.0 .0;
+        AKey(
+            u64::from_be_bytes(b[0..8].try_into().unwrap()),
+            u64::from_be_bytes(b[8..16].try_into().unwrap()),
+            u32::from_be_bytes(b[16..20].try_into().unwrap()),
+        )
+    }
+
+    #[inline]
+    fn addr(self) -> Address {
+        let mut b = [0u8; 20];
+        b[0..8].copy_from_slice(&self.0.to_be_bytes());
+        b[8..16].copy_from_slice(&self.1.to_be_bytes());
+        b[16..20].copy_from_slice(&self.2.to_be_bytes());
+        Address::new(b)
+    }
+}
+
+/// One deferred credit: recipient key and amount in AMOUNT_UNIT.
+#[derive(Clone, Copy)]
+struct Credit {
+    key: AKey,
+    amount: u64,
+}
+
+/// The post-state of one sender after its txs of the block ran.
+struct SenderPost {
+    key: AKey,
+    acct: Acct,
+    applied: usize,
+    outputs: usize,
+    fees: u128,
+}
+
 /// THE state transition function: execute `items` (block order) against
 /// `state` and return the delta. Pure — `state` is only read.
+///
+/// Sender-partitioned: a sender's in-block balance depends only on its own
+/// earlier txs (same-block credits are not spendable), so the items are
+/// grouped by sender (sort by (sender, block index)), each group runs in
+/// block order from the block-start value, groups are independent. The
+/// credits of applied txs are then sorted by recipient and summed per run,
+/// and senders ∪ recipients ∪ beneficiary are merged in address order — the
+/// write set comes out sorted without a map. `+=` on balances keeps the
+/// reference's overflow semantics; wrapping addition is commutative and
+/// associative, so the summation order cannot change a result. The same
+/// algorithm runs on the rayon pool or on the calling thread
+/// (`ctx.parallel_recovery`); only the executor differs.
 pub(crate) fn execute<S: StateView + ?Sized>(
     state: &S,
     items: &[RecoveredTx],
     ctx: &EngineCtx,
 ) -> Delta {
+    let par = ctx.parallel_recovery;
     let beneficiary = ctx.beneficiary;
-    // Post view: block-start values, own debits accumulate, incoming
-    // same-block credits invisible to the debit checks (deterministic-parallel
-    // rule) — they are only merged in after the debit phase.
-    let mut post: HashMap<Address, Acct> = HashMap::new();
-    let mut credits: HashMap<Address, u128> = HashMap::new();
-    let mut fees = 0u128;
-    let mut applied = 0usize;
-    let mut outputs = 0usize;
 
-    for (sender, tx, _) in items {
-        let entry = post.entry(*sender).or_insert_with(|| state.get(sender));
-        let fee = lean_fee(tx.outputs.len());
-        let mut total = fee;
-        let mut ok = tx.nonce as u64 == entry.nonce;
-        if ok {
-            for o in &tx.outputs {
-                match total.checked_add(o.amount as u128 * AMOUNT_UNIT) {
-                    Some(t) => total = t,
-                    None => {
-                        ok = false;
-                        break;
+    // 1. group by sender, block order inside a group ((key, index) is unique,
+    //    so the unstable sort is deterministic)
+    let mut order: Vec<(AKey, usize)> = items
+        .iter()
+        .enumerate()
+        .map(|(i, (s, _, _))| (AKey::of(s), i))
+        .collect();
+    if par {
+        order.par_sort_unstable();
+    } else {
+        order.sort_unstable();
+    }
+    let mut groups: Vec<(usize, usize)> = Vec::new();
+    let mut at = 0;
+    while at < order.len() {
+        let k = order[at].0;
+        let mut end = at + 1;
+        while end < order.len() && order[end].0 == k {
+            end += 1;
+        }
+        groups.push((at, end));
+        at = end;
+    }
+
+    // 2. run every sender's txs in block order from its block-start value
+    let applied_flags: Vec<AtomicBool> = (0..items.len()).map(|_| AtomicBool::new(false)).collect();
+    let run_group = |&(lo, hi): &(usize, usize)| -> SenderPost {
+        let key = order[lo].0;
+        let (sender, _, _) = &items[order[lo].1];
+        let mut acct = state.get(sender);
+        let (mut applied, mut outputs, mut fees) = (0usize, 0usize, 0u128);
+        for &(_, i) in &order[lo..hi] {
+            let tx = &items[i].1;
+            let fee = lean_fee(tx.outputs.len());
+            let mut total = fee;
+            let mut ok = tx.nonce as u64 == acct.nonce;
+            if ok {
+                for o in &tx.outputs {
+                    match total.checked_add(o.amount as u128 * AMOUNT_UNIT) {
+                        Some(t) => total = t,
+                        None => {
+                            ok = false;
+                            break;
+                        }
                     }
                 }
             }
+            if !ok || acct.balance < total {
+                continue;
+            }
+            acct.balance -= total;
+            acct.nonce += 1;
+            applied_flags[i].store(true, Ordering::Relaxed);
+            outputs += tx.outputs.len();
+            fees += fee;
+            applied += 1;
         }
-        if !ok || entry.balance < total {
-            continue;
+        SenderPost {
+            key,
+            acct,
+            applied,
+            outputs,
+            fees,
         }
-        entry.balance -= total;
-        entry.nonce += 1;
-        for o in &tx.outputs {
-            *credits.entry(o.to).or_default() += o.amount as u128 * AMOUNT_UNIT;
-        }
-        outputs += tx.outputs.len();
-        fees += fee;
-        applied += 1;
+    };
+    let senders: Vec<SenderPost> = if par {
+        groups.par_iter().map(run_group).collect()
+    } else {
+        groups.iter().map(run_group).collect()
+    };
+    let (mut applied, mut outputs, mut fees) = (0usize, 0usize, 0u128);
+    for s in &senders {
+        applied += s.applied;
+        outputs += s.outputs;
+        fees += s.fees;
     }
 
-    for (addr, wei) in credits {
-        post.entry(addr).or_insert_with(|| state.get(&addr)).balance += wei;
+    // 3. credits of applied txs, sorted by recipient, summed per run
+    let mut credits: Vec<Credit> = Vec::with_capacity(outputs);
+    for (i, (_, tx, _)) in items.iter().enumerate() {
+        if applied_flags[i].load(Ordering::Relaxed) {
+            credits.extend(tx.outputs.iter().map(|o| Credit {
+                key: AKey::of(&o.to),
+                amount: o.amount,
+            }));
+        }
     }
-    post.entry(beneficiary)
-        .or_insert_with(|| state.get(&beneficiary))
-        .balance += fees;
+    if par {
+        credits.par_sort_unstable_by_key(|c| c.key);
+    } else {
+        credits.sort_unstable_by_key(|c| c.key);
+    }
+    // distinct recipients (+ the beneficiary, credited `fees`, always
+    // present), ascending: (key, wei)
+    let ben = AKey::of(&beneficiary);
+    let mut recv: Vec<(AKey, u128)> = Vec::with_capacity(credits.len().min(outputs) + 1);
+    let mut ben_done = false;
+    let mut at = 0;
+    while at < credits.len() {
+        let k = credits[at].key;
+        if !ben_done && ben < k {
+            recv.push((ben, fees));
+            ben_done = true;
+        }
+        let mut wei = 0u128;
+        while at < credits.len() && credits[at].key == k {
+            wei += credits[at].amount as u128 * AMOUNT_UNIT;
+            at += 1;
+        }
+        if k == ben {
+            wei += fees;
+            ben_done = true;
+        }
+        recv.push((k, wei));
+    }
+    if !ben_done {
+        recv.push((ben, fees));
+    }
+    drop(credits);
 
-    let mut writes: Vec<(Address, Acct)> = post.into_iter().collect();
-    writes.sort_unstable_by_key(|(a, _)| *a);
+    // 4. merge senders and recipients in address order; a recipient that is
+    //    not a sender starts from its block-start value (read in step 5)
+    let mut writes: Vec<(Address, Acct)> = Vec::with_capacity(senders.len() + recv.len());
+    let mut fill: Vec<usize> = Vec::with_capacity(recv.len());
+    let (mut si, mut ri) = (0, 0);
+    while si < senders.len() || ri < recv.len() {
+        let take_s = ri == recv.len() || (si < senders.len() && senders[si].key <= recv[ri].0);
+        if take_s {
+            let s = &senders[si];
+            let mut acct = s.acct;
+            if ri < recv.len() && recv[ri].0 == s.key {
+                acct.balance += recv[ri].1;
+                ri += 1;
+            }
+            writes.push((s.key.addr(), acct));
+            si += 1;
+        } else {
+            let (k, wei) = recv[ri];
+            fill.push(writes.len());
+            writes.push((
+                k.addr(),
+                Acct {
+                    nonce: 0,
+                    balance: wei,
+                },
+            ));
+            ri += 1;
+        }
+    }
+
+    // 5. block-start values of the recipient-only accounts: balance = state + credit
+    let read = |w: &mut (Address, Acct)| {
+        let base = state.get(&w.0);
+        w.1 = Acct {
+            nonce: base.nonce,
+            balance: {
+                let mut b = base.balance;
+                b += w.1.balance;
+                b
+            },
+        };
+    };
+    if par {
+        // `fill` is ascending, so the writes it names are disjoint
+        let mut rest: &mut [(Address, Acct)] = &mut writes;
+        let mut taken = 0;
+        let mut refs: Vec<&mut (Address, Acct)> = Vec::with_capacity(fill.len());
+        for &i in &fill {
+            let (_, tail) = std::mem::take(&mut rest).split_at_mut(i - taken);
+            let (one, tail) = tail.split_first_mut().unwrap();
+            refs.push(one);
+            rest = tail;
+            taken = i + 1;
+        }
+        refs.into_par_iter().for_each(|w| read(w));
+    } else {
+        for &i in &fill {
+            read(&mut writes[i]);
+        }
+    }
+
     Delta {
         writes,
         evict: items.iter().map(|(_, _, h)| *h).collect(),
