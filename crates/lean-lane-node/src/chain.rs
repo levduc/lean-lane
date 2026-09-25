@@ -39,16 +39,17 @@
 //! truncated there. (A production log would add a CRC per record; the echo
 //! catches truncation — the crash mode fsync-per-block leaves us with.)
 
-use alloy_primitives::{keccak256, B256};
+//!
+//! Framing, the commitment and the genesis commitment are defined ONCE, in
+//! `lean_core` (`lean_core::framing` + the engine's `scan`); this module only
+//! adds the owned block type and the log.
+
+use alloy_primitives::B256;
+use lean_core::{framing, BlockHeader};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-pub fn genesis_commitment(chain_id: u64) -> B256 {
-    let mut buf = Vec::with_capacity(29);
-    buf.extend_from_slice(b"ARC_LEAN_LANE_GENESIS");
-    buf.extend_from_slice(&chain_id.to_be_bytes());
-    keccak256(&buf)
-}
+pub use lean_core::genesis_commitment;
 
 /// A wire block's header fields plus its commitment, obtained without
 /// materialising the transaction list (see `LeanBlock::commitment_of_wire`).
@@ -74,19 +75,12 @@ impl LeanBlock {
     pub fn new(parent: B256, number: u64, timestamp_ms: u64, txs: Vec<Vec<u8>>) -> Self {
         // FRAMED preimage: count + per-tx lengths bound into the hash
         // (identical bytes to the wire form's tail).
-        let mut cat = Vec::with_capacity(4 + txs.iter().map(|t| 4 + t.len()).sum::<usize>());
-        cat.extend_from_slice(&(txs.len() as u32).to_le_bytes());
-        for t in &txs {
-            cat.extend_from_slice(&(t.len() as u32).to_le_bytes());
-            cat.extend_from_slice(t);
-        }
-        let txs_hash = keccak256(&cat);
-        let mut pre = Vec::with_capacity(80);
-        pre.extend_from_slice(parent.as_slice());
-        pre.extend_from_slice(&number.to_le_bytes());
-        pre.extend_from_slice(&timestamp_ms.to_le_bytes());
-        pre.extend_from_slice(txs_hash.as_slice());
-        let commitment = keccak256(&pre);
+        let h = BlockHeader {
+            parent,
+            number,
+            timestamp_ms,
+        };
+        let commitment = framing::commitment_of_list(&h, &txs);
         Self {
             parent,
             number,
@@ -96,50 +90,19 @@ impl LeanBlock {
         }
     }
 
+    fn header(&self) -> BlockHeader {
+        BlockHeader {
+            parent: self.parent,
+            number: self.number,
+            timestamp_ms: self.timestamp_ms,
+        }
+    }
+
     /// Canonical CONSENSUS wire form (the SSZ-carried bytes; commitment NOT
     /// included — receivers recompute it):
     /// `[parent 32][number u64 LE][timestamp_ms u64 LE][n_txs u32 LE]([len u32 LE][tx])*`
     pub fn to_wire_bytes(&self) -> Vec<u8> {
-        let tx_bytes: usize = self.txs.iter().map(|t| 4 + t.len()).sum();
-        let mut w = Vec::with_capacity(52 + tx_bytes);
-        w.extend_from_slice(self.parent.as_slice());
-        w.extend_from_slice(&self.number.to_le_bytes());
-        w.extend_from_slice(&self.timestamp_ms.to_le_bytes());
-        w.extend_from_slice(&(self.txs.len() as u32).to_le_bytes());
-        for t in &self.txs {
-            w.extend_from_slice(&(t.len() as u32).to_le_bytes());
-            w.extend_from_slice(t);
-        }
-        w
-    }
-
-    /// Validate the wire FRAMING and return the header fields plus the tx
-    /// count. Walks the length table without copying a single tx body, so it
-    /// is the cheap half of a decode.
-    fn scan_wire(bytes: &[u8]) -> Result<(B256, u64, u64, usize), String> {
-        if bytes.len() < 52 {
-            return Err("wire block too short".into());
-        }
-        let parent = B256::from_slice(&bytes[0..32]);
-        let number = u64::from_le_bytes(bytes[32..40].try_into().unwrap());
-        let timestamp_ms = u64::from_le_bytes(bytes[40..48].try_into().unwrap());
-        let n_tx = u32::from_le_bytes(bytes[48..52].try_into().unwrap()) as usize;
-        let mut at = 52usize;
-        for i in 0..n_tx {
-            if bytes.len() < at + 4 {
-                return Err(format!("wire block truncated at tx {i} length"));
-            }
-            let len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
-            at += 4;
-            if bytes.len() < at + len {
-                return Err(format!("wire block truncated at tx {i} body"));
-            }
-            at += len;
-        }
-        if at != bytes.len() {
-            return Err("trailing bytes after wire block".into());
-        }
-        Ok((parent, number, timestamp_ms, n_tx))
+        framing::to_wire(&self.header(), &self.txs)
     }
 
     /// The commitment (and header) of a wire block WITHOUT materialising its
@@ -156,18 +119,12 @@ impl LeanBlock {
     /// Framing is validated exactly as `from_wire_bytes` validates it, so a
     /// malformed body can never be marked in progress.
     pub fn commitment_of_wire(bytes: &[u8]) -> Result<WireHeader, String> {
-        let (parent, number, timestamp_ms, _) = Self::scan_wire(bytes)?;
-        let txs_hash = keccak256(&bytes[48..]);
-        let mut pre = Vec::with_capacity(80);
-        pre.extend_from_slice(parent.as_slice());
-        pre.extend_from_slice(&number.to_le_bytes());
-        pre.extend_from_slice(&timestamp_ms.to_le_bytes());
-        pre.extend_from_slice(txs_hash.as_slice());
+        let (h, commitment) = lean_core::header_and_commitment(bytes)?;
         Ok(WireHeader {
-            parent,
-            number,
-            timestamp_ms,
-            commitment: keccak256(&pre),
+            parent: h.parent,
+            number: h.number,
+            timestamp_ms: h.timestamp_ms,
+            commitment,
         })
     }
 
@@ -196,26 +153,19 @@ impl LeanBlock {
     /// and decode the one slice. Debug builds recompute and reject a mismatch,
     /// so a violating caller fails in tests rather than on the fleet.
     pub(crate) fn from_wire_bytes_with_header(bytes: &[u8], h: WireHeader) -> Result<Self, String> {
-        let (parent, number, timestamp_ms, n_tx) = Self::scan_wire(bytes)?;
+        let (hdr, txs) = lean_core::scan(bytes)?;
+        let (parent, number, timestamp_ms) = (hdr.parent, hdr.number, hdr.timestamp_ms);
         if parent != h.parent || number != h.number || timestamp_ms != h.timestamp_ms {
             return Err("wire header does not match the bytes".into());
         }
         if cfg!(debug_assertions) && Self::commitment_of_wire(bytes)?.commitment != h.commitment {
             return Err("wire header commitment does not match the bytes".into());
         }
-        let mut txs = Vec::with_capacity(n_tx.min(1 << 20));
-        let mut at = 52usize;
-        for _ in 0..n_tx {
-            let len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
-            at += 4;
-            txs.push(bytes[at..at + len].to_vec());
-            at += len;
-        }
         Ok(Self {
             parent,
             number,
             timestamp_ms,
-            txs,
+            txs: txs.into_iter().map(<[u8]>::to_vec).collect(),
             commitment: h.commitment,
         })
     }
