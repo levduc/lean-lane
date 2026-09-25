@@ -16,6 +16,7 @@ pub mod framing;
 mod types;
 
 pub use framing::genesis_commitment;
+pub use types::{shard_of, SHARDS, SHARD_BITS};
 pub use types::{
     AccountMap, Acct, AddressHasher, AddressHasherBuilder, BlockError, BlockHeader, BlockOutcome,
     Decoded, Delta, EngineCtx, FlatState, Framed, Processed, RecoveredTx, StateView,

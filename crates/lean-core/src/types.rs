@@ -14,12 +14,123 @@ pub struct Acct {
     pub balance: u128,
 }
 
-/// The account map of [`FlatState`]: std's `HashMap` keyed by address,
-/// hashed with [`AddressHasher`] instead of SipHash (2x cheaper inserts,
-/// 2.5x cheaper lookups into a 1e7-account map). Iteration order is
-/// unspecified either way (the digest sorts; snapshot order was already
-/// hash-map order).
-pub type AccountMap = HashMap<Address, Acct, AddressHasherBuilder>;
+/// Number of [`AccountMap`] shards: shard = top `SHARD_BITS` bits of the
+/// address's first byte, so shard order IS address order and a write set
+/// sorted by address splits into one contiguous run per shard.
+pub const SHARD_BITS: u32 = 6;
+pub const SHARDS: usize = 1 << SHARD_BITS;
+
+/// The account map of [`FlatState`]: `SHARDS` std `HashMap`s keyed by
+/// address, sharded by the address's leading bits, each hashed with
+/// [`AddressHasher`] (keyed, cheap) instead of SipHash. Sharding lets
+/// [`crate::apply`] write disjoint shards on several threads (a write set is
+/// sorted by address, so each shard's writes are one contiguous run), and a
+/// growing state rehashes one 1/`SHARDS` slice at a time. The method set
+/// mirrors the `HashMap` methods the node, bench and tests use. Iteration
+/// order is unspecified (shard by shard; the digest sorts; snapshot order
+/// was already hash-map order).
+#[derive(Clone, Debug)]
+pub struct AccountMap {
+    shards: Box<[HashMap<Address, Acct, AddressHasherBuilder>]>,
+}
+
+/// The shard of address `a` (monotone in address order).
+#[inline]
+pub fn shard_of(a: &Address) -> usize {
+    (a.0[0] >> (8 - SHARD_BITS)) as usize
+}
+
+impl Default for AccountMap {
+    fn default() -> Self {
+        Self::with_capacity(0)
+    }
+}
+
+impl AccountMap {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Room for `n` accounts spread uniformly over the shards (+ slack).
+    pub fn with_capacity(n: usize) -> Self {
+        let per = Self::per_shard(n);
+        Self {
+            shards: (0..SHARDS)
+                .map(|_| HashMap::with_capacity_and_hasher(per, AddressHasherBuilder::default()))
+                .collect(),
+        }
+    }
+
+    #[inline]
+    fn per_shard(n: usize) -> usize {
+        if n == 0 {
+            0
+        } else {
+            n / SHARDS + n / SHARDS / 16 + 64
+        }
+    }
+
+    /// Reserve room for `additional` more accounts (spread uniformly).
+    pub fn reserve(&mut self, additional: usize) {
+        let per = Self::per_shard(additional);
+        for m in self.shards.iter_mut() {
+            m.reserve(per);
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.shards.iter().map(|m| m.len()).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.shards.iter().all(|m| m.is_empty())
+    }
+
+    #[inline]
+    pub fn get(&self, a: &Address) -> Option<&Acct> {
+        self.shards[shard_of(a)].get(a)
+    }
+
+    #[inline]
+    pub fn get_mut(&mut self, a: &Address) -> Option<&mut Acct> {
+        self.shards[shard_of(a)].get_mut(a)
+    }
+
+    #[inline]
+    pub fn contains_key(&self, a: &Address) -> bool {
+        self.shards[shard_of(a)].contains_key(a)
+    }
+
+    #[inline]
+    pub fn insert(&mut self, a: Address, acct: Acct) -> Option<Acct> {
+        self.shards[shard_of(&a)].insert(a, acct)
+    }
+
+    #[inline]
+    pub fn remove(&mut self, a: &Address) -> Option<Acct> {
+        self.shards[shard_of(a)].remove(a)
+    }
+
+    /// Every (address, account), shard by shard (unspecified order).
+    pub fn iter(&self) -> impl Iterator<Item = (&Address, &Acct)> + '_ {
+        self.shards.iter().flat_map(|m| m.iter())
+    }
+
+    /// The shards, in address order (for [`crate::apply`]).
+    pub(crate) fn shards_mut(&mut self) -> &mut [HashMap<Address, Acct, AddressHasherBuilder>] {
+        &mut self.shards
+    }
+}
+
+impl<'a> IntoIterator for &'a AccountMap {
+    type Item = (&'a Address, &'a Acct);
+    type IntoIter =
+        std::iter::Flatten<std::slice::Iter<'a, HashMap<Address, Acct, AddressHasherBuilder>>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.shards.iter().flatten()
+    }
+}
 
 /// Keyed hasher builder for [`AccountMap`]: four 64-bit keys drawn from
 /// std's `RandomState` (OS randomness) per map instance. Account addresses
@@ -123,7 +234,18 @@ impl FlatState {
     }
 
     pub fn credit(&mut self, a: Address, wei: u128) {
-        self.accounts.entry(a).or_default().balance += wei;
+        match self.accounts.get_mut(&a) {
+            Some(acct) => acct.balance += wei,
+            None => {
+                self.accounts.insert(
+                    a,
+                    Acct {
+                        nonce: 0,
+                        balance: wei,
+                    },
+                );
+            }
+        }
     }
 
     /// Deterministic digest over sorted entries — for crash/recovery equality

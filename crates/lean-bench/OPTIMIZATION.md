@@ -148,3 +148,32 @@ path (reserve check + insert-slot search). Same map afterwards. Base = A4b.
 | t16 | s1e6-n100-g450m | 5,548,001 | 3.8 % | 5,883,347 | 4.3 % | **+6.0 %** |
 | t16 | s1e6-nmix-g450m | 3,762,495 | 9.9 % | 3,903,658 | 12.6 % | +3.8 % (noise) |
 | t16 | s1e7-n100-g450m | 5,036,549 | 1.0 % | 5,369,959 | 1.0 % | **+6.6 %** |
+
+### A7 — sharded `AccountMap` (64 maps by the address's top 6 bits) + shard-parallel `apply` — ACCEPTED
+
+Idea: `apply` was the last serial phase (2.9 ms N=100/1e6, 4.7 ms at 1e7). Shard the
+state map by the leading address bits: shard order = address order, so an `execute`
+write set (sorted by address) splits into one contiguous run per shard, and disjoint
+shards are written on rayon in parallel. Serial fallback for small (< 2048) or
+not-shard-sorted write sets; within a shard writes keep their order (a hand-built
+delta with a repeated address still ends at its last value). `AccountMap` is now a
+struct mirroring the `HashMap` methods callers use (`insert/get/get_mut/remove/
+contains_key/len/is_empty/reserve/iter/&-IntoIterator/with_capacity`) — node, bench,
+diff and tests compile unchanged except the node's snapshot loader
+(`AccountMap::with_capacity`). Bonus: a growing 1e7 state rehashes 1/64 at a time.
+New test `lean-core/tests/apply.rs` (apply vs insert-in-order on sorted, unsorted and
+duplicate-carrying deltas; `AccountMap` vs `HashMap`). State build at 1e7 unchanged
+(0.80 s, +1040 MB). Base = A5.
+
+| mode | scenario | base median | spread | cand median | spread | delta |
+|---|---|--:|--:|--:|--:|--:|
+| p8 | s1e6-n1-g450m | 173,724 | 28.4 % | 174,802 | 27.9 % | +0.6 % (noise) |
+| p8 | s1e6-n100-g450m | 6,300,482 | 3.6 % | 7,334,876 | 6.0 % | **+16.4 %** |
+| p8 | s1e6-nmix-g450m | 3,711,426 | 9.1 % | 4,028,555 | 2.4 % | +8.5 % (≈ spread) |
+| p8 | s1e7-n100-g450m | 5,600,630 | 1.7 % | 7,023,215 | 1.5 % | **+25.4 %** |
+| t16 | s1e6-n1-g450m | 182,883 | 0.7 % | 183,870 | 1.4 % | +0.5 % (noise) |
+| t16 | s1e6-n100-g450m | 5,861,466 | 2.4 % | 6,659,364 | 1.0 % | **+13.6 %** |
+| t16 | s1e6-nmix-g450m | 3,902,552 | 0.4 % | 4,238,047 | 1.3 % | **+8.6 %** |
+| t16 | s1e7-n100-g450m | 5,383,748 | 1.4 % | 6,765,644 | 0.6 % | **+25.7 %** |
+
+apply at 1e7 (p8): 4.67 → 1.73 ms.

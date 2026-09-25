@@ -38,12 +38,13 @@
 
 use crate::framing::{self, WIRE_HEADER_LEN};
 use crate::types::{
-    Acct, BlockError, BlockHeader, BlockOutcome, Decoded, Delta, EngineCtx, FlatState, Processed,
-    RecoveredTx, StateView,
+    shard_of, Acct, AddressHasherBuilder, BlockError, BlockHeader, BlockOutcome, Decoded, Delta,
+    EngineCtx, FlatState, Processed, RecoveredTx, StateView, SHARDS,
 };
 use alloy_primitives::{keccak256, Address, B256};
 use lean_native::{lean_fee, LeanTx, AMOUNT_UNIT, LEAN_TX_TYPE};
 use rayon::prelude::*;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[inline]
@@ -401,16 +402,54 @@ pub(crate) fn execute<S: StateView + ?Sized>(
 /// Most writes hit an existing account: overwrite it in place (`get_mut`) and
 /// insert only when absent — the same map afterwards as `insert` for every
 /// write, but an update skips the insert path's slot search/reserve.
+///
+/// A large write set sorted by shard (every `execute` delta: writes are
+/// sorted by address and shards are address-ordered) is applied shard-
+/// parallel: each shard's writes are one contiguous run and shards are
+/// disjoint maps. Within a shard the writes keep their order, so even a
+/// hand-built delta with a repeated address ends with its last value, as
+/// the serial loop does. Anything else runs serially.
 pub(crate) fn apply(state: &mut FlatState, delta: &Delta) {
-    for (a, acct) in &delta.writes {
-        match state.accounts.get_mut(a) {
-            Some(v) => *v = *acct,
-            None => {
-                state.accounts.insert(*a, *acct);
+    fn write(m: &mut HashMap<Address, Acct, AddressHasherBuilder>, w: &[(Address, Acct)]) {
+        for (a, acct) in w {
+            match m.get_mut(a) {
+                Some(v) => *v = *acct,
+                None => {
+                    m.insert(*a, *acct);
+                }
+            }
+        }
+    }
+    let w = &delta.writes;
+    if w.len() >= PAR_APPLY_MIN && w.windows(2).all(|p| shard_of(&p[0].0) <= shard_of(&p[1].0)) {
+        let mut runs: Vec<&[(Address, Acct)]> = Vec::with_capacity(SHARDS);
+        let mut rest = &w[..];
+        for s in 0..SHARDS {
+            let n = rest.partition_point(|(a, _)| shard_of(a) <= s);
+            let (run, tail) = rest.split_at(n);
+            runs.push(run);
+            rest = tail;
+        }
+        state
+            .accounts
+            .shards_mut()
+            .par_iter_mut()
+            .zip(runs)
+            .for_each(|(m, run)| write(m, run));
+    } else {
+        for (a, acct) in w {
+            match state.accounts.get_mut(a) {
+                Some(v) => *v = *acct,
+                None => {
+                    state.accounts.insert(*a, *acct);
+                }
             }
         }
     }
 }
+
+/// Below this many writes `apply` stays on the calling thread.
+const PAR_APPLY_MIN: usize = 2048;
 
 /// The whole pipeline over one wire block.
 pub(crate) fn process_block<S: StateView + ?Sized>(

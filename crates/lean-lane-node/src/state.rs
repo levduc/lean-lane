@@ -103,8 +103,7 @@ impl Snapshots for FlatState {
         if bytes.len() != 56 + count * 44 {
             return Ok(None); // torn snapshot (tmp+rename should prevent this)
         }
-        let mut accounts =
-            lean_core::AccountMap::with_capacity_and_hasher(count, Default::default());
+        let mut accounts = lean_core::AccountMap::with_capacity(count);
         let mut at = 56;
         for _ in 0..count {
             let a = Address::from_slice(&bytes[at..at + 20]);
