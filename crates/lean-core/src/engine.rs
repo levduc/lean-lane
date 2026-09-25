@@ -197,6 +197,12 @@ impl AKey {
         )
     }
 
+    /// The address's first byte.
+    #[inline]
+    fn first_byte(self) -> usize {
+        (self.0 >> 56) as usize
+    }
+
     #[inline]
     fn addr(self) -> Address {
         let mut b = [0u8; 20];
@@ -221,6 +227,55 @@ struct SenderPost {
     applied: usize,
     outputs: usize,
     fees: u128,
+}
+
+/// Merge one address range of the write set in address order: `snd`
+/// (senders' post values, sorted, unique), `cr` (credits, sorted; equal keys
+/// summed) and optionally the beneficiary with its fee income. Calls `emit`
+/// once per distinct address with its sender post value (if a sender) and
+/// its summed credit in wei.
+#[inline]
+fn merge_range(
+    snd: &[SenderPost],
+    cr: &[Credit],
+    mut ben: Option<(AKey, u128)>,
+    mut emit: impl FnMut(AKey, Option<Acct>, u128),
+) {
+    let (mut si, mut ci) = (0, 0);
+    loop {
+        let mut k = match (snd.get(si), cr.get(ci)) {
+            (Some(p), Some(c)) => p.key.min(c.key),
+            (Some(p), None) => p.key,
+            (None, Some(c)) => c.key,
+            (None, None) => match ben {
+                Some((bk, _)) => bk,
+                None => break,
+            },
+        };
+        if let Some((bk, _)) = ben {
+            if bk < k {
+                k = bk;
+            }
+        }
+        let mut wei = 0u128;
+        while ci < cr.len() && cr[ci].key == k {
+            wei += cr[ci].amount as u128 * AMOUNT_UNIT;
+            ci += 1;
+        }
+        if let Some((bk, fees)) = ben {
+            if bk == k {
+                wei += fees;
+                ben = None;
+            }
+        }
+        let post = if si < snd.len() && snd[si].key == k {
+            si += 1;
+            Some(snd[si - 1].acct)
+        } else {
+            None
+        };
+        emit(k, post, wei);
+    }
 }
 
 /// THE state transition function: execute `items` (block order) against
@@ -374,71 +429,80 @@ pub(crate) fn execute<S: StateView + ?Sized>(
             .into_iter()
             .for_each(|b| b.sort_unstable_by_key(|c| c.key));
     }
-    // 4. one merge, in address order, of senders ∪ recipient runs (summed)
-    //    ∪ the beneficiary (credited `fees`, always written). An account that
-    //    is not a sender starts from its block-start value, read in step 5;
-    //    until then it holds just its credit and is flagged in `from_state`.
+
+    // 4. merge, in address order, senders ∪ recipient runs (summed) ∪ the
+    //    beneficiary (credited `fees`, always written); an account that is
+    //    not a sender starts from its block-start value. The 256 first-byte
+    //    ranges are independent: count each range's rows, then fill every
+    //    range's slice of the (pre-sized) write set in parallel.
     let ben = AKey::of(&beneficiary);
-    let mut writes: Vec<(Address, Acct)> = Vec::with_capacity(senders.len() + credits.len() + 1);
-    let mut from_state: Vec<bool> = Vec::with_capacity(senders.len() + credits.len() + 1);
-    let mut ben_pending = true;
-    let (mut si, mut ci) = (0, 0);
-    loop {
-        let mut k = match (senders.get(si), credits.get(ci)) {
-            (Some(p), Some(c)) => p.key.min(c.key),
-            (Some(p), None) => p.key,
-            (None, Some(c)) => c.key,
-            (None, None) if ben_pending => ben,
-            (None, None) => break,
-        };
-        if ben_pending && ben < k {
-            k = ben;
-        }
-        let mut wei = 0u128;
-        while ci < credits.len() && credits[ci].key == k {
-            wei += credits[ci].amount as u128 * AMOUNT_UNIT;
-            ci += 1;
-        }
-        if ben_pending && k == ben {
-            wei += fees;
-            ben_pending = false;
-        }
-        if si < senders.len() && senders[si].key == k {
-            let mut acct = senders[si].acct;
-            acct.balance += wei;
-            writes.push((k.addr(), acct));
-            from_state.push(false);
-            si += 1;
-        } else {
-            writes.push((
-                k.addr(),
-                Acct {
-                    nonce: 0,
-                    balance: wei,
-                },
-            ));
-            from_state.push(true);
+    let mut cstart = [0usize; 257];
+    for b in 0..256 {
+        cstart[b + 1] = cstart[b] + counts[b];
+    }
+    let mut sstart = [0usize; 257];
+    let mut j = 0;
+    for (b, start) in sstart.iter_mut().enumerate().take(256) {
+        *start = j;
+        while j < senders.len() && senders[j].key.first_byte() == b {
+            j += 1;
         }
     }
-    drop(credits);
-
-    // 5. block-start values of the flagged accounts: balance = state + credit
-    let read = |(w, &flag): (&mut (Address, Acct), &bool)| {
-        if flag {
-            let mut acct = state.get(&w.0);
-            acct.balance += w.1.balance;
-            w.1 = acct;
-        }
+    sstart[256] = j;
+    let range = |b: usize| -> (&[SenderPost], &[Credit], Option<(AKey, u128)>) {
+        (
+            &senders[sstart[b]..sstart[b + 1]],
+            &credits[cstart[b]..cstart[b + 1]],
+            (ben.first_byte() == b).then_some((ben, fees)),
+        )
+    };
+    let count = |b: usize| -> usize {
+        let (snd, cr, bn) = range(b);
+        let mut n = 0;
+        merge_range(snd, cr, bn, |_, _, _| n += 1);
+        n
+    };
+    let rows: Vec<usize> = if par {
+        (0..256).into_par_iter().map(count).collect()
+    } else {
+        (0..256).map(count).collect()
+    };
+    let total: usize = rows.iter().sum();
+    let blank = (Address::ZERO, Acct::default());
+    let mut writes: Vec<(Address, Acct)> = Vec::with_capacity(total);
+    if par {
+        // parallel first touch: the fresh pages fault on every thread
+        writes.par_extend(rayon::iter::repeat_n(blank, total));
+    } else {
+        writes.resize(total, blank);
+    }
+    let mut slices: Vec<(usize, &mut [(Address, Acct)])> = Vec::with_capacity(256);
+    let mut rest: &mut [(Address, Acct)] = &mut writes;
+    for (b, &n) in rows.iter().enumerate() {
+        let (slice, tail) = std::mem::take(&mut rest).split_at_mut(n);
+        slices.push((b, slice));
+        rest = tail;
+    }
+    let fill = |(b, out): (usize, &mut [(Address, Acct)])| {
+        let (snd, cr, bn) = range(b);
+        let mut i = 0;
+        merge_range(snd, cr, bn, |k, post, wei| {
+            let addr = k.addr();
+            let mut acct = match post {
+                Some(a) => a,
+                None => state.get(&addr),
+            };
+            acct.balance += wei;
+            out[i] = (addr, acct);
+            i += 1;
+        });
     };
     if par {
-        writes
-            .par_iter_mut()
-            .zip(from_state.par_iter())
-            .with_min_len(512)
-            .for_each(read);
+        slices.into_par_iter().for_each(fill);
     } else {
-        writes.iter_mut().zip(from_state.iter()).for_each(read);
+        slices.into_iter().for_each(fill);
     }
+    drop(credits);
 
     Delta {
         writes,

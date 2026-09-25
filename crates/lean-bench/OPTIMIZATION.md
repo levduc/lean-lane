@@ -278,3 +278,28 @@ A preliminary K=3 p8 run was tighter: N=100 +3.5 % (spreads 0.6/0.6 %), 1e7 +2.7
 (1.1/0.4 %), mix +2.0 % (0.2/0.3 %) — every candidate above every baseline. Accepted
 on t16 N=100 and 1e7 clearing their spreads and the K=3 run; the gain is ~3 %, at the
 edge of what this protocol resolves.
+
+### A11 — `execute`: range-parallel merge into a pre-sized, parallel-first-touched write set — ACCEPTED
+
+Idea: after A10 the tail was a serial merge (0.5 ms) pushing into a fresh 5.5 MB `writes`
+(≈1,300 first-touch page faults on the critical path) plus a separate flagged read pass.
+The 256 first-byte ranges of the key space are independent: count each range's rows in
+parallel (the same `merge_range` walk with a counting sink), allocate `writes` at the
+exact total and first-touch it with `par_extend(repeat_n(..))` (the page faults land on
+every thread), split it into per-range slices and fill all ranges in parallel, reading
+the recipient-only block-start values inside the fill. A6 failed on per-shard buffers +
+concat; this writes each row once, in place. Gate correct. Base = A10.
+
+| mode | scenario | base median | spread | cand median | spread | delta |
+|---|---|--:|--:|--:|--:|--:|
+| p8 | s1e6-n1-g450m | 178,854 | 28.9 % | 179,202 | 19.6 % | +0.2 % (noise) |
+| p8 | s1e6-n100-g450m | 8,510,700 | 4.9 % | 8,811,700 | 5.7 % | +3.5 % (≤ spread) |
+| p8 | s1e6-nmix-g450m | 4,246,374 | 9.8 % | 4,436,476 | 1.3 % | +4.5 % (≤ spread) |
+| p8 | s1e7-n100-g450m | 7,764,232 | 1.7 % | 8,270,465 | 5.8 % | **+6.5 %** |
+| t16 | s1e6-n1-g450m | 188,611 | 0.2 % | 189,224 | 0.9 % | +0.3 % (noise) |
+| t16 | s1e6-n100-g450m | 7,889,119 | 3.3 % | 8,344,368 | 2.6 % | **+5.8 %** |
+| t16 | s1e6-nmix-g450m | 4,587,963 | 0.8 % | 4,878,323 | 2.1 % | **+6.3 %** |
+| t16 | s1e7-n100-g450m | 7,476,074 | 1.8 % | 7,973,003 | 1.7 % | **+6.6 %** |
+
+Preliminary K=3 p8: N=100 +5.4 % (0.8/0.9 %), 1e7 +4.4 % (1.2/0.7 %), mix +7.1 %
+(0.6/1.1 %), every candidate above every baseline.
