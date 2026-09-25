@@ -1,0 +1,195 @@
+{
+  "bench": "lean-bench",
+  "version": 1,
+  "cpus_available": 8,
+  "threads": 8,
+  "runs": 3,
+  "warmup_runs": 1,
+  "blocks_per_run": 3,
+  "seed": 1,
+  "states": [
+    {
+      "accounts": 1000000,
+      "build_s": 0.069946426,
+      "rss_mb": 130.19140625
+    }
+  ],
+  "scenarios": [
+    {
+      "scenario": "s1e6-n1-g450m",
+      "accounts": 1000000,
+      "fanout": "1",
+      "budget_gas": 450000000,
+      "threads": 8,
+      "blocks_per_run": 3,
+      "runs": 3,
+      "warmup_runs": 1,
+      "txs_per_block": 17307.0,
+      "payments_per_block": 17307.0,
+      "bytes_per_block": 1799980.0,
+      "fullness": 0.99996,
+      "corpus_cached": true,
+      "corpus_load_s": 0.003898552,
+      "ns_per_block": {
+        "frame_decode": 4772907.666666667,
+        "recover_parallel": 71740649.33333333,
+        "recover_serial": 506783552.0,
+        "execute": 11061679.333333334,
+        "apply": 2434967.0,
+        "process_block": 87802536.33333333,
+        "total": 90237503.33333333
+      },
+      "payments_per_s": 191793.870183539,
+      "tx_per_s": 191793.870183539,
+      "blocks_per_s": 11.081866885279887,
+      "payments_per_s_serial_recovery": 32959.38733894092,
+      "tx_per_s_serial_recovery": 32959.38733894092,
+      "peak_rss_mb": 186.27734375,
+      "hotspots": [
+        {
+          "function": "framing walk (engine::scan)",
+          "ns_per_block": 99944.0,
+          "pct": 0.019116832374540017
+        },
+        {
+          "function": "commitment keccak (framing::commitment_of_wire)",
+          "ns_per_block": 3138262.0,
+          "pct": 0.6002724385794915
+        },
+        {
+          "function": "tx decode (LeanTx::parse_after_type)",
+          "ns_per_block": 285037.0,
+          "pct": 0.05452057701854801
+        },
+        {
+          "function": "tx hash keccak (engine::decode_one)",
+          "ns_per_block": 4330815.0,
+          "pct": 0.8283785359815848
+        },
+        {
+          "function": "signing hash: body re-encode + keccak (LeanTx::signing_hash)",
+          "ns_per_block": 2247876.0,
+          "pct": 0.4299634664487264
+        },
+        {
+          "function": "ecrecover (secp256k1 recover_ecdsa)",
+          "ns_per_block": 499296665.0,
+          "pct": 95.5031882851583
+        },
+        {
+          "function": "pubkey -> address keccak (pubkey_to_address)",
+          "ns_per_block": 2212049.0,
+          "pct": 0.4231106413318345
+        },
+        {
+          "function": "execute (engine::execute, whole)",
+          "ns_per_block": 9778157.0,
+          "pct": 1.870321262916584
+        },
+        {
+          "function": "  of which: state lookups (FlatState::get)",
+          "ns_per_block": 2335114.0,
+          "pct": 0.4466499531081569
+        },
+        {
+          "function": "  of which: write-set sort",
+          "ns_per_block": 205619.0,
+          "pct": 0.03932986428420459
+        },
+        {
+          "function": "apply (FlatState insert)",
+          "ns_per_block": 1417474.0,
+          "pct": 0.271127960190394
+        }
+      ]
+    },
+    {
+      "scenario": "s1e6-n100-g450m",
+      "accounts": 1000000,
+      "fanout": "100",
+      "budget_gas": 450000000,
+      "threads": 8,
+      "blocks_per_run": 3,
+      "runs": 3,
+      "warmup_runs": 1,
+      "txs_per_block": 863.0,
+      "payments_per_block": 86300.0,
+      "bytes_per_block": 2482040.0,
+      "fullness": 0.9991622222222222,
+      "corpus_cached": true,
+      "corpus_load_s": 0.001335345,
+      "ns_per_block": {
+        "frame_decode": 5228766.666666667,
+        "recover_parallel": 4545338.0,
+        "recover_serial": 29768934.0,
+        "execute": 31361592.0,
+        "apply": 6285173.0,
+        "process_block": 41800142.0,
+        "total": 48047638.666666664
+      },
+      "payments_per_s": 1796134.0535111695,
+      "tx_per_s": 17961.340535111696,
+      "blocks_per_s": 20.812677329214015,
+      "payments_per_s_serial_recovery": 1186909.3770576506,
+      "tx_per_s_serial_recovery": 11869.093770576506,
+      "peak_rss_mb": 210.80078125,
+      "hotspots": [
+        {
+          "function": "framing walk (engine::scan)",
+          "ns_per_block": 3346.0,
+          "pct": 0.004353412357092018
+        },
+        {
+          "function": "commitment keccak (framing::commitment_of_wire)",
+          "ns_per_block": 4336715.0,
+          "pct": 5.64241143759304
+        },
+        {
+          "function": "tx decode (LeanTx::parse_after_type)",
+          "ns_per_block": 152032.0,
+          "pct": 0.1978057344511099
+        },
+        {
+          "function": "tx hash keccak (engine::decode_one)",
+          "ns_per_block": 4520171.0,
+          "pct": 5.8811022975400435
+        },
+        {
+          "function": "signing hash: body re-encode + keccak (LeanTx::signing_hash)",
+          "ns_per_block": 4585940.0,
+          "pct": 5.966673002056955
+        },
+        {
+          "function": "ecrecover (secp256k1 recover_ecdsa)",
+          "ns_per_block": 24730845.0,
+          "pct": 32.176798034766094
+        },
+        {
+          "function": "pubkey -> address keccak (pubkey_to_address)",
+          "ns_per_block": 41672.0,
+          "pct": 0.05421858928414184
+        },
+        {
+          "function": "execute (engine::execute, whole)",
+          "ns_per_block": 32089134.0,
+          "pct": 41.75051777763946
+        },
+        {
+          "function": "  of which: state lookups (FlatState::get)",
+          "ns_per_block": 5869741.0,
+          "pct": 7.637000299560568
+        },
+        {
+          "function": "  of which: write-set sort",
+          "ns_per_block": 675073.0,
+          "pct": 0.8783237119363957
+        },
+        {
+          "function": "apply (FlatState insert)",
+          "ns_per_block": 6399393.0,
+          "pct": 8.326119714312062
+        }
+      ]
+    }
+  ]
+}

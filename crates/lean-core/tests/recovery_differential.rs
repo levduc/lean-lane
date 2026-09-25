@@ -1,19 +1,38 @@
-//! The consensus-critical gate for parallel recovery: `decode_block_txs`
-//! (rayon) must return the IDENTICAL item vector — order, skips, senders,
-//! hashes — as a plain serial decode, on mixed-N blocks with invalid entries
-//! interleaved. A single divergence here is a chain split.
+//! The consensus-critical gate for the engine's decode + recovery: parallel
+//! AND serial `lean_core::recover_txs` must return the IDENTICAL item vector —
+//! order, skips, senders, hashes — as the EIP-2718 envelope path the pool
+//! uses (`ArcTxEnvelope::decode_2718` + `recover_signer`, one tx at a time),
+//! on mixed-N blocks with invalid entries interleaved. A single divergence
+//! here is a chain split.
 
-mod common;
-
+use alloy_consensus::transaction::SignerRecoverable;
 use alloy_eips::{Decodable2718, Encodable2718};
 use alloy_primitives::{Address, B256};
-use common::sk;
-use lean_lane_node::node::decode_block_txs as decode_block_txs_parallel;
+use lean_core::{EngineCtx, RecoveredTx};
 use lean_native::envelope::{current_lane_domain, ArcTxEnvelope, LeanSigned};
 use lean_native::{LeanTx, Output};
-use reth_primitives_traits::SignerRecoverable;
+use secp256k1::SecretKey;
 
-/// The serial oracle: one tx at a time, same skips.
+fn sk(i: u64) -> SecretKey {
+    let mut b = [0u8; 32];
+    b[..8].copy_from_slice(&(i + 1).to_be_bytes());
+    b[31] = 1;
+    SecretKey::from_slice(&b).unwrap()
+}
+
+fn ctx(parallel: bool) -> EngineCtx {
+    EngineCtx::new(1338, Address::with_last_byte(0xbe)).with_parallel_recovery(parallel)
+}
+
+fn decode_block_txs_parallel(txs: &[Vec<u8>]) -> Vec<RecoveredTx> {
+    lean_core::recover_txs(txs, &ctx(true))
+}
+
+fn decode_block_txs_engine_serial(txs: &[Vec<u8>]) -> Vec<RecoveredTx> {
+    lean_core::recover_txs(txs, &ctx(false))
+}
+
+/// The oracle: the envelope path, one tx at a time, same skips.
 fn decode_block_txs_serial(txs: &[Vec<u8>]) -> Vec<(Address, LeanTx, B256)> {
     let mut items = Vec::with_capacity(txs.len());
     for bytes in txs {
@@ -81,6 +100,11 @@ fn parallel_recovery_identical_on_mixed_block_with_invalid_entries() {
     let txs = mixed_block_with_invalid(40); // 200 valid + ~114 invalid entries
     let serial = decode_block_txs_serial(&txs);
     let parallel = decode_block_txs_parallel(&txs);
+    assert_eq!(
+        decode_block_txs_engine_serial(&txs),
+        parallel,
+        "engine modes diverged"
+    );
     assert_eq!(serial.len(), parallel.len(), "item count diverged");
     for (i, (s, p)) in serial.iter().zip(parallel.iter()).enumerate() {
         assert_eq!(s.0, p.0, "sender diverged at item {i}");
@@ -95,6 +119,7 @@ fn parallel_recovery_identical_on_all_invalid_and_empty_blocks() {
     let all_bad: Vec<Vec<u8>> = vec![vec![0xff; 30], Vec::new(), vec![0x02, 0x01]];
     assert_eq!(decode_block_txs_serial(&all_bad).len(), 0);
     assert_eq!(decode_block_txs_parallel(&all_bad).len(), 0);
+    assert_eq!(decode_block_txs_engine_serial(&all_bad).len(), 0);
     let empty: Vec<Vec<u8>> = Vec::new();
     assert_eq!(decode_block_txs_serial(&empty).len(), 0);
     assert_eq!(decode_block_txs_parallel(&empty).len(), 0);
@@ -116,4 +141,24 @@ fn corrupted_sig_agrees_between_paths() {
     if let (Some(a), Some(b)) = (s.first(), p.first()) {
         assert_eq!(a.0, b.0, "recovered (wrong) sender must be identical");
     }
+}
+
+/// EIP-2718 `decode_2718` ignores bytes after a complete tx, and the tx hash
+/// covers the consumed prefix only. The engine must match that exactly —
+/// including in which entries it keeps.
+#[test]
+fn trailing_bytes_inside_an_entry_match_the_envelope_path() {
+    let mut long = signed_fanout(11, 0, 3);
+    let clean = long.clone();
+    long.extend_from_slice(&[0xab; 9]);
+    let txs = vec![long, clean.clone(), vec![0x50], vec![0x50; 3]];
+    let oracle = decode_block_txs_serial(&txs);
+    for got in [
+        decode_block_txs_parallel(&txs),
+        decode_block_txs_engine_serial(&txs),
+    ] {
+        assert_eq!(got, oracle);
+    }
+    assert_eq!(oracle.len(), 2);
+    assert_eq!(oracle[0].2, oracle[1].2, "hash of the consumed prefix");
 }

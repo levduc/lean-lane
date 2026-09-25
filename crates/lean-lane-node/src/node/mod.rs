@@ -5,16 +5,15 @@
 //! `docs/integration.md`) plus node-to-node gossip and backfill.
 
 use crate::chain::{genesis_commitment, BlockLog, LeanBlock};
-use crate::exec::{apply_block, execute, Delta};
 use crate::metrics::{rss_mb, AnchorPath, Metrics, PathCell};
 use crate::pool::{ArcPooledTx, LanePool};
 use crate::provider::LeanProvider;
-use crate::state::{Acct, FlatState};
+use crate::state::{Acct, FlatState, Snapshots};
 use alloy_consensus::Transaction as _;
 use alloy_eips::eip2718::Decodable2718;
 use alloy_primitives::{Address, B256, U256};
+use lean_core::{Delta, EngineCtx};
 use lean_native::envelope::{set_lane_chain_id, ArcTxEnvelope, LEAN_TX_TYPE};
-use lean_native::LeanTx;
 use reth_primitives_traits::SignerRecoverable;
 use reth_transaction_pool::{
     PoolTransaction, TransactionOrigin, TransactionPool, TransactionPoolExt,
@@ -110,6 +109,9 @@ impl Default for Config {
 /// await.
 pub struct LaneNode {
     pub cfg: Config,
+    /// The engine context every execution path runs under (chain id / lane
+    /// domain, beneficiary, parallel recovery on).
+    pub engine: EngineCtx,
     pub pool: LanePool,
     pub provider: LeanProvider,
     pub state: Mutex<FlatState>,
@@ -206,7 +208,7 @@ fn replay_onto(
     state: &mut FlatState,
     log: &mut BlockLog,
     snap: (B256, u64, u64),
-    beneficiary: Address,
+    engine: &EngineCtx,
 ) -> std::io::Result<Replayed> {
     let (mut head, mut blocks, mut txs) = (snap, 0u64, 0u64);
     let mut by_commitment = std::collections::HashMap::new();
@@ -215,9 +217,9 @@ fn replay_onto(
         if block.number <= snap.1 {
             return;
         }
-        let items = decode_block_txs(&block.txs);
+        let items = lean_core::recover_txs(&block.txs, engine);
         txs += items.len() as u64;
-        apply_block(state, &items, beneficiary);
+        lean_core::apply_block(state, &items, engine);
         head = (block.commitment, block.number, block.timestamp_ms);
         blocks += 1;
     })?;
@@ -239,10 +241,10 @@ impl LaneNode {
                 None => (FlatState::default(), genesis_commitment(cfg.chain_id), 0, 0),
             };
         let mut log = BlockLog::open(&cfg.datadir.join("blocks.log"), cfg.fsync)?;
-        let beneficiary = cfg.beneficiary;
+        let engine = EngineCtx::new(cfg.chain_id, cfg.beneficiary);
         let snap = (snap_commitment, snap_number, snap_ts);
         let (mut head, mut replayed_blocks, mut replayed_txs, mut by_commitment) =
-            replay_onto(&mut state, &mut log, snap, beneficiary)?;
+            replay_onto(&mut state, &mut log, snap, &engine)?;
 
         // SNAPSHOT AHEAD OF THE LOG (only reachable with `fsync` off, which
         // fsyncs the snapshot but not the append — see `BlockLog::append`).
@@ -274,7 +276,7 @@ impl LaneNode {
             state = from;
             snap_number = at.1;
             (head, replayed_blocks, replayed_txs, by_commitment) =
-                replay_onto(&mut state, &mut log, at, beneficiary)?;
+                replay_onto(&mut state, &mut log, at, &engine)?;
         }
         let recovery = RecoveryReport {
             snapshot_number: snap_number,
@@ -291,6 +293,7 @@ impl LaneNode {
         Ok((
             Self {
                 cfg,
+                engine,
                 pool,
                 provider,
                 state: Mutex::new(state),
@@ -391,32 +394,4 @@ pub struct RecoveryReport {
     pub replayed_blocks: u64,
     pub replayed_txs: u64,
     pub elapsed: std::time::Duration,
-}
-
-/// Decode a block's raw tx list back into recovered items (replay path: one
-/// decode + one ecrecover per tx). Invalid bytes are skipped — a torn/bad tx
-/// in an appended block cannot occur (we wrote it), but total-STF posture is
-/// kept everywhere.
-///
-/// Decode + ecrecover in parallel on the rayon pool, keeping block order
-/// (indexed par_iter + collect preserves it; skipped entries collapse via
-/// flatten). Per-signature work stays off the tokio runtime threads.
-pub fn decode_block_txs(txs: &[Vec<u8>]) -> Vec<(Address, LeanTx, B256)> {
-    use rayon::prelude::*;
-    txs.par_iter()
-        .map(|bytes| {
-            let env = ArcTxEnvelope::decode_2718(&mut bytes.as_slice()).ok()?;
-            let signer = env.recover_signer().ok()?;
-            match env {
-                ArcTxEnvelope::Lean(lean) => {
-                    let hash = *lean.hash();
-                    Some((signer, lean.tx().clone(), hash))
-                }
-                _ => None,
-            }
-        })
-        .collect::<Vec<_>>()
-        .into_iter()
-        .flatten()
-        .collect()
 }

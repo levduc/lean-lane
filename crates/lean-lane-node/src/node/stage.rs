@@ -152,7 +152,7 @@ impl LaneNode {
         let block = LeanBlock::from_wire_bytes_with_header(bytes, hdr)?;
         t.decode_ms = since(t_decode);
         let t_recover = Instant::now();
-        let items = decode_block_txs(&block.txs);
+        let items = lean_core::recover_txs(&block.txs, &self.engine);
         t.recover_ms = since(t_recover);
         // ATOMIC (head, state). A staged entry is a post-state PLUS the parent
         // it claims to descend from, and promotion trusts that pairing rather
@@ -181,7 +181,7 @@ impl LaneNode {
             }
             let state = self.state.lock().await;
             drop(head);
-            (head_c, execute(&state, &items, self.cfg.beneficiary))
+            (head_c, lean_core::execute(&*state, &items, &self.engine))
         };
         let commitment = block.commitment;
         let entry = StagedBlock {

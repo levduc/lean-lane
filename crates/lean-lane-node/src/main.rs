@@ -4,7 +4,7 @@ use alloy_primitives::Address;
 use clap::{Parser, Subcommand};
 use lean_lane_node::node::{Config, LaneNode};
 use lean_lane_node::rpc;
-use lean_lane_node::state::Acct;
+use lean_lane_node::state::{Acct, Snapshots};
 use std::sync::Arc;
 
 #[derive(Parser)]

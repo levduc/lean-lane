@@ -99,7 +99,7 @@ impl LaneNode {
                 continue;
             }
             let _work = self.begin_work(commitment);
-            let items = decode_block_txs(&block.txs);
+            let items = lean_core::recover_txs(&block.txs, &self.engine);
             self.commit_block(block, items)
                 .await
                 .map_err(|e| e.to_string())?;
@@ -119,7 +119,7 @@ impl LaneNode {
             if nb.number != hn + 1 || nb.parent != hc {
                 break;
             }
-            let items = decode_block_txs(&nb.txs);
+            let items = lean_core::recover_txs(&nb.txs, &self.engine);
             self.commit_block(nb, items)
                 .await
                 .map_err(|e| e.to_string())?;

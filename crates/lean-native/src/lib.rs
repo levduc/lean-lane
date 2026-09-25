@@ -19,8 +19,9 @@
 //! ~1.8e28 wei — both fine for a payment lane; documented trade, saves
 //! 8B/output vs u128 wei.
 //!
-//! Block execution semantics (implemented by the node, `lean-lane-node`'s
-//! `exec::execute`). The state transition is TOTAL:
+//! Block execution semantics (implemented by the engine, `lean-core`'s
+//! `execute`, which every node path runs through). The state transition is
+//! TOTAL:
 //! * Whole-tx atomic: any invalidity (nonce mismatch, output-sum overflow,
 //!   insufficient funds) makes the ENTIRE tx a no-op; state untouched. The
 //!   BLOCK stays valid — an invalid tx never rejects the block that carries

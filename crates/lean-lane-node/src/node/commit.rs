@@ -66,13 +66,13 @@ impl LaneNode {
     pub(super) async fn commit_block(
         &self,
         block: LeanBlock,
-        items: Vec<(Address, LeanTx, B256)>,
+        items: Vec<lean_core::RecoveredTx>,
     ) -> eyre::Result<()> {
         let gate = self.commit_gate.lock().await;
         if self.link_to_head(&block).await? == Link::AlreadyCanonical {
             return Ok(());
         }
-        let delta = execute(&*self.state.lock().await, &items, self.cfg.beneficiary);
+        let delta = lean_core::execute(&*self.state.lock().await, &items, &self.engine);
         self.append(&gate, &block, delta).await
     }
 
@@ -107,7 +107,7 @@ impl LaneNode {
         mut delta: Delta,
     ) -> eyre::Result<()> {
         let mut state = self.state.lock().await;
-        delta.apply_to(&mut state);
+        lean_core::apply(&mut state, &delta);
         for (a, acct) in &delta.writes {
             self.provider.upsert(*a, *acct);
         }

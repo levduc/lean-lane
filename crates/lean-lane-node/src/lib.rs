@@ -7,7 +7,6 @@
 
 pub mod blockreader;
 pub mod chain;
-pub mod exec;
 pub mod metrics;
 pub mod node;
 pub mod pool;
