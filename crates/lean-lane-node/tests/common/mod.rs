@@ -4,7 +4,7 @@
 use alloy_primitives::{Address, B256};
 use lean_lane_node::chain::LeanBlock;
 use lean_lane_node::node::{Config, LaneNode, NewBlockOutcome};
-use lean_lane_node::state::Acct;
+use lean_lane_node::state::{Acct, Snapshots};
 use lean_native::envelope::{current_lane_domain, LeanSigned};
 use lean_native::{lean_fee, LeanTx, Output, AMOUNT_UNIT};
 use secp256k1::SecretKey;

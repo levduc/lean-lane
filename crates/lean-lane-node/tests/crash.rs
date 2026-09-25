@@ -4,7 +4,6 @@
 
 mod common;
 
-use alloy_primitives::Address;
 use common::*;
 use lean_lane_node::node::{Config, LaneNode, NewBlockOutcome};
 use std::io::Write;
@@ -86,10 +85,10 @@ async fn total_stf_noop_never_halts() {
     let stale = signed(500, 0, 1, 5);
     let mut state = n.state.lock().await;
     let before = state.digest();
-    let out = lean_lane_node::exec::apply_block(
+    let out = lean_core::apply_block(
         &mut state,
         &[(sender(500), stale.tx().clone(), *stale.hash())],
-        Address::with_last_byte(0xbe),
+        &n.engine,
     );
     assert_eq!((out.applied, out.noops), (0, 1));
     assert_eq!(state.digest(), before, "a no-op leaves state untouched");

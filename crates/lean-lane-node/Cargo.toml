@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 lean-native = { path = "../lean-native" }
+lean-core = { path = "../lean-core" }
 alloy-primitives.workspace = true
 alloy-consensus.workspace = true
 alloy-eips.workspace = true
@@ -29,7 +30,6 @@ serde_json.workspace = true
 base64 = "0.22"
 eyre.workspace = true
 secp256k1 = { workspace = true, features = ["std", "recovery", "global-context", "rand"] }
-rayon.workspace = true
 rand.workspace = true
 clap = { workspace = true, features = ["derive", "env"] }
 tracing = { workspace = true, features = ["std"] }

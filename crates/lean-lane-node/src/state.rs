@@ -3,48 +3,48 @@
 //! Snapshots are full serializations of the map tagged with the block
 //! commitment they correspond to; recovery = newest snapshot + log replay.
 
-use alloy_primitives::{keccak256, Address, B256};
+use alloy_primitives::{Address, B256};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Acct {
-    pub nonce: u64,
-    pub balance: u128,
-}
+pub use lean_core::{Acct, FlatState};
 
-#[derive(Clone, Debug, Default)]
-pub struct FlatState {
-    pub accounts: HashMap<Address, Acct>,
-}
-
-impl FlatState {
-    pub fn get(&self, a: &Address) -> Acct {
-        self.accounts.get(a).copied().unwrap_or_default()
-    }
-
-    pub fn credit(&mut self, a: Address, wei: u128) {
-        self.accounts.entry(a).or_default().balance += wei;
-    }
-
-    /// Deterministic digest over sorted entries — for crash/recovery equality
-    /// checks (NOT a consensus commitment).
-    pub fn digest(&self) -> B256 {
-        let mut entries: Vec<(&Address, &Acct)> = self.accounts.iter().collect();
-        entries.sort_by_key(|(a, _)| **a);
-        let mut buf = Vec::with_capacity(entries.len() * 44);
-        for (a, acct) in entries {
-            buf.extend_from_slice(a.as_slice());
-            buf.extend_from_slice(&acct.nonce.to_le_bytes());
-            buf.extend_from_slice(&acct.balance.to_le_bytes());
-        }
-        keccak256(&buf)
-    }
-
+/// Snapshot I/O for the engine's `FlatState` (the engine itself never
+/// touches a filesystem).
+pub trait Snapshots: Sized {
     /// Serialize the full map with the commitment + number it corresponds to.
     /// Written to a tmp file then renamed (atomic on the same filesystem).
-    pub fn write_snapshot(
+    fn write_snapshot(
+        &self,
+        dir: &Path,
+        commitment: B256,
+        number: u64,
+        timestamp_ms: u64,
+    ) -> std::io::Result<PathBuf>;
+
+    /// Load the newest complete snapshot in `dir`.
+    /// Returns (state, commitment, number, timestamp_ms); None if no snapshot exists.
+    fn load_newest_snapshot(dir: &Path) -> std::io::Result<Option<(Self, B256, u64, u64)>> {
+        Self::load_newest_snapshot_upto(dir, u64::MAX)
+    }
+
+    /// As `load_newest_snapshot`, but never above block `ceiling`.
+    ///
+    /// Snapshots are fsync'd (tmp + `sync_all` + rename) while the block log
+    /// with `--no-fsync` is not, so a crash can leave a snapshot NEWER than
+    /// the last intact log record. Recovering from it would strand the node
+    /// above a permanent hole in its own log; `LaneNode::open` instead asks for
+    /// the newest snapshot the log can actually continue from. Snapshots are
+    /// never pruned, so that is normally the previous one.
+    fn load_newest_snapshot_upto(
+        dir: &Path,
+        ceiling: u64,
+    ) -> std::io::Result<Option<(Self, B256, u64, u64)>>;
+}
+
+impl Snapshots for FlatState {
+    fn write_snapshot(
         &self,
         dir: &Path,
         commitment: B256,
@@ -70,22 +70,7 @@ impl FlatState {
         Ok(fin)
     }
 
-    /// Load the newest complete snapshot in `dir`, returning
-    /// (state, commitment, block number). None if no snapshot exists.
-    /// Returns (state, commitment, number, timestamp_ms).
-    pub fn load_newest_snapshot(dir: &Path) -> std::io::Result<Option<(Self, B256, u64, u64)>> {
-        Self::load_newest_snapshot_upto(dir, u64::MAX)
-    }
-
-    /// As `load_newest_snapshot`, but never above block `ceiling`.
-    ///
-    /// Snapshots are fsync'd (tmp + `sync_all` + rename) while the block log
-    /// with `--no-fsync` is not, so a crash can leave a snapshot NEWER than
-    /// the last intact log record. Recovering from it would strand the node
-    /// above a permanent hole in its own log; `LaneNode::open` instead asks for
-    /// the newest snapshot the log can actually continue from. Snapshots are
-    /// never pruned, so that is normally the previous one.
-    pub fn load_newest_snapshot_upto(
+    fn load_newest_snapshot_upto(
         dir: &Path,
         ceiling: u64,
     ) -> std::io::Result<Option<(Self, B256, u64, u64)>> {

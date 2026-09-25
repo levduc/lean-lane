@@ -8,7 +8,7 @@ publish = false
 
 [dependencies]
 alloy-primitives.workspace = true
-alloy-consensus = { workspace = true, features = ["serde"] }
+alloy-consensus = { workspace = true, features = ["serde", "k256"] }
 alloy-eips.workspace = true
 alloy-rlp.workspace = true
 serde.workspace = true

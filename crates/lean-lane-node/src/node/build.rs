@@ -70,7 +70,7 @@ impl LaneNode {
             if head.0 == head_c {
                 let state = self.state.lock().await;
                 drop(head);
-                Some(execute(&state, &items, self.cfg.beneficiary))
+                Some(lean_core::execute(&*state, &items, &self.engine))
             } else {
                 None
             }
