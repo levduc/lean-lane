@@ -296,53 +296,42 @@ pub(crate) fn execute<S: StateView + ?Sized>(
     } else {
         credits.sort_unstable_by_key(|c| c.key);
     }
-    // distinct recipients (+ the beneficiary, credited `fees`, always
-    // present), ascending: (key, wei)
+    // 4. one merge, in address order, of senders ∪ recipient runs (summed)
+    //    ∪ the beneficiary (credited `fees`, always written). An account that
+    //    is not a sender starts from its block-start value, read in step 5;
+    //    until then it holds just its credit and is flagged in `from_state`.
     let ben = AKey::of(&beneficiary);
-    let mut recv: Vec<(AKey, u128)> = Vec::with_capacity(credits.len().min(outputs) + 1);
-    let mut ben_done = false;
-    let mut at = 0;
-    while at < credits.len() {
-        let k = credits[at].key;
-        if !ben_done && ben < k {
-            recv.push((ben, fees));
-            ben_done = true;
+    let mut writes: Vec<(Address, Acct)> = Vec::with_capacity(senders.len() + credits.len() + 1);
+    let mut from_state: Vec<bool> = Vec::with_capacity(senders.len() + credits.len() + 1);
+    let mut ben_pending = true;
+    let (mut si, mut ci) = (0, 0);
+    loop {
+        let mut k = match (senders.get(si), credits.get(ci)) {
+            (Some(p), Some(c)) => p.key.min(c.key),
+            (Some(p), None) => p.key,
+            (None, Some(c)) => c.key,
+            (None, None) if ben_pending => ben,
+            (None, None) => break,
+        };
+        if ben_pending && ben < k {
+            k = ben;
         }
         let mut wei = 0u128;
-        while at < credits.len() && credits[at].key == k {
-            wei += credits[at].amount as u128 * AMOUNT_UNIT;
-            at += 1;
+        while ci < credits.len() && credits[ci].key == k {
+            wei += credits[ci].amount as u128 * AMOUNT_UNIT;
+            ci += 1;
         }
-        if k == ben {
+        if ben_pending && k == ben {
             wei += fees;
-            ben_done = true;
+            ben_pending = false;
         }
-        recv.push((k, wei));
-    }
-    if !ben_done {
-        recv.push((ben, fees));
-    }
-    drop(credits);
-
-    // 4. merge senders and recipients in address order; a recipient that is
-    //    not a sender starts from its block-start value (read in step 5)
-    let mut writes: Vec<(Address, Acct)> = Vec::with_capacity(senders.len() + recv.len());
-    let mut fill: Vec<usize> = Vec::with_capacity(recv.len());
-    let (mut si, mut ri) = (0, 0);
-    while si < senders.len() || ri < recv.len() {
-        let take_s = ri == recv.len() || (si < senders.len() && senders[si].key <= recv[ri].0);
-        if take_s {
-            let s = &senders[si];
-            let mut acct = s.acct;
-            if ri < recv.len() && recv[ri].0 == s.key {
-                acct.balance += recv[ri].1;
-                ri += 1;
-            }
-            writes.push((s.key.addr(), acct));
+        if si < senders.len() && senders[si].key == k {
+            let mut acct = senders[si].acct;
+            acct.balance += wei;
+            writes.push((k.addr(), acct));
+            from_state.push(false);
             si += 1;
         } else {
-            let (k, wei) = recv[ri];
-            fill.push(writes.len());
             writes.push((
                 k.addr(),
                 Acct {
@@ -350,39 +339,27 @@ pub(crate) fn execute<S: StateView + ?Sized>(
                     balance: wei,
                 },
             ));
-            ri += 1;
+            from_state.push(true);
         }
     }
+    drop(credits);
 
-    // 5. block-start values of the recipient-only accounts: balance = state + credit
-    let read = |w: &mut (Address, Acct)| {
-        let base = state.get(&w.0);
-        w.1 = Acct {
-            nonce: base.nonce,
-            balance: {
-                let mut b = base.balance;
-                b += w.1.balance;
-                b
-            },
-        };
+    // 5. block-start values of the flagged accounts: balance = state + credit
+    let read = |(w, &flag): (&mut (Address, Acct), &bool)| {
+        if flag {
+            let mut acct = state.get(&w.0);
+            acct.balance += w.1.balance;
+            w.1 = acct;
+        }
     };
     if par {
-        // `fill` is ascending, so the writes it names are disjoint
-        let mut rest: &mut [(Address, Acct)] = &mut writes;
-        let mut taken = 0;
-        let mut refs: Vec<&mut (Address, Acct)> = Vec::with_capacity(fill.len());
-        for &i in &fill {
-            let (_, tail) = std::mem::take(&mut rest).split_at_mut(i - taken);
-            let (one, tail) = tail.split_first_mut().unwrap();
-            refs.push(one);
-            rest = tail;
-            taken = i + 1;
-        }
-        refs.into_par_iter().for_each(|w| read(w));
+        writes
+            .par_iter_mut()
+            .zip(from_state.par_iter())
+            .with_min_len(512)
+            .for_each(read);
     } else {
-        for &i in &fill {
-            read(&mut writes[i]);
-        }
+        writes.iter_mut().zip(from_state.iter()).for_each(read);
     }
 
     Delta {

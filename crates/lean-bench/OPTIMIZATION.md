@@ -177,3 +177,50 @@ duplicate-carrying deltas; `AccountMap` vs `HashMap`). State build at 1e7 unchan
 | t16 | s1e7-n100-g450m | 5,383,748 | 1.4 % | 6,765,644 | 0.6 % | **+25.7 %** |
 
 apply at 1e7 (p8): 4.67 → 1.73 ms.
+
+### A6 — `execute`: per-shard parallel credit sort + merge + state reads — REJECTED (inconclusive)
+
+Idea: bucket the applied credits by account-map shard (rayon `fold`), then per shard in
+parallel: sort, sum runs, merge with that shard's senders and the beneficiary, read the
+recipient-only block-start values; concatenate the 64 per-shard write lists. Gate
+correct. Base = A7.
+
+| mode | scenario | base median | spread | cand median | spread | delta |
+|---|---|--:|--:|--:|--:|--:|
+| p8 | s1e6-n1-g450m | 174,939 | 28.2 % | 178,129 | 28.0 % | +1.8 % (noise) |
+| p8 | s1e6-n100-g450m | 7,352,653 | 1.7 % | 7,628,105 | 3.6 % | +3.7 % (≈ spread) |
+| p8 | s1e6-nmix-g450m | 4,049,556 | 10.1 % | 3,975,471 | 1.6 % | −1.8 % |
+| p8 | s1e7-n100-g450m | 6,983,808 | 2.9 % | 7,090,833 | 4.4 % | +1.5 % |
+| t16 | s1e6-n1-g450m | 183,756 | 0.8 % | 185,730 | 0.6 % | +1.1 % |
+| t16 | s1e6-n100-g450m | 6,602,710 | 2.8 % | 6,849,149 | 2.7 % | +3.7 % |
+| t16 | s1e6-nmix-g450m | 4,258,396 | 1.0 % | 4,136,058 | 1.2 % | **−2.9 %** |
+| t16 | s1e7-n100-g450m | 6,765,095 | 1.2 % | 6,548,650 | 3.4 % | −3.2 % |
+
+Why: execute's internal time fell (2.2 ms) but the extra 5.5 MB per-shard buffers +
+concat and 64×(fold pieces) allocations cost as much in fresh-page faults and frees. A
+side measurement found the allocator matters at this scale: glibc's trim/mmap
+thresholds re-fault ~31 MB of fresh pages per block iteration in this bench; with
+`GLIBC_TUNABLES=glibc.malloc.trim_threshold=1G:glibc.malloc.mmap_threshold=1G` minor
+faults drop 161k → 60k and N=100 gains ~+9 % with no code change (binary-level, not
+applied — see concerns). Reverted.
+
+### A8 — `execute`: one merge pass, flagged parallel state reads (fewer, smaller buffers) — ACCEPTED
+
+Idea: A1's tail built a `recv` list of summed recipients (4 MB at N=100), then merged it
+with the senders, then built a `fill` index list and a `Vec<&mut>` (0.7 MB each, serial)
+for the parallel state reads. Now a single merge walks senders ∪ credit runs ∪
+beneficiary straight into `writes`, flagging recipient-only rows in a `Vec<bool>`; the
+state reads are one `par_iter_mut().zip(flags)` pass. Gate correct. Base = A7.
+
+| mode | scenario | base median | spread | cand median | spread | delta |
+|---|---|--:|--:|--:|--:|--:|
+| p8 | s1e6-n1-g450m | 174,677 | 27.6 % | 174,849 | 28.5 % | +0.1 % (noise) |
+| p8 | s1e6-n100-g450m | 7,350,943 | 19.6 %¹ | 8,206,338 | 2.3 % | **+11.6 %** |
+| p8 | s1e6-nmix-g450m | 4,041,172 | 8.2 % | 4,128,652 | 2.0 % | +2.2 % (noise) |
+| p8 | s1e7-n100-g450m | 6,999,920 | 3.4 % | 7,588,016 | 1.4 % | **+8.4 %** |
+| t16 | s1e6-n1-g450m | 185,660 | 1.3 % | 184,402 | 0.6 % | −0.7 % (noise) |
+| t16 | s1e6-n100-g450m | 6,692,995 | 2.4 % | 7,658,893 | 3.0 % | **+14.4 %** |
+| t16 | s1e6-nmix-g450m | 4,244,451 | 0.9 % | 4,483,272 | 1.3 % | **+5.6 %** |
+| t16 | s1e7-n100-g450m | 6,734,601 | 1.5 % | 7,236,044 | 2.3 % | **+7.4 %** |
+
+¹ one low base invocation (6.0M); the other four were 7.30–7.37M.
