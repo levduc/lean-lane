@@ -1,0 +1,24 @@
+[package]
+name = "lean-bench"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Deterministic benchmark of the lean lane: engine-only ceiling (lean-core) over cached pre-signed corpora, plus an in-process end-to-end mode driving the real node."
+publish = false
+
+[[bin]]
+name = "lean-bench"
+path = "src/main.rs"
+
+[dependencies]
+lean-core = { path = "../lean-core" }
+lean-native = { path = "../lean-native" }
+lean-lane-node = { path = "../lean-lane-node" }
+alloy-primitives.workspace = true
+rayon.workspace = true
+secp256k1 = { workspace = true, features = ["std", "recovery", "global-context"] }
+clap = { workspace = true, features = ["derive"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, features = ["std"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync"] }
+eyre.workspace = true
