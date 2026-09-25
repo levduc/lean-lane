@@ -254,3 +254,27 @@ Focused re-run, K=7 (N=1 this time not bimodal under p8):
 ² the first alternation pair ran ~30 % fast for both binaries (a host turbo state); the
 other six pairs are within 2 %. Accepted for the consistent +2 % at N=1 (one fewer
 rayon pass and barrier, no intermediate `Vec<Decoded>`, no re-encode); neutral at N≥10.
+
+### A10 — `execute`: counting sort of the credits on the address's first byte, then per-bucket sorts — ACCEPTED (marginal)
+
+Idea: instrumenting A8's execute at N=100 (p8): collect 0.2 ms, `par_sort_unstable` of
+86k 32-byte credits 0.85 ms, merge 0.5 ms, parallel state reads 1.2 ms. Replace the
+sort by one counting pass + one placement pass into 256 first-byte buckets (bucket
+order = address order), then the buckets sorted independently on rayon. Gate correct.
+Base = A9.
+
+| mode | scenario | base median | spread | cand median | spread | delta |
+|---|---|--:|--:|--:|--:|--:|
+| p8 | s1e6-n1-g450m | 178,743 | 28.6 % | 179,244 | 28.9 % | +0.3 % (noise) |
+| p8 | s1e6-n100-g450m | 8,273,468 | 6.1 % | 8,576,918 | 4.1 % | +3.7 % (≤ spread) |
+| p8 | s1e6-nmix-g450m | 4,191,162 | 9.7 % | 4,215,076 | 5.3 % | +0.6 % (noise) |
+| p8 | s1e7-n100-g450m | 7,567,116 | 2.4 % | 7,724,809 | 2.8 % | +2.1 % (≤ spread) |
+| t16 | s1e6-n1-g450m | 188,120 | 0.3 % | 188,273 | 0.6 % | +0.1 % (noise) |
+| t16 | s1e6-n100-g450m | 7,660,563 | 2.7 % | 7,897,532 | 1.7 % | **+3.1 %** |
+| t16 | s1e6-nmix-g450m | 4,522,780 | 1.7 % | 4,582,837 | 0.9 % | +1.3 % (noise) |
+| t16 | s1e7-n100-g450m | 7,275,505 | 0.8 % | 7,540,729 | 1.8 % | **+3.6 %** |
+
+A preliminary K=3 p8 run was tighter: N=100 +3.5 % (spreads 0.6/0.6 %), 1e7 +2.7 %
+(1.1/0.4 %), mix +2.0 % (0.2/0.3 %) — every candidate above every baseline. Accepted
+on t16 N=100 and 1e7 clearing their spreads and the K=3 run; the gain is ~3 %, at the
+edge of what this protocol resolves.

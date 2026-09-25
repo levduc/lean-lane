@@ -322,20 +322,57 @@ pub(crate) fn execute<S: StateView + ?Sized>(
         fees += s.fees;
     }
 
-    // 3. credits of applied txs, sorted by recipient, summed per run
-    let mut credits: Vec<Credit> = Vec::with_capacity(outputs);
+    // 3. credits of applied txs, sorted by recipient: a counting sort on the
+    //    address's first byte (256 buckets, bucket order = address order),
+    //    then each bucket sorted on its own (in parallel)
+    let mut counts = [0usize; 256];
     for (i, (_, tx, _)) in items.iter().enumerate() {
         if applied_flags[i].load(Ordering::Relaxed) {
-            credits.extend(tx.outputs.iter().map(|o| Credit {
-                key: AKey::of(&o.to),
-                amount: o.amount,
-            }));
+            for o in &tx.outputs {
+                counts[o.to.0[0] as usize] += 1;
+            }
         }
     }
+    let mut next = [0usize; 256];
+    let mut sum = 0;
+    for (b, c) in counts.iter().enumerate() {
+        next[b] = sum;
+        sum += c;
+    }
+    let mut credits: Vec<Credit> = vec![
+        Credit {
+            key: AKey(0, 0, 0),
+            amount: 0
+        };
+        sum
+    ];
+    for (i, (_, tx, _)) in items.iter().enumerate() {
+        if applied_flags[i].load(Ordering::Relaxed) {
+            for o in &tx.outputs {
+                let b = o.to.0[0] as usize;
+                credits[next[b]] = Credit {
+                    key: AKey::of(&o.to),
+                    amount: o.amount,
+                };
+                next[b] += 1;
+            }
+        }
+    }
+    let mut buckets: Vec<&mut [Credit]> = Vec::with_capacity(256);
+    let mut rest: &mut [Credit] = &mut credits;
+    for c in counts {
+        let (bucket, tail) = std::mem::take(&mut rest).split_at_mut(c);
+        buckets.push(bucket);
+        rest = tail;
+    }
     if par {
-        credits.par_sort_unstable_by_key(|c| c.key);
+        buckets
+            .into_par_iter()
+            .for_each(|b| b.sort_unstable_by_key(|c| c.key));
     } else {
-        credits.sort_unstable_by_key(|c| c.key);
+        buckets
+            .into_iter()
+            .for_each(|b| b.sort_unstable_by_key(|c| c.key));
     }
     // 4. one merge, in address order, of senders ∪ recipient runs (summed)
     //    ∪ the beneficiary (credited `fees`, always written). An account that
