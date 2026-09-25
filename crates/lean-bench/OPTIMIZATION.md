@@ -88,3 +88,47 @@ others decode and recover. Serial mode unchanged. Base = A1.
 | t16 | s1e6-n100-g450m | 4,377,791 | 0.9 % | 4,594,418 | 1.2 % | **+4.9 %** |
 | t16 | s1e6-nmix-g450m | 2,952,937 | 1.3 % | 3,328,469 | 0.8 % | **+12.7 %** |
 | t16 | s1e7-n100-g450m | 3,596,963 | 1.3 % | 3,949,884 | 1.3 % | **+9.8 %** |
+
+### A4 — `FlatState` map on foldhash (`alloy_primitives::map::HashMap`) — REJECTED (slower)
+
+Idea: SipHash → foldhash (seeded, already in the dep graph). Needs one node line
+(`state.rs` snapshot load: `with_capacity_and_hasher`). Gate correct. Base = A3.
+
+| mode | scenario | base median | spread | cand median | spread | delta |
+|---|---|--:|--:|--:|--:|--:|
+| p8 | s1e6-n1-g450m | 170,938 | 28.2 % | 167,383 | 27.9 % | −2.1 % (noise) |
+| p8 | s1e6-n100-g450m | 4,850,734 | 1.7 % | 3,973,716 | 1.6 % | **−18.1 %** |
+| p8 | s1e6-nmix-g450m | 3,158,159 | 6.1 % | 2,792,149 | 4.9 % | **−11.6 %** |
+| p8 | s1e7-n100-g450m | 4,041,607 | 1.1 % | 3,108,454 | 1.3 % | **−23.1 %** |
+| t16 | s1e6-n100-g450m | 4,624,579 | 1.6 % | 3,823,029 | 1.2 % | **−17.3 %** |
+| t16 | s1e7-n100-g450m | 3,935,030 | 3.0 % | 3,049,969 | 1.4 % | **−22.5 %** |
+
+Why (standalone map microbench, 87k sorted-address updates, one core): lookups get
+2x faster (1e7: 8.3 → 3.9 ms) but `HashMap::insert` of an EXISTING key gets ~1.7x
+SLOWER (8.9 → 14.8 ms; `get_mut` + assign is 5.9 ms) — with both foldhash `fast` and
+`quality`, so not hash distribution; an insert-path codegen effect of the std map with
+foldhash's outlined >16-byte `write`. `apply` went 10.2 → 16.3 ms at 1e7. Reverted.
+
+### A4b — `FlatState` map on a small keyed address hasher (`AddressHasher`) — ACCEPTED
+
+Idea: a 30-line hasher specialised for 20-byte keys: two folded 64×64→128 multiplies of
+key-whitened input + one to finish (foldhash's construction, inlined), keys drawn per
+map instance from std's `RandomState`. NOT an unkeyed FxHash: recipient addresses are
+attacker-chosen (zero-amount outputs create accounts), so the persistent map must be
+keyed or a proposer could grind colliding addresses. Microbench at 1e7 (insert / get,
+ms per 87k): SipHash 8.9 / 8.3, foldhash 14.8 / 3.9, unkeyed FxHash (`FbBuildHasher`)
+4.4 / 2.9, **this 4.8 / 3.3**. Public type change: `FlatState::accounts` is now
+`lean_core::AccountMap` = `HashMap<Address, Acct, AddressHasherBuilder>` (all method
+calls unchanged; one node line: snapshot load uses `with_capacity_and_hasher`).
+Base = A3.
+
+| mode | scenario | base median | spread | cand median | spread | delta |
+|---|---|--:|--:|--:|--:|--:|
+| p8 | s1e6-n1-g450m | 170,069 | 29.3 % | 172,318 | 28.4 % | +1.3 % (noise) |
+| p8 | s1e6-n100-g450m | 4,809,091 | 2.3 % | 5,884,576 | 2.4 % | **+22.4 %** |
+| p8 | s1e6-nmix-g450m | 3,178,949 | 5.8 % | 3,558,130 | 8.5 % | **+11.9 %** |
+| p8 | s1e7-n100-g450m | 3,999,932 | 2.3 % | 5,247,523 | 1.1 % | **+31.2 %** |
+| t16 | s1e6-n1-g450m | 179,472 | 1.0 % | 180,005 | 1.6 % | +0.3 % (noise) |
+| t16 | s1e6-n100-g450m | 4,607,324 | 1.0 % | 5,516,430 | 1.7 % | **+19.7 %** |
+| t16 | s1e6-nmix-g450m | 3,361,712 | 2.5 % | 3,751,065 | 0.9 % | **+11.6 %** |
+| t16 | s1e7-n100-g450m | 3,948,914 | 1.1 % | 5,069,821 | 0.6 % | **+28.4 %** |

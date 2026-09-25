@@ -17,8 +17,8 @@ mod types;
 
 pub use framing::genesis_commitment;
 pub use types::{
-    Acct, BlockError, BlockHeader, BlockOutcome, Decoded, Delta, EngineCtx, FlatState, Framed,
-    Processed, RecoveredTx, StateView,
+    AccountMap, Acct, AddressHasher, AddressHasherBuilder, BlockError, BlockHeader, BlockOutcome,
+    Decoded, Delta, EngineCtx, FlatState, Framed, Processed, RecoveredTx, StateView,
 };
 
 use alloy_primitives::B256;

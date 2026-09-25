@@ -5,6 +5,7 @@
 use alloy_primitives::{keccak256, Address, B256};
 use lean_native::{lane_domain, LeanTx};
 use std::collections::HashMap;
+use std::hash::{BuildHasher, Hasher};
 
 /// One account of the flat state.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -13,11 +14,107 @@ pub struct Acct {
     pub balance: u128,
 }
 
+/// The account map of [`FlatState`]: std's `HashMap` keyed by address,
+/// hashed with [`AddressHasher`] instead of SipHash (2x cheaper inserts,
+/// 2.5x cheaper lookups into a 1e7-account map). Iteration order is
+/// unspecified either way (the digest sorts; snapshot order was already
+/// hash-map order).
+pub type AccountMap = HashMap<Address, Acct, AddressHasherBuilder>;
+
+/// Keyed hasher builder for [`AccountMap`]: four 64-bit keys drawn from
+/// std's `RandomState` (OS randomness) per map instance. Account addresses
+/// are attacker-chosen (any tx can credit any address, zero amounts
+/// included), so the state map must not use an unkeyed hash (FxHash): with
+/// secret per-node keys, colliding addresses cannot be precomputed. The
+/// strength is foldhash's ("minimally DoS-resistant", folded 64x64->128
+/// multiplies of key-whitened input) — not a cryptographic PRF, same as
+/// every fast keyed hasher.
+#[derive(Clone, Copy)]
+pub struct AddressHasherBuilder {
+    k: [u64; 4],
+}
+
+impl Default for AddressHasherBuilder {
+    fn default() -> Self {
+        let rs = std::collections::hash_map::RandomState::new();
+        Self {
+            k: [
+                rs.hash_one(0u64),
+                rs.hash_one(1u64),
+                rs.hash_one(2u64),
+                rs.hash_one(3u64),
+            ],
+        }
+    }
+}
+
+impl std::fmt::Debug for AddressHasherBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AddressHasherBuilder")
+            .finish_non_exhaustive()
+    }
+}
+
+impl BuildHasher for AddressHasherBuilder {
+    type Hasher = AddressHasher;
+
+    #[inline]
+    fn build_hasher(&self) -> AddressHasher {
+        AddressHasher { k: self.k, h: 0 }
+    }
+}
+
+#[inline(always)]
+fn folded_multiply(x: u64, y: u64) -> u64 {
+    let p = x as u128 * y as u128;
+    (p as u64) ^ ((p >> 64) as u64)
+}
+
+/// See [`AddressHasherBuilder`]. Correct (deterministic per instance) for
+/// any input; fast for a 20-byte address: two folded multiplies plus one to
+/// finish. `write_usize` (the slice length prefix `Hash for [u8; 20]`
+/// emits) is ignored: the key type has a fixed length.
+pub struct AddressHasher {
+    k: [u64; 4],
+    h: u64,
+}
+
+impl Hasher for AddressHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let k = &self.k;
+        let mut acc = self.h;
+        let mut rest = bytes;
+        while rest.len() >= 16 {
+            let lo = u64::from_le_bytes(rest[0..8].try_into().unwrap());
+            let hi = u64::from_le_bytes(rest[8..16].try_into().unwrap());
+            acc = folded_multiply(lo ^ k[0] ^ acc, hi ^ k[1]);
+            rest = &rest[16..];
+        }
+        if !rest.is_empty() {
+            let mut buf = [0u8; 16];
+            buf[..rest.len()].copy_from_slice(rest);
+            let lo = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+            let hi = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+            acc = folded_multiply(lo ^ k[2] ^ acc, hi ^ k[3] ^ rest.len() as u64);
+        }
+        self.h = acc;
+    }
+
+    #[inline]
+    fn write_usize(&mut self, _len: usize) {}
+
+    #[inline]
+    fn finish(&self) -> u64 {
+        folded_multiply(self.h ^ self.k[1], self.k[0] | 1)
+    }
+}
+
 /// Flat account state: address -> (nonce, balance). No trie, no root — the
 /// lane is BFT-final, the CL's signed block commitment is the source of truth.
 #[derive(Clone, Debug, Default)]
 pub struct FlatState {
-    pub accounts: HashMap<Address, Acct>,
+    pub accounts: AccountMap,
 }
 
 impl FlatState {

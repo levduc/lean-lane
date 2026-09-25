@@ -4,7 +4,6 @@
 //! commitment they correspond to; recovery = newest snapshot + log replay.
 
 use alloy_primitives::{Address, B256};
-use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -104,7 +103,8 @@ impl Snapshots for FlatState {
         if bytes.len() != 56 + count * 44 {
             return Ok(None); // torn snapshot (tmp+rename should prevent this)
         }
-        let mut accounts = HashMap::with_capacity(count);
+        let mut accounts =
+            lean_core::AccountMap::with_capacity_and_hasher(count, Default::default());
         let mut at = 56;
         for _ in 0..count {
             let a = Address::from_slice(&bytes[at..at + 20]);

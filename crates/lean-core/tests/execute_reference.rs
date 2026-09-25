@@ -95,7 +95,11 @@ fn addr(r: &mut Rng, pool: u64) -> Address {
 
 fn case(seed: u64, n_items: usize, pool: u64, max_n: u64, parallel: bool) {
     let mut r = Rng(seed);
-    let ben = if seed % 3 == 0 { addr(&mut r, pool) } else { Address::with_last_byte(0xbe) };
+    let ben = if seed % 3 == 0 {
+        addr(&mut r, pool)
+    } else {
+        Address::with_last_byte(0xbe)
+    };
     let mut state = FlatState::default();
     for _ in 0..pool / 2 {
         let a = addr(&mut r, pool);
@@ -104,13 +108,25 @@ fn case(seed: u64, n_items: usize, pool: u64, max_n: u64, parallel: bool) {
             1 => r.below(1_000) as u128 * AMOUNT_UNIT,
             _ => r.below(1 << 40) as u128 * AMOUNT_UNIT * 1000,
         };
-        state.accounts.insert(a, Acct { nonce: r.below(3), balance: bal });
+        state.accounts.insert(
+            a,
+            Acct {
+                nonce: r.below(3),
+                balance: bal,
+            },
+        );
     }
     let mut nonces: HashMap<Address, u64> = HashMap::new();
     let items: Vec<RecoveredTx> = (0..n_items)
         .map(|j| {
-            let sender = if r.below(10) == 0 { ben } else { addr(&mut r, pool) };
-            let exp = *nonces.entry(sender).or_insert_with(|| state.get(&sender).nonce);
+            let sender = if r.below(10) == 0 {
+                ben
+            } else {
+                addr(&mut r, pool)
+            };
+            let exp = *nonces
+                .entry(sender)
+                .or_insert_with(|| state.get(&sender).nonce);
             let nonce = match r.below(8) {
                 0 => exp + 1,
                 1 => exp.saturating_sub(1),
@@ -139,7 +155,11 @@ fn case(seed: u64, n_items: usize, pool: u64, max_n: u64, parallel: bool) {
             h[8..16].copy_from_slice(&seed.to_le_bytes());
             (
                 sender,
-                LeanTx { nonce: nonce as u32, outputs, sig: [0u8; SIG_LEN] },
+                LeanTx {
+                    nonce: nonce as u32,
+                    outputs,
+                    sig: [0u8; SIG_LEN],
+                },
                 B256::new(h),
             )
         })
@@ -147,10 +167,20 @@ fn case(seed: u64, n_items: usize, pool: u64, max_n: u64, parallel: bool) {
     let ctx = EngineCtx::new(1338, ben).with_parallel_recovery(parallel);
     let got = execute(&state, &items, &ctx);
     let want = reference(&state, &items, ben);
-    assert_eq!(got.outcome, want.outcome, "outcome seed={seed} n={n_items} par={parallel}");
+    assert_eq!(
+        got.outcome, want.outcome,
+        "outcome seed={seed} n={n_items} par={parallel}"
+    );
     assert_eq!(got.evict, want.evict, "evict seed={seed}");
-    assert_eq!(got.writes.len(), want.writes.len(), "write count seed={seed} n={n_items}");
-    assert_eq!(got.writes, want.writes, "writes seed={seed} n={n_items} par={parallel}");
+    assert_eq!(
+        got.writes.len(),
+        want.writes.len(),
+        "write count seed={seed} n={n_items}"
+    );
+    assert_eq!(
+        got.writes, want.writes,
+        "writes seed={seed} n={n_items} par={parallel}"
+    );
 }
 
 #[test]
