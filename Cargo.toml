@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/lean-native", "crates/lean-lane-node", "crates/spammer"]
+members = ["crates/lean-native", "crates/lean-lane-node", "crates/spammer", "crates/lean-oracle"]
 
 [workspace.package]
 edition = "2021"
