@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/lean-native", "crates/lean-core", "crates/lean-lane-node", "crates/lean-bench", "crates/lean-oracle", "crates/spammer"]
+members = ["crates/lean-native", "crates/lean-core", "crates/lean-lane-node", "crates/lean-bench", "crates/lean-oracle", "crates/lean-diff", "crates/spammer"]
 
 [workspace.package]
 edition = "2021"
@@ -51,3 +51,18 @@ tokio = { version = "1.44.2", default-features = false }
 [profile.release]
 lto = "thin"
 codegen-units = 16
+
+# Debug-build speed for the crypto the test suites hammer (lean-diff runs
+# thousands of signatures/recoveries per `cargo test`); no effect on release.
+[profile.dev.package.k256]
+opt-level = 3
+[profile.dev.package.elliptic-curve]
+opt-level = 3
+[profile.dev.package.crypto-bigint]
+opt-level = 3
+[profile.dev.package.secp256k1-sys]
+opt-level = 3
+[profile.dev.package.sha3]
+opt-level = 3
+[profile.dev.package.keccak]
+opt-level = 3

@@ -2908,6 +2908,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "lean-diff"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "clap",
+ "hex",
+ "k256",
+ "lean-core",
+ "lean-lane-node",
+ "lean-native",
+ "lean-oracle",
+ "secp256k1 0.30.0",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "lean-lane-node"
 version = "0.1.0"
 dependencies = [
