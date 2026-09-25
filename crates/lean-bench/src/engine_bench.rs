@@ -5,7 +5,7 @@ use crate::corpus::{self, beneficiary, Corpus, CorpusSpec, Fanout, CHAIN_ID};
 use crate::util::{median, peak_rss_mb, reset_peak_rss, rss_mb};
 use alloy_primitives::{keccak256, Address};
 use lean_core::{Acct, EngineCtx, FlatState};
-use lean_native::{lane_domain, pubkey_to_address, LeanTx, LEAN_TX_TYPE};
+use lean_native::{lane_domain, pubkey_to_address, signing_hash_of_body, LeanTx, LEAN_TX_TYPE};
 use serde::Serialize;
 use std::hint::black_box;
 use std::path::PathBuf;
@@ -368,10 +368,11 @@ fn micro(corpus: &Corpus, state: &mut FlatState) -> Vec<Hotspot> {
         }
     });
     time(
-        "signing hash: body re-encode + keccak (LeanTx::signing_hash)",
+        "signing hash: keccak(domain ‖ wire body) (lean_native::signing_hash_of_body)",
         &mut || {
-            for t in &parsed {
-                black_box(t.signing_hash(&domain));
+            for t in &txs {
+                let n = u16::from_le_bytes([t[5], t[6]]) as usize;
+                black_box(signing_hash_of_body(&domain, &t[..7 + 28 * n]));
             }
         },
     );
@@ -399,15 +400,10 @@ fn micro(corpus: &Corpus, state: &mut FlatState) -> Vec<Hotspot> {
             black_box(state.get(a));
         }
     });
-    time("  of which: write-set sort", &mut || {
-        let mut w = delta.writes.clone();
-        w.reverse();
-        w.sort_unstable_by_key(|(a, _)| *a);
-        black_box(w);
-    });
     // apply into the REAL state (the map size is the point), undone after
-    // each repetition
-    time("apply (FlatState insert)", &mut || {
+    // each repetition. NOTE: apply is shard-parallel on the rayon pool for
+    // large write sets, so this row is not single-threaded.
+    time("apply (FlatState write, shard-parallel)", &mut || {
         lean_core::apply(state, &delta);
     });
     for (a, prev) in &undo {
