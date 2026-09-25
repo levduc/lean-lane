@@ -320,3 +320,148 @@ Idea: std collects `into_iter().filter_map(|x| x)` in place but `flatten()` not
 
 The p8 medians moved only because more candidate invocations landed in the host's fast
 N=1 mode; the stable t16 arm shows nothing. Reverted.
+
+
+## Final results (branch head)
+
+Correctness: `scripts/engine-gate.sh` twice — `"correct":true` both (golden 83 assertions,
+diff 4000 chains × 20 blocks, fuzz 1e6, restart 32 chains); gate geomean
+1,940,010 / 1,939,521 payments/s (baseline gate: 799,506).
+`cargo test --workspace` passes. `scripts/lean-smoke.sh`: PASS (40 heights, 9,856 txs,
+98,560 payments, 3/3 nodes at one commitment, V4 replay identical); `--mixed`: PASS
+(4,147 txs, 122,146 payments, avg N=29.5).
+
+### Before → after: the gate scenarios + N=100 at 1e7 (K=5 alternating invocations, median of medians)
+
+| mode | scenario | before pay/s | spread | after pay/s | spread | speedup |
+|---|---|--:|--:|--:|--:|--:|
+| p8 | s1e6-n1-g450m | 191,904 | 0.4 % | 230,070 | 0.5 % | 1.20x |
+| p8 | s1e6-n100-g450m | 1,793,186 | 1.5 % | 9,045,787 | 4.4 % | **5.04x** |
+| p8 | s1e6-nmix-g450m | 1,552,652 | 0.3 % | 4,915,746 | 1.7 % | **3.17x** |
+| p8 | s1e7-n100-g450m | 1,468,397 | 1.4 % | 8,282,018 | 0.8 % | **5.64x** |
+| t16 | s1e6-n1-g450m | 204,073 | 20.4 %¹ | 220,584 | 19.3 %¹ | 1.08x |
+| t16 | s1e6-n100-g450m | 1,827,056 | 1.1 % | 8,105,186 | 3.0 % | **4.44x** |
+| t16 | s1e6-nmix-g450m | 1,585,005 | 2.8 % | 4,866,342 | 0.8 % | **3.07x** |
+| t16 | s1e7-n100-g450m | 1,491,399 | 0.7 % | 7,992,550 | 0.8 % | **5.36x** |
+
+¹ bimodal host (two invocations per binary in the slow mode, ~164k/187k). All blocks
+99.92–100 % full. At 16 threads N=100 is slightly *slower* than at 8 pinned: the
+remaining memory-bound pieces do not gain from SMT and 16 unpinned threads contend.
+
+### e2e (`lean-bench e2e --seconds 10`: two real nodes in-process, N=10, 225M, 1e5 accounts, 16 threads; both nodes end at the same head and state digest — asserted)
+
+| log | run | blocks | full % | blk/s | tx/s | payments/s | build ms | follower stage ms | proposer anchor ms | follower anchor ms | append ms |
+|---|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| fsync | before #1 | 117 | 100 | 15.32 | 48,552 | 485,523 | 12.8 | 24.2 | 19.3 | 8.9 | 1.53 |
+| fsync | before #2 | 117 | 100 | 15.27 | 48,397 | 483,968 | 12.8 | 24.2 | 19.5 | 8.9 | 1.83 |
+| fsync | after #1 | 117 | 100 | 19.59 | 62,086 | 620,856 | 6.9 | 18.2 | 18.4 | 7.5 | 1.72 |
+| fsync | after #2 | 117 | 100 | 19.27 | 61,076 | 610,759 | 7.0 | 18.4 | 18.7 | 7.7 | 1.75 |
+| no-fsync | before #1 | 117 | 100 | 16.03 | 50,802 | 508,023 | 12.8 | 24.4 | 17.8 | 7.2 | 0.24 |
+| no-fsync | before #2 | 117 | 100 | 16.07 | 50,926 | 509,258 | 12.8 | 24.3 | 17.8 | 7.2 | 0.23 |
+| no-fsync | after #1 | 117 | 100 | 20.79 | 65,893 | 658,930 | 6.8 | 18.0 | 17.3 | 5.9 | 0.23 |
+| no-fsync | after #2 | 117 | 100 | 20.68 | 65,526 | 655,264 | 7.0 | 18.1 | 17.1 | 6.1 | 0.23 |
+
+fsync ~485k → ~616k payments/s (+27 %), no-fsync ~509k → ~657k (+29 %): build 12.8 →
+6.9 ms and follower stage 24.2 → 18.2 ms (engine); the proposer/follower anchor
+(promote + pool update, node code outside lean-core) is unchanged at ~18/7 ms and is now
+the largest node-side step.
+
+### Full suite (`taskset -c 0-7 lean-bench --all --json --threads 8`, one invocation per binary, same session)
+
+| scenario | tx/blk | full % | before pay/s | after pay/s | speedup | before blk ms | after blk ms | after fr+dec | recover | execute | apply | after serial-rec pay/s | peak RSS MB |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| s1e5-n1-g225m | 8653 | 99.99 | 202,279 | 224,165 | 1.11x | 42.8 | 38.6 | 2.4 | 36.3 | 1.1 | 0.2 | 33,476 | 52 |
+| s1e5-n1-g450m | 17307 | 100.00 | 201,766 | 227,852 | 1.13x | 85.8 | 76.0 | 4.8 | 71.9 | 1.9 | 0.3 | 33,538 | 73 |
+| s1e5-n1-g1g | 38461 | 100.00 | 205,458 | 229,196 | 1.12x | 187.2 | 167.8 | 10.5 | 159.4 | 3.7 | 0.6 | 33,483 | 123 |
+| s1e5-n10-g225m | 3169 | 100.00 | 1,274,787 | 2,038,633 | 1.60x | 24.9 | 15.5 | 2.6 | 13.7 | 0.9 | 0.2 | 322,776 | 74 |
+| s1e5-n10-g450m | 6338 | 100.00 | 1,337,649 | 2,069,681 | 1.55x | 47.4 | 30.6 | 5.1 | 26.9 | 1.9 | 0.4 | 321,281 | 80 |
+| s1e5-n10-g1g | 14084 | 100.00 | 1,414,730 | 2,106,288 | 1.49x | 99.6 | 66.9 | 11.4 | 59.3 | 3.6 | 0.6 | 322,086 | 111 |
+| s1e5-n100-g225m | 431 | 99.80 | 2,750,515 | 10,292,958 | 3.74x | 15.7 | 4.2 | 2.7 | 2.4 | 0.9 | 0.2 | 2,299,087 | 79 |
+| s1e5-n100-g450m | 863 | 99.92 | 2,900,834 | 10,793,059 | 3.72x | 29.8 | 8.0 | 5.3 | 4.6 | 1.6 | 0.5 | 2,327,818 | 93 |
+| s1e5-n100-g1g | 1919 | 99.98 | 3,739,321 | 11,449,440 | 3.06x | 51.3 | 16.8 | 11.6 | 9.6 | 3.6 | 0.6 | 2,343,213 | 128 |
+| s1e5-nmix-g225m | 1271 | 100.00 | 2,082,417 | 5,084,813 | 2.44x | 19.0 | 7.8 | 2.7 | 5.9 | 0.9 | 0.2 | 918,410 | 83 |
+| s1e5-nmix-g450m | 2449 | 100.00 | 2,385,318 | 5,421,726 | 2.27x | 33.4 | 14.7 | 5.4 | 11.0 | 1.7 | 0.5 | 956,540 | 94 |
+| s1e5-nmix-g1g | 5408 | 100.00 | 2,710,299 | 5,619,741 | 2.07x | 65.4 | 31.5 | 11.6 | 23.8 | 3.7 | 0.6 | 965,341 | 128 |
+| s1e6-n1-g225m | 8653 | 99.99 | 195,416 | 228,355 | 1.17x | 44.3 | 37.9 | 2.3 | 35.9 | 1.3 | 0.2 | 33,553 | 195 |
+| s1e6-n1-g450m | 17307 | 100.00 | 193,122 | 230,160 | 1.19x | 89.6 | 75.2 | 4.8 | 71.7 | 2.2 | 0.5 | 33,468 | 218 |
+| s1e6-n1-g1g | 38461 | 100.00 | 192,281 | 227,229 | 1.18x | 200.0 | 169.3 | 10.0 | 158.6 | 4.3 | 1.0 | 33,522 | 246 |
+| s1e6-n10-g225m | 3169 | 100.00 | 1,056,723 | 1,981,090 | 1.87x | 30.0 | 16.0 | 2.6 | 13.5 | 1.2 | 0.3 | 318,338 | 191 |
+| s1e6-n10-g450m | 6338 | 100.00 | 1,044,721 | 1,995,165 | 1.91x | 60.7 | 31.8 | 5.1 | 26.8 | 2.5 | 0.9 | 319,519 | 211 |
+| s1e6-n10-g1g | 14084 | 100.00 | 1,027,239 | 2,021,703 | 1.97x | 137.1 | 69.7 | 11.2 | 59.3 | 5.1 | 1.8 | 320,637 | 270 |
+| s1e6-n100-g225m | 431 | 99.80 | 2,004,158 | 8,929,133 | 4.46x | 21.5 | 4.8 | 2.7 | 2.5 | 1.3 | 0.5 | 2,209,606 | 205 |
+| s1e6-n100-g450m | 863 | 99.92 | 1,939,614 | 9,217,024 | 4.75x | 44.5 | 9.4 | 5.3 | 4.5 | 2.4 | 1.1 | 2,245,804 | 231 |
+| s1e6-n100-g1g | 1919 | 99.98 | 1,999,186 | 9,516,253 | 4.76x | 96.0 | 20.2 | 11.6 | 9.6 | 5.5 | 2.1 | 2,251,444 | 271 |
+| s1e6-nmix-g225m | 1271 | 100.00 | 1,629,418 | 4,695,758 | 2.88x | 24.3 | 8.4 | 2.7 | 5.9 | 1.3 | 0.4 | 902,515 | 205 |
+| s1e6-nmix-g450m | 2449 | 100.00 | 1,623,440 | 4,956,140 | 3.05x | 49.1 | 16.1 | 5.3 | 11.0 | 2.4 | 1.0 | 940,993 | 230 |
+| s1e6-nmix-g1g | 5408 | 100.00 | 1,635,534 | 5,145,161 | 3.15x | 108.4 | 34.5 | 11.6 | 23.9 | 5.4 | 2.0 | 943,790 | 279 |
+| s1e7-n1-g225m | 8653 | 99.99 | 186,902 | 226,811 | 1.21x | 46.3 | 38.2 | 2.3 | 35.9 | 1.5 | 0.3 | 33,494 | 1138 |
+| s1e7-n1-g450m | 17307 | 100.00 | 184,186 | 228,457 | 1.24x | 94.0 | 75.8 | 4.5 | 71.6 | 2.4 | 0.8 | 33,495 | 1141 |
+| s1e7-n1-g1g | 38461 | 100.00 | 183,253 | 228,316 | 1.25x | 209.9 | 168.5 | 10.3 | 159.4 | 4.9 | 1.6 | 33,472 | 1188 |
+| s1e7-n10-g225m | 3169 | 100.00 | 910,180 | 1,899,297 | 2.09x | 34.8 | 16.7 | 2.6 | 13.7 | 1.4 | 0.8 | 318,248 | 1160 |
+| s1e7-n10-g450m | 6338 | 100.00 | 901,182 | 1,939,601 | 2.15x | 70.3 | 32.7 | 5.1 | 26.8 | 3.0 | 1.4 | 318,959 | 1160 |
+| s1e7-n10-g1g | 14084 | 100.00 | 893,015 | 1,962,751 | 2.20x | 157.7 | 71.8 | 11.1 | 59.2 | 6.2 | 2.9 | 317,871 | 1222 |
+| s1e7-n100-g225m | 431 | 99.80 | 1,534,410 | 7,920,809 | 5.16x | 28.1 | 5.4 | 2.7 | 2.4 | 1.6 | 0.9 | 2,130,478 | 1181 |
+| s1e7-n100-g450m | 863 | 99.92 | 1,527,805 | 8,234,824 | 5.39x | 56.5 | 10.5 | 5.3 | 4.5 | 3.0 | 1.7 | 2,165,594 | 1181 |
+| s1e7-n100-g1g | 1919 | 99.98 | 1,532,212 | 8,469,676 | 5.53x | 125.2 | 22.7 | 11.6 | 9.6 | 6.5 | 3.6 | 2,189,010 | 1226 |
+| s1e7-nmix-g225m | 1271 | 100.00 | 1,318,285 | 4,402,651 | 3.34x | 30.1 | 9.0 | 2.7 | 5.9 | 1.5 | 0.9 | 895,017 | 1160 |
+| s1e7-nmix-g450m | 2449 | 100.00 | 1,323,780 | 4,655,969 | 3.52x | 60.2 | 17.1 | 5.3 | 11.0 | 2.9 | 1.6 | 927,739 | 1166 |
+| s1e7-nmix-g1g | 5408 | 100.00 | 1,317,635 | 4,766,838 | 3.62x | 134.5 | 37.2 | 11.6 | 23.9 | 6.6 | 3.3 | 938,325 | 1234 |
+
+### Thread scaling (s1e6, 450M; `taskset -c 0-(t-1)` for t ≤ 8, t=16 unpinned)
+
+| threads | N=1 before | N=1 after | N=1 recover ms (after) | N=100 before | N=100 after |
+|--:|--:|--:|--:|--:|--:|
+| 1 | 31,920 | 32,513 | 518.1 | 1,099,793 | 1,776,194 |
+| 2 | 60,973 | 63,461 | 263.0 | 1,408,736 | 3,334,418 |
+| 4 | 112,038 | 121,793 | 135.0 | 1,673,484 | 5,685,410 |
+| 8 | 191,424 | 229,489 | 71.4 | 1,808,954 | 8,509,049 |
+| 16 | 205,094 | 249,665 | 65.5 | 1,816,033 | 8,118,786 |
+
+Recovery scales 7.3x on 8 physical cores (91 % efficiency — rayon's chunking is fine,
+per-thread batching has nothing to win) and gains only +9 % from SMT. N=100 went from
+flat beyond 4 threads (1.1M → 1.8M) to 4.8x over 1 → 8 threads, and dips at 16.
+
+### Final profile (single-threaded `--micro`, block 1, 1e6 accounts / 450M; the apply row is shard-parallel)
+
+| function | N=1 ms | N=1 % | N=100 ms | N=100 % |
+|---|--:|--:|--:|--:|
+| ecrecover (`secp256k1` `recover_ecdsa`) | 498.14 | **96.4** | 25.02 | **53.9** |
+| execute (`engine::execute`, serial executor) | 3.86 | 0.7 | 6.66 | 14.4 |
+| … of which state lookups | 1.04 | 0.2 | 2.88 | 6.2 |
+| tx hash keccak | 4.33 | 0.8 | 4.58 | 9.9 |
+| commitment keccak (overlapped with recovery in `process_block`) | 3.15 | 0.6 | 4.34 | 9.4 |
+| signing hash keccak (`signing_hash_of_body`) | 4.45 | 0.9 | 4.33 | 9.3 |
+| apply (shard-parallel) | 0.25 | 0.0 | 1.25 | 2.7 |
+| pubkey → address keccak | 2.26 | 0.4 | 0.04 | 0.1 |
+| tx decode | 0.27 | 0.1 | 0.18 | 0.4 |
+
+Baseline N=100: execute 32.09 ms (41.8 %), apply 6.40 ms serial. (The baseline's
+2.25 ms N=1 signing-hash row was flattered by alloy's keccak cache answering the micro
+loop's repeated inputs; the real per-block path misses it.)
+
+**Where it stands.** N=1 is ecrecover (96 % of CPU, 91 %-efficient parallel scaling).
+At N=100/1e6 a block costs ~9.4 ms ≈ 109 ns per payment on 8 cores. Justifiable floor
+per payment: ecrecover/100 ≈ 286 ns + three keccak passes over its 28 wire bytes
+(commitment, tx hash, signing hash) ≈ 150 ns + sort/merge ≈ 30 ns of CPU → ≈ 60 ns
+wall on 8 cores, plus one state read and one state write into a 130 MB–1 GB map (DRAM,
+partly overlapped): ~70–90 ns. The engine is within ~1.2–1.6x of that. Each keccak is
+required (commitment = consensus, tx hash = `evict`, signing hash = recovery).
+
+## Concerns
+
+- **Public type change.** `FlatState::accounts` is now `lean_core::AccountMap` (64
+  sharded maps with a keyed address hasher) instead of `HashMap<Address, Acct>`; every
+  call site compiles unchanged except one node line (snapshot load:
+  `AccountMap::with_capacity`). Anyone naming the old type must switch.
+- **HashDoS.** The hasher is keyed per map from OS randomness (foldhash-strength, not a
+  PRF); the shard index (top 6 address bits) is NOT keyed, so a grinder can pile
+  accounts into one shard — that only serialises that shard's share of `apply` and
+  grows one table; lookups stay keyed-hashed.
+- **Allocator.** glibc re-faults ~31 MB/block of fresh pages in the bench; with
+  `GLIBC_TUNABLES=glibc.malloc.trim_threshold=1G:glibc.malloc.mmap_threshold=1G` N=100
+  is ~+9 % with no code change. The node binary would likely gain from a tuned or
+  alternative allocator (binary-level, outside lean-core; not done).
+- **Small blocks / host noise.** `execute` always uses rayon in parallel mode (no size
+  cut-off) so the gate's differential test exercises the parallel path; the cost is
+  tens of µs of fork/join on tiny blocks (gate `diff` step 38 → 42–48 s). The host's
+  N=1 numbers are bimodal (~170k vs ~225k per invocation, same binary).
