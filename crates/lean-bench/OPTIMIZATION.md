@@ -223,4 +223,4 @@ state reads are one `par_iter_mut().zip(flags)` pass. Gate correct. Base = A7.
 | t16 | s1e6-nmix-g450m | 4,244,451 | 0.9 % | 4,483,272 | 1.3 % | **+5.6 %** |
 | t16 | s1e7-n100-g450m | 6,734,601 | 1.5 % | 7,236,044 | 2.3 % | **+7.4 %** |
 
-¹ one low base invocation (6.0M); the other four were 7.30–7.37M.
+¹ one low base invocation (6.02M); the other four were 7.31–7.46M.
