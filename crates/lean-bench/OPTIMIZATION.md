@@ -132,3 +132,19 @@ Base = A3.
 | t16 | s1e6-n100-g450m | 4,607,324 | 1.0 % | 5,516,430 | 1.7 % | **+19.7 %** |
 | t16 | s1e6-nmix-g450m | 3,361,712 | 2.5 % | 3,751,065 | 0.9 % | **+11.6 %** |
 | t16 | s1e7-n100-g450m | 3,948,914 | 1.1 % | 5,069,821 | 0.6 % | **+28.4 %** |
+
+### A5 — `apply`: overwrite in place (`get_mut`), insert only when absent — ACCEPTED
+
+Idea: nearly every write hits an existing account; `get_mut` + assign skips the insert
+path (reserve check + insert-slot search). Same map afterwards. Base = A4b.
+
+| mode | scenario | base median | spread | cand median | spread | delta |
+|---|---|--:|--:|--:|--:|--:|
+| p8 | s1e6-n1-g450m | 173,064 | 25.6 % | 173,713 | 28.3 % | +0.4 % (noise) |
+| p8 | s1e6-n100-g450m | 5,982,057 | 1.1 % | 6,307,795 | 3.1 % | **+5.4 %** |
+| p8 | s1e6-nmix-g450m | 3,583,968 | 15.7 % | 3,687,812 | 1.2 % | +2.9 % (noise) |
+| p8 | s1e7-n100-g450m | 5,271,921 | 1.4 % | 5,649,006 | 1.2 % | **+7.2 %** |
+| t16 | s1e6-n1-g450m | 181,676 | 32.0 % | 182,715 | 33.8 % | +0.6 % (noise) |
+| t16 | s1e6-n100-g450m | 5,548,001 | 3.8 % | 5,883,347 | 4.3 % | **+6.0 %** |
+| t16 | s1e6-nmix-g450m | 3,762,495 | 9.9 % | 3,903,658 | 12.6 % | +3.8 % (noise) |
+| t16 | s1e7-n100-g450m | 5,036,549 | 1.0 % | 5,369,959 | 1.0 % | **+6.6 %** |

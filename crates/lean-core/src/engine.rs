@@ -397,9 +397,18 @@ pub(crate) fn execute<S: StateView + ?Sized>(
 }
 
 /// Write a delta into the state.
+///
+/// Most writes hit an existing account: overwrite it in place (`get_mut`) and
+/// insert only when absent — the same map afterwards as `insert` for every
+/// write, but an update skips the insert path's slot search/reserve.
 pub(crate) fn apply(state: &mut FlatState, delta: &Delta) {
     for (a, acct) in &delta.writes {
-        state.accounts.insert(*a, *acct);
+        match state.accounts.get_mut(a) {
+            Some(v) => *v = *acct,
+            None => {
+                state.accounts.insert(*a, *acct);
+            }
+        }
     }
 }
 
