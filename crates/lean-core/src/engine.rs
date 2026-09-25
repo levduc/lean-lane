@@ -42,7 +42,9 @@ use crate::types::{
     EngineCtx, FlatState, Processed, RecoveredTx, StateView, SHARDS,
 };
 use alloy_primitives::{keccak256, Address, B256};
-use lean_native::{lean_fee, LeanTx, AMOUNT_UNIT, LEAN_TX_TYPE};
+use lean_native::{
+    lean_fee, recover_prehashed, signing_hash_of_body, LeanTx, AMOUNT_UNIT, LEAN_TX_TYPE, SIG_LEN,
+};
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -115,6 +117,45 @@ pub(crate) fn decode<T: AsRef<[u8]> + Sync>(txs: &[T], ctx: &EngineCtx) -> Vec<D
             .collect()
     } else {
         txs.iter().filter_map(|t| decode_one(t.as_ref())).collect()
+    }
+}
+
+/// Decode and recover one entry in a single pass over its bytes (CONTRACT:
+/// DECODE + RECOVER). The signing hash is taken straight from the entry's
+/// canonical body bytes — byte-identical to `LeanTx::signing_hash`'s
+/// re-encode, since the parser reads every body field from exactly those
+/// positions and `n` round-trips; the tx hash only for a recovered tx.
+#[inline]
+fn decode_recover_one(bytes: &[u8], domain: &B256) -> Option<RecoveredTx> {
+    if bytes.first() != Some(&LEAN_TX_TYPE) {
+        return None;
+    }
+    let mut buf = &bytes[1..];
+    let tx = LeanTx::parse_after_type(&mut buf).ok()?;
+    let canon = &bytes[..bytes.len() - buf.len()];
+    let body = &canon[..canon.len() - SIG_LEN];
+    let sender = recover_prehashed(&tx.sig, signing_hash_of_body(domain, body)).ok()?;
+    Some((sender, tx, keccak256(canon)))
+}
+
+/// `decode` + `recover` fused into one pass (one rayon pass in parallel
+/// mode), block order kept.
+pub(crate) fn decode_recover<T: AsRef<[u8]> + Sync>(
+    txs: &[T],
+    ctx: &EngineCtx,
+) -> Vec<RecoveredTx> {
+    let domain = ctx.domain;
+    if ctx.parallel_recovery {
+        txs.par_iter()
+            .map(|t| decode_recover_one(t.as_ref(), &domain))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .flatten()
+            .collect()
+    } else {
+        txs.iter()
+            .filter_map(|t| decode_recover_one(t.as_ref(), &domain))
+            .collect()
     }
 }
 
@@ -440,12 +481,12 @@ pub(crate) fn process_block<S: StateView + ?Sized>(
     let (commitment, items) = if ctx.parallel_recovery {
         rayon::join(
             || framing::commitment_of_wire(&header, wire),
-            || recover(decode(&txs, ctx), ctx),
+            || decode_recover(&txs, ctx),
         )
     } else {
         (
             framing::commitment_of_wire(&header, wire),
-            recover(decode(&txs, ctx), ctx),
+            decode_recover(&txs, ctx),
         )
     };
     let delta = execute(state, &items, ctx);

@@ -224,3 +224,33 @@ state reads are one `par_iter_mut().zip(flags)` pass. Gate correct. Base = A7.
 | t16 | s1e7-n100-g450m | 6,734,601 | 1.5 % | 7,236,044 | 2.3 % | **+7.4 %** |
 
 ¹ one low base invocation (6.02M); the other four were 7.31–7.46M.
+
+### A9 — A2 retried on top of A8: fused decode+recover, signing hash from the body bytes — ACCEPTED (small)
+
+Same code as A2 (`lean_native::{signing_hash_of_body, recover_prehashed}`;
+`process_block` and `recover_txs` run one fused rayon pass). With the block ~2x cheaper
+than when A2 was measured, re-measured. Base = A8.
+
+| mode | scenario | base median | spread | cand median | spread | delta |
+|---|---|--:|--:|--:|--:|--:|
+| p8 | s1e6-n1-g450m | 174,716 | 26.8 % | 178,398 | 29.7 % | +2.1 % |
+| p8 | s1e6-n100-g450m | 8,196,153 | 3.0 % | 8,213,514 | 1.9 % | +0.2 % (noise) |
+| p8 | s1e6-nmix-g450m | 4,132,814 | 24.7 % | 4,167,752 | 2.7 % | +0.8 % (noise) |
+| p8 | s1e7-n100-g450m | 7,513,317 | 1.0 % | 7,545,783 | 1.8 % | +0.4 % (noise) |
+| t16 | s1e6-n1-g450m | 184,299 | 0.5 % | 188,457 | 1.1 % | **+2.3 %** |
+| t16 | s1e6-n100-g450m | 7,649,778 | 2.0 % | 7,607,587 | 3.2 % | −0.6 % (noise) |
+| t16 | s1e6-nmix-g450m | 4,478,552 | 0.9 % | 4,521,223 | 0.5 % | +1.0 % |
+| t16 | s1e7-n100-g450m | 7,243,574 | 1.4 % | 7,275,796 | 2.0 % | +0.4 % (noise) |
+
+Focused re-run, K=7 (N=1 this time not bimodal under p8):
+
+| mode | scenario | base median | spread | cand median | spread | delta |
+|---|---|--:|--:|--:|--:|--:|
+| p8 | s1e6-n1-g450m | 175,701 | 0.6 % | 179,179 | 0.2 % | **+2.0 %** (every cand > every base) |
+| p8 | s1e6-nmix-g450m | 4,209,091 | 4.5 % | 4,222,460 | 2.7 % | +0.3 % (noise) |
+| t16 | s1e6-n1-g450m | 184,368 | 33.1 %² | 188,706 | 33.5 %² | +2.4 % |
+| t16 | s1e6-nmix-g450m | 4,535,280 | 15.2 %² | 4,557,175 | 11.6 %² | +0.5 % (noise) |
+
+² the first alternation pair ran ~30 % fast for both binaries (a host turbo state); the
+other six pairs are within 2 %. Accepted for the consistent +2 % at N=1 (one fewer
+rayon pass and barrier, no intermediate `Vec<Decoded>`, no re-encode); neutral at N≥10.

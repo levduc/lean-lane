@@ -70,7 +70,7 @@ pub fn recover(decoded: Vec<Decoded>, ctx: &EngineCtx) -> Vec<RecoveredTx> {
 
 /// [`decode_txs`] + [`recover`]: a block's raw tx list to recovered items.
 pub fn recover_txs<T: AsRef<[u8]> + Sync>(txs: &[T], ctx: &EngineCtx) -> Vec<RecoveredTx> {
-    engine::recover(engine::decode(txs, ctx), ctx)
+    engine::decode_recover(txs, ctx)
 }
 
 /// THE state transition function over already-recovered items (block

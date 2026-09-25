@@ -139,11 +139,7 @@ impl LeanTx {
     }
 
     pub fn signing_hash(&self, domain: &B256) -> B256 {
-        let pre = self.body_bytes();
-        let mut buf = Vec::with_capacity(32 + pre.len());
-        buf.extend_from_slice(domain.as_slice());
-        buf.extend_from_slice(&pre);
-        keccak256(&buf)
+        signing_hash_of_body(domain, &self.body_bytes())
     }
 
     /// Full canonical encoding, INCLUDING the leading 2718 type byte.
@@ -222,15 +218,34 @@ impl LeanTx {
 
     /// ecrecover — the dominant per-tx cost being amortized over N outputs.
     pub fn recover_sender(&self, domain: &B256) -> Result<Address, TxError> {
-        let rec = RecoveryId::try_from(self.sig[64] as i32).map_err(|_| TxError::BadSignature)?;
-        let sig = RecoverableSignature::from_compact(&self.sig[..64], rec)
-            .map_err(|_| TxError::BadSignature)?;
-        let msg = Message::from_digest(self.signing_hash(domain).0);
-        let pk: PublicKey = SECP256K1
-            .recover_ecdsa(&msg, &sig)
-            .map_err(|_| TxError::BadSignature)?;
-        Ok(pubkey_to_address(&pk))
+        recover_prehashed(&self.sig, self.signing_hash(domain))
     }
+}
+
+/// `keccak256(domain ‖ body)` where `body` is a tx's canonical bytes before
+/// the signature (`[type][nonce][n][outputs]`, the first `7 + 28*N` bytes of
+/// the wire form): the signing hash straight from bytes a block already
+/// holds, no re-encode. Streams both parts into one sponge (no preimage
+/// buffer; bypasses alloy's small-input keccak cache, which signing hashes
+/// would only pollute — they never repeat).
+pub fn signing_hash_of_body(domain: &B256, body: &[u8]) -> B256 {
+    let mut h = alloy_primitives::Keccak256::new();
+    h.update(domain.as_slice());
+    h.update(body);
+    h.finalize()
+}
+
+/// Recover the sender of `sig` (r ‖ s ‖ v, v the raw recovery id 0..=3) over
+/// the 32-byte message `signing_hash`.
+pub fn recover_prehashed(sig: &[u8; SIG_LEN], signing_hash: B256) -> Result<Address, TxError> {
+    let rec = RecoveryId::try_from(sig[64] as i32).map_err(|_| TxError::BadSignature)?;
+    let sig =
+        RecoverableSignature::from_compact(&sig[..64], rec).map_err(|_| TxError::BadSignature)?;
+    let msg = Message::from_digest(signing_hash.0);
+    let pk: PublicKey = SECP256K1
+        .recover_ecdsa(&msg, &sig)
+        .map_err(|_| TxError::BadSignature)?;
+    Ok(pubkey_to_address(&pk))
 }
 
 pub fn pubkey_to_address(pk: &PublicKey) -> Address {
