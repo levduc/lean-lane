@@ -35,7 +35,7 @@ You need `rustup` (each side pins its Rust version; the script installs it),
 `clang`, `libclang` and a C++ compiler (reth builds MDBX and RocksDB from C/C++).
 On Debian or Ubuntu: `sudo apt-get install -y clang libclang-dev build-essential`.
 On macOS: `xcode-select --install`. The first reth build takes some minutes.
-A full run takes about one minute after the build and needs about 3 GB of RAM.
+A full run takes under a minute after the build and needs about 2 GB of RAM.
 
 Put `BENCH_TMPDIR` on the disk you want to measure. Do not use a tmpfs: the
 persist and fsync numbers then measure RAM. The script deletes its temporary
@@ -133,12 +133,48 @@ results.
 Use these pairs:
 
 - **lean headline vs reth "recover + execute"**: the same work (check, recover,
-  run, update state), no Merkle root, no disk.
+  run, compute the new state), no Merkle root, no disk writes.
 - **lean headline vs reth "engine newPayload"**: reth with all its
   optimizations, but with its state root (lean has none) and without disk
   writes.
 - **lean headline + log fsync vs reth "full import"**: what each engine must do
   before a block is final and durable in its own design.
+
+## Reference result
+
+Host: i7-11700F (8 cores / 16 threads), 62 GB, Ubuntu 24.04, kernel 7.0, NVMe
+SSD (ext4). 1,000,000 accounts, 20,000 txs/block, 1 warm-up + 5 measured
+blocks, 8 threads, commit `4d9b6be`. Two runs, back to back
+(`results/ginny-alienware-20261013-144733.json`, `-144750.json`). All checks
+passed in both runs.
+
+| side | row | run 1 ms | run 1 tx/s | run 2 ms | run 2 tx/s |
+|---|---|---:|---:|---:|---:|
+| lean | recover (parallel) | 82.50 | 242,425 | 82.50 | 242,415 |
+| lean | execute | 2.25 | 8,884,857 | 2.39 | 8,373,113 |
+| lean | **decode + recover + execute + apply** | **88.26** | **226,595** | **87.80** | **227,803** |
+| lean | block-log append + fsync | 4.08 | 4,898,286 | 4.06 | 4,930,316 |
+| reth | 1. recover senders | 82.79 | 241,574 | 82.79 | 241,587 |
+| reth | 2. execute | 77.86 | 256,879 | 78.54 | 254,659 |
+| reth | 3. state root | 341.67 | 58,537 | 336.58 | 59,421 |
+| reth | 4. persist | 151.58 | 131,945 | 151.22 | 132,258 |
+| reth | **recover + execute** | **160.93** | **124,278** | **161.34** | **123,962** |
+| reth | **full import** (1+2+3+4) | **662.83** | **30,174** | **651.62** | **30,693** |
+| reth | **engine newPayload** | **196.83** | **101,609** | **199.03** | **100,486** |
+| reth | engine newPayload + persist | 348.41 | 57,403 | 350.25 | 57,102 |
+
+What this shows, on this host:
+
+- Signature recovery costs the same on both sides (about 82.5 ms per 20,000
+  signatures on 8 threads). It is 94 % of the lean block.
+- Without recovery, lean executes and applies a block in about 3 ms; reth's EVM
+  execution takes about 78 ms.
+- reth's serial state root (about 340 ms for 40,000 changed accounts in a
+  1M-account trie) and its per-block persist (about 150 ms) are the largest
+  reth phases. reth's engine hides most of the state root behind execution:
+  newPayload takes about 197 ms.
+- Ratios (lean headline / reth row): 1.8x vs recover + execute, 2.2x vs engine
+  newPayload, 7.4-7.5x vs the direct full import.
 
 ## What is not measured
 

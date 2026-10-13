@@ -1,0 +1,372 @@
+{
+  "bench": "native-transfer",
+  "version": 1,
+  "date_utc": "2026-10-13T21:47:17Z",
+  "host": "ginny-alienware",
+  "params": { "accounts": 1000000, "txs_per_block": 20000, "warmup_blocks": 1, "measured_blocks": 5, "threads": 8, "seed": 1, "payments_per_tx": 1 },
+  "hardware": {
+    "cpu": "11th Gen Intel(R) Core(TM) i7-11700F @ 2.50GHz",
+    "physical_cores": 8,
+    "logical_cores": 16,
+    "ram_gb": 62,
+    "os": "Ubuntu 24.04.5 LTS",
+    "kernel": "7.0.0-31-generic",
+    "tmpdir_disk": "SSD, nvme, SPCC M.2 PCIe SSD, fs=ext4"
+  },
+  "software": {
+    "git_commit": "4d9b6be",
+    "reth_tag": "v2.7.0",
+    "rustc_lean": "rustc 1.93.0 (254b59607 2026-01-19)",
+    "rustc_reth": "rustc 1.96.0 (ac68faa20 2026-05-25)"
+  },
+  "correctness": { "lean": "PASS", "reth": "PASS" },
+  "lean": {
+  "engine": "lean",
+  "accounts": 1000000,
+  "txs_per_block": 20000,
+  "payments_per_tx": 1,
+  "tx_bytes": 100,
+  "warmup_blocks": 1,
+  "measured_blocks": 5,
+  "threads": 8,
+  "seed": 1,
+  "setup_s": {
+    "build_state": 0.056451369,
+    "derive_sender_keys": 0.04875696,
+    "sign_blocks": 0.399760031
+  },
+  "per_block_ms": [
+    {
+      "block": 1,
+      "frame_decode": 5.907556,
+      "recover": 84.016965,
+      "execute": 2.252582,
+      "process_block": 87.88872,
+      "apply": 0.777413,
+      "total": 88.666133,
+      "log_append_fsync": 3.9910579999999998
+    },
+    {
+      "block": 2,
+      "frame_decode": 5.501329,
+      "recover": 81.970737,
+      "execute": 2.1754320000000003,
+      "process_block": 87.410452,
+      "apply": 0.770133,
+      "total": 88.18058500000001,
+      "log_append_fsync": 3.6627650000000003
+    },
+    {
+      "block": 3,
+      "frame_decode": 5.504529,
+      "recover": 82.018277,
+      "execute": 2.304681,
+      "process_block": 87.50409300000001,
+      "apply": 0.741924,
+      "total": 88.24601700000001,
+      "log_append_fsync": 4.407694
+    },
+    {
+      "block": 4,
+      "frame_decode": 5.714579,
+      "recover": 90.539016,
+      "execute": 2.177691,
+      "process_block": 87.519587,
+      "apply": 0.743544,
+      "total": 88.263131,
+      "log_append_fsync": 4.4186440000000005
+    },
+    {
+      "block": 5,
+      "frame_decode": 5.640663,
+      "recover": 82.49967099999999,
+      "execute": 2.251021,
+      "process_block": 89.054742,
+      "apply": 0.595807,
+      "total": 89.650549,
+      "log_append_fsync": 4.083061
+    },
+    {
+      "block": 6,
+      "frame_decode": 5.697756,
+      "recover": 82.810327,
+      "execute": 2.355998,
+      "process_block": 87.600648,
+      "apply": 0.674164,
+      "total": 88.27481200000001,
+      "log_append_fsync": 4.073539
+    }
+  ],
+  "phases": [
+    {
+      "phase": "frame + decode",
+      "ms_per_block": 5.640663,
+      "tx_per_s": 3545682.4844880826
+    },
+    {
+      "phase": "recover (parallel)",
+      "ms_per_block": 82.49967099999999,
+      "tx_per_s": 242425.2091865918
+    },
+    {
+      "phase": "execute",
+      "ms_per_block": 2.251021,
+      "tx_per_s": 8884857.13816086
+    },
+    {
+      "phase": "apply",
+      "ms_per_block": 0.741924,
+      "tx_per_s": 26956938.985664297
+    },
+    {
+      "phase": "decode + recover + execute + apply (process_block + apply)",
+      "ms_per_block": 88.263131,
+      "tx_per_s": 226595.17936203736
+    },
+    {
+      "phase": "block-log append + fsync",
+      "ms_per_block": 4.083061,
+      "tx_per_s": 4898285.86935145
+    },
+    {
+      "phase": "engine + log append + fsync",
+      "ms_per_block": 92.65371100000002,
+      "tx_per_s": 215857.51702918837
+    }
+  ],
+  "checks": {
+    "zero_noops": true,
+    "every_tx_applied": true,
+    "nonces_advanced": true,
+    "balances_match_model": true,
+    "conservation": true,
+    "accounts_checked": 130843,
+    "all_passed": true
+  },
+  "peak_rss_mb": 199.87890625
+},
+  "reth": {
+  "engine": "reth",
+  "reth_tag": "v2.7.0",
+  "accounts": 1000000,
+  "txs_per_block": 20000,
+  "payments_per_tx": 1,
+  "tx_bytes": 115,
+  "warmup_blocks": 1,
+  "measured_blocks": 5,
+  "threads": 8,
+  "seed": 1,
+  "storage": "reth storage v2 (MDBX + static files + RocksDB), MDBX SyncMode::Durable",
+  "setup_s": {
+    "chain_spec_with_genesis_root": 1.528226823,
+    "derive_sender_keys": 0.042955988,
+    "init_genesis_direct": 3.062571632,
+    "init_genesis_engine": 3.04173139,
+    "sign_blocks": 0.43896146,
+    "verify_accounts_direct": 0.137180735,
+    "verify_accounts_engine": 0.061250319,
+    "verify_full_state_root": 0.936686874
+  },
+  "per_block_ms": [
+    {
+      "block": 1,
+      "base_fee": 7,
+      "recover": 83.237997,
+      "execute": 84.50640700000001,
+      "hashed_post_state": 15.742705999999998,
+      "trie_root": 324.013215,
+      "state_root": 339.756301,
+      "persist": 151.640224,
+      "block_roots": 31.104322,
+      "recover_execute": 167.744404,
+      "full_import": 659.140929
+    },
+    {
+      "block": 2,
+      "base_fee": 8,
+      "recover": 83.72739999999999,
+      "execute": 81.883098,
+      "hashed_post_state": 15.508218000000001,
+      "trie_root": 329.13937500000003,
+      "state_root": 344.648058,
+      "persist": 164.10652000000002,
+      "block_roots": 31.226765,
+      "recover_execute": 165.610498,
+      "full_import": 674.365076
+    },
+    {
+      "block": 3,
+      "base_fee": 9,
+      "recover": 82.55763,
+      "execute": 78.377238,
+      "hashed_post_state": 15.648042,
+      "trie_root": 325.941028,
+      "state_root": 341.58962599999995,
+      "persist": 148.47521,
+      "block_roots": 30.207214,
+      "recover_execute": 160.934868,
+      "full_import": 650.999704
+    },
+    {
+      "block": 4,
+      "base_fee": 10,
+      "recover": 83.071569,
+      "execute": 77.857574,
+      "hashed_post_state": 15.685997,
+      "trie_root": 325.980534,
+      "state_root": 341.666831,
+      "persist": 151.57619499999998,
+      "block_roots": 30.239241,
+      "recover_execute": 160.929143,
+      "full_import": 654.1721689999999
+    },
+    {
+      "block": 5,
+      "base_fee": 11,
+      "recover": 82.790303,
+      "execute": 77.795135,
+      "hashed_post_state": 15.631532,
+      "trie_root": 324.23246900000004,
+      "state_root": 339.864462,
+      "persist": 163.768982,
+      "block_roots": 30.399791999999998,
+      "recover_execute": 160.585438,
+      "full_import": 664.218882
+    },
+    {
+      "block": 6,
+      "base_fee": 12,
+      "recover": 82.518884,
+      "execute": 77.80482900000001,
+      "hashed_post_state": 19.000412,
+      "trie_root": 331.928245,
+      "state_root": 350.929241,
+      "persist": 151.578196,
+      "block_roots": 30.276244000000002,
+      "recover_execute": 160.323713,
+      "full_import": 662.83115
+    }
+  ],
+  "engine_per_block_ms": [
+    {
+      "block": 1,
+      "new_payload": 303.656728,
+      "new_payload_wall": 303.87597100000005,
+      "forkchoice_updated": 9.001057999999999
+    },
+    {
+      "block": 2,
+      "new_payload": 213.084159,
+      "new_payload_wall": 213.12771,
+      "forkchoice_updated": 11.397604000000001
+    },
+    {
+      "block": 3,
+      "new_payload": 194.817149,
+      "new_payload_wall": 194.88189,
+      "forkchoice_updated": 9.968295
+    },
+    {
+      "block": 4,
+      "new_payload": 196.832964,
+      "new_payload_wall": 196.934819,
+      "forkchoice_updated": 8.837262
+    },
+    {
+      "block": 5,
+      "new_payload": 193.770705,
+      "new_payload_wall": 193.88430300000002,
+      "forkchoice_updated": 8.88102
+    },
+    {
+      "block": 6,
+      "new_payload": 199.610547,
+      "new_payload_wall": 199.757669,
+      "forkchoice_updated": 9.991098000000001
+    }
+  ],
+  "phases": [
+    {
+      "phase": "1. recover senders (parallel)",
+      "ms_per_block": 82.790303,
+      "tx_per_s": 241574.18532457843
+    },
+    {
+      "phase": "2. execute (EVM, BasicBlockExecutor)",
+      "ms_per_block": 77.857574,
+      "tx_per_s": 256879.31144630836
+    },
+    {
+      "phase": "3. state root (hashed state + incremental trie)",
+      "ms_per_block": 341.666831,
+      "tx_per_s": 58536.55721119736
+    },
+    {
+      "phase": "   3a. hashed post-state",
+      "ms_per_block": 15.648042,
+      "tx_per_s": 1278115.1788830832
+    },
+    {
+      "phase": "   3b. incremental trie root (serial)",
+      "ms_per_block": 325.980534,
+      "tx_per_s": 61353.35676209427
+    },
+    {
+      "phase": "4. persist (save_blocks + commit)",
+      "ms_per_block": 151.578196,
+      "tx_per_s": 131945.09848896737
+    },
+    {
+      "phase": "recover + execute",
+      "ms_per_block": 160.929143,
+      "tx_per_s": 124278.29805817085
+    },
+    {
+      "phase": "full import = recover + execute + state root + persist",
+      "ms_per_block": 662.83115,
+      "tx_per_s": 30173.597001287588
+    },
+    {
+      "phase": "(info) tx root + receipts root + bloom",
+      "ms_per_block": 30.276244000000002,
+      "tx_per_s": 660583.9218365395
+    },
+    {
+      "phase": "engine newPayload (recover+execute+root, overlapped)",
+      "ms_per_block": 196.832964,
+      "tx_per_s": 101608.99675320643
+    },
+    {
+      "phase": "engine forkchoiceUpdated",
+      "ms_per_block": 9.968295,
+      "tx_per_s": 2006361.1680834084
+    },
+    {
+      "phase": "engine newPayload + persist (4.)",
+      "ms_per_block": 348.41116,
+      "tx_per_s": 57403.4425303713
+    }
+  ],
+  "checks": {
+    "every_receipt_successful": true,
+    "gas_used_is_21000_per_tx": true,
+    "direct_accounts": {
+      "nonces_advanced": true,
+      "balances_match_model": true,
+      "conservation": true,
+      "accounts_checked": 130843
+    },
+    "full_state_root_recompute_matches": true,
+    "engine_all_blocks_valid": true,
+    "engine_accounts": {
+      "nonces_advanced": true,
+      "balances_match_model": true,
+      "conservation": true,
+      "accounts_checked": 130843
+    },
+    "all_passed": true
+  },
+  "final_state_root": "0x4d7f6ef3f680049a0c07714eb5decb8b58ceac8bcfae774471690696897f0b5c",
+  "peak_rss_mb": 1878.78125
+}
+}
