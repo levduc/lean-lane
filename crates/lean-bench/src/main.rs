@@ -8,6 +8,7 @@
 //! lean-bench --scenario 's1e6-n100-*'     # a subset (`*` wildcard)
 //! lean-bench --list                       # scenario names
 //! lean-bench e2e --seconds 10 [--no-fsync]  # two real nodes in-process
+//! lean-bench native --accounts 1000000 --txs 20000 --blocks 5   # N=1, vs reth
 //! ```
 //!
 //! Scenario `s{accounts}-n{fanout}-g{budget}`: accounts in {1e5,1e6,1e7},
@@ -17,6 +18,7 @@
 mod corpus;
 mod e2e;
 mod engine_bench;
+mod native;
 mod util;
 
 use clap::{Parser, Subcommand};
@@ -83,6 +85,28 @@ struct Common {
 enum Cmd {
     /// Drive two real nodes in-process with the stand-in CL, unpaced.
     E2e(E2eArgs),
+    /// N=1 native-transfer workload of `bench/native-transfer` (the lean half
+    /// of the lean-vs-reth comparison).
+    Native(NativeArgs),
+}
+
+#[derive(clap::Args)]
+struct NativeArgs {
+    /// Pre-funded accounts.
+    #[arg(long, default_value_t = 1_000_000)]
+    accounts: u64,
+    /// Transactions per block (= distinct senders; one payment each).
+    #[arg(long, default_value_t = 20_000)]
+    txs: u64,
+    /// Measured blocks.
+    #[arg(long, default_value_t = 5)]
+    blocks: usize,
+    /// Warm-up blocks (run first, excluded from the medians).
+    #[arg(long, default_value_t = 1)]
+    warmup: usize,
+    /// Also time the node's block-log append + fsync, with the log in DIR.
+    #[arg(long, value_name = "DIR")]
+    log_dir: Option<PathBuf>,
 }
 
 #[derive(clap::Args)]
@@ -152,6 +176,42 @@ fn main() -> eyre::Result<()> {
         .clone()
         .unwrap_or_else(util::default_cache_dir);
     match cli.cmd {
+        Some(Cmd::Native(a)) => {
+            let o = native::NativeOpts {
+                accounts: a.accounts,
+                txs: a.txs,
+                blocks: a.blocks,
+                warmup: a.warmup,
+                seed: cli.common.seed,
+                log_dir: a.log_dir,
+            };
+            eprintln!(
+                "lean-bench native: {} accounts, {} txs/block, {}+{} blocks, {} rayon threads",
+                o.accounts,
+                o.txs,
+                o.warmup,
+                o.blocks,
+                rayon::current_num_threads()
+            );
+            let r = native::run(&o)?;
+            if cli.common.json {
+                println!("{}", serde_json::to_string_pretty(&r)?);
+            } else {
+                for p in &r.phases {
+                    println!(
+                        "{:<60} {:>10.2} ms/block {:>12.0} tx/s",
+                        p.phase, p.ms_per_block, p.tx_per_s
+                    );
+                }
+                println!("checks: {:?}", r.checks);
+            }
+            eyre::ensure!(
+                r.checks.all_passed,
+                "correctness checks FAILED: {:?}",
+                r.checks
+            );
+            Ok(())
+        }
         Some(Cmd::E2e(a)) => {
             let o = e2e::E2eOpts {
                 seconds: a.seconds,

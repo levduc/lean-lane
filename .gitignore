@@ -5,3 +5,6 @@ lean-lane-data/
 bench/fleet/fleet.env
 bench/runs/
 __pycache__/
+
+# native-transfer bench scratch (reth datadir, lean block log)
+bench/native-transfer/.tmp/

@@ -1,0 +1,63 @@
+[package]
+name = "reth-native-bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "reth half of bench/native-transfer: native-transfer block import through reth v2.7.0 (recover, execute, state root, persist)."
+
+# Standalone: not part of the lean-lane workspace (which pins reth v2.3.0).
+[workspace]
+
+[dependencies]
+# reth, latest release (git tag). Cargo.lock started from reth's own v2.7.0 lock.
+reth-chainspec = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-chain-state = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-db = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-db-common = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-ethereum-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-evm = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-evm-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+# test-utils only for the tempdir ProviderFactory helper (real MDBX, real
+# static files, real RocksDB; production DatabaseArguments are passed in).
+reth-provider = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0", features = ["test-utils"] }
+reth-revm = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-trie = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-trie-common = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-trie-db = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+# engine path: reth's engine tree, driven in-process
+reth-consensus = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-engine-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-engine-tree = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-ethereum-consensus = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-ethereum-engine-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-ethereum-payload-builder = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-payload-builder = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-payload-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-prune = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-storage-overlay = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-tasks = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0", features = ["rayon"] }
+# crates.io, versions as in reth v2.7.0's workspace
+reth-primitives-traits = { version = "0.8.1", features = ["rayon", "secp256k1"] }
+alloy-consensus = "2.5.0"
+alloy-eips = "2.5.0"
+alloy-genesis = "2.5.0"
+alloy-primitives = "1.6.1"
+alloy-rpc-types-engine = "2.5.0"
+tokio = { version = "1", features = ["sync"] }
+secp256k1 = { version = "0.30", features = ["global-context", "recovery", "std"] }
+rayon = "1.10"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+eyre = "0.6"
+# reth's binary runs on jemalloc by default
+tikv-jemallocator = "0.6"
+
+# Same as reth's own release profile at v2.7.0.
+[profile.release]
+opt-level = 3
+lto = "thin"
+debug = "none"
+strip = "symbols"
+panic = "unwind"
+codegen-units = 16
